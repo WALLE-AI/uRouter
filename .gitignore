@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/
+*.pt
+.ultralytics/
+_chm_extract/
+opensource
+node_modules/
+packages/*/lib/
+*.tgz
+*.tsbuildinfo
+.real-approval-workspace-*/
+real-smoke-report.log
+dist/
