@@ -1,0 +1,16 @@
+[package]
+name = "urouter-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+urouter-ai = { path = "../../crates/urouter-ai" }
+urouter-types = { path = "../../crates/urouter-types" }
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+{
+  "id": "urouter/auto",
+  "tiers": [
+    {
+      "tier": "efficient",
+      "model": "local-vllm/qwen3.5-4b",
+      "fallbacks": ["capable"]
+    },
+    {
+      "tier": "capable",
+      "model": "local-vllm-qwen38/qwen3.8-27b"
+    }
+  ],
+  "default_preference_bias_millis": 0
+}

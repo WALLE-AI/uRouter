@@ -1,0 +1,294 @@
+{
+  "schema_version": 1,
+  "providers": [
+    {
+      "id": "anthropic",
+      "name": "Anthropic",
+      "base_url": "https://api.anthropic.com/v1",
+      "built_in": true,
+      "auth": { "kind": "api_key_env", "env": "ANTHROPIC_API_KEY", "header": "x-api-key", "prefix": "" },
+      "headers": { "anthropic-version": "2023-06-01" },
+      "source": {
+        "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
+        "checked_at": "2026-08-25",
+        "confidence": "official"
+      }
+    },
+    {
+      "id": "local-fixture",
+      "name": "Local OpenAI-compatible Fixture",
+      "base_url": "http://127.0.0.1:{PORT}/v1",
+      "built_in": false,
+      "auth": { "kind": "none" },
+      "env": { "PORT": "8000" },
+      "source": {
+        "source": "fixture://local-openai-compatible",
+        "checked_at": "2026-08-25",
+        "confidence": "verified"
+      }
+    },
+    {
+      "id": "local-vllm",
+      "name": "Local vLLM on port 8087",
+      "base_url": "http://127.0.0.1:8087/v1",
+      "built_in": false,
+      "auth": { "kind": "none" },
+      "source": {
+        "source": "smoke://127.0.0.1:8087/v1/models",
+        "checked_at": "2026-08-26",
+        "confidence": "verified"
+      }
+    },
+    {
+      "id": "local-vllm-qwen38",
+      "name": "Local Qwen3.8-27B vLLM",
+      "base_url": "http://127.0.0.1:19121/starvlm/v1",
+      "built_in": false,
+      "auth": { "kind": "none" },
+      "source": {
+        "source": "smoke://127.0.0.1:19121/starvlm/v1/models",
+        "checked_at": "2026-08-26",
+        "confidence": "verified"
+      }
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "base_url": "https://api.openai.com/v1",
+      "built_in": true,
+      "auth": { "kind": "api_key_env", "env": "OPENAI_API_KEY" },
+      "source": {
+        "source": "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
+        "checked_at": "2026-08-25",
+        "confidence": "official"
+      }
+    }
+  ],
+  "models": [
+    {
+      "id": "anthropic/claude-sonnet-4-6",
+      "upstream_id": "claude-sonnet-4-6",
+      "name": "Claude Sonnet 4.6",
+      "provider": "anthropic",
+      "api": "anthropic_messages",
+      "base_url": null,
+      "cost": {
+        "base": { "input": "3", "output": "15", "cache_read": "0.3", "cache_write": "3.75" },
+        "tiers": [],
+        "long_cache_write": { "input_multiplier_millis": 2000 }
+      },
+      "capabilities": {
+        "context_window": 1000000,
+        "max_output_tokens": 64000,
+        "input_modalities": ["text", "image"],
+        "tool_calling": true,
+        "structured_output": true,
+        "reasoning": "token_budget",
+        "prompt_cache": {
+          "enabled": true,
+          "min_cacheable_tokens": 1024,
+          "retention": "provider_default",
+          "explicit_control": true,
+          "session_affinity_header": null
+        }
+      },
+      "compat": {
+        "max_tokens_field": "max_output_tokens",
+        "supports_usage_in_streaming": true,
+        "supports_finish_reason": true,
+        "supports_developer_role": false,
+        "tool_call_format": "anthropic",
+        "structured_output_format": "tool_call",
+        "thinking_format": "anthropic_budget"
+      },
+      "aliases": ["claude-sonnet-4-6"],
+      "lifecycle": "active",
+      "source": {
+        "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
+        "checked_at": "2026-08-25",
+        "confidence": "official"
+      }
+    },
+    {
+      "id": "local-fixture/efficient",
+      "upstream_id": "fixture-efficient",
+      "name": "Local Efficient Fixture",
+      "provider": "local-fixture",
+      "api": "open_ai_chat",
+      "base_url": null,
+      "cost": {
+        "base": { "input": "0", "output": "0", "cache_read": "0", "cache_write": "0" },
+        "tiers": [],
+        "long_cache_write": null
+      },
+      "capabilities": {
+        "context_window": 32768,
+        "max_output_tokens": 8192,
+        "input_modalities": ["text"],
+        "tool_calling": true,
+        "structured_output": false,
+        "reasoning": "unsupported",
+        "prompt_cache": {
+          "enabled": false,
+          "min_cacheable_tokens": 0,
+          "retention": "provider_default",
+          "explicit_control": false,
+          "session_affinity_header": null
+        }
+      },
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_usage_in_streaming": false,
+        "supports_finish_reason": true,
+        "supports_developer_role": false,
+        "tool_call_format": "open_ai",
+        "structured_output_format": "none",
+        "thinking_format": "none"
+      },
+      "aliases": ["local/efficient"],
+      "lifecycle": "active",
+      "source": {
+        "source": "fixture://local/efficient",
+        "checked_at": "2026-08-25",
+        "confidence": "verified"
+      }
+    },
+    {
+      "id": "local-vllm/qwen3.5-4b",
+      "upstream_id": "Qwen3.5-4B",
+      "name": "Qwen3.5 4B (local vLLM)",
+      "provider": "local-vllm",
+      "api": "open_ai_chat",
+      "base_url": null,
+      "cost": {
+        "base": { "input": "0", "output": "0", "cache_read": "0", "cache_write": "0" },
+        "tiers": [],
+        "long_cache_write": null
+      },
+      "capabilities": {
+        "context_window": 16384,
+        "max_output_tokens": 16384,
+        "input_modalities": ["text"],
+        "tool_calling": false,
+        "structured_output": true,
+        "reasoning": "unsupported",
+        "prompt_cache": {
+          "enabled": false,
+          "min_cacheable_tokens": 0,
+          "retention": "provider_default",
+          "explicit_control": false,
+          "session_affinity_header": null
+        }
+      },
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_usage_in_streaming": true,
+        "supports_finish_reason": true,
+        "supports_developer_role": false,
+        "tool_call_format": "none",
+        "structured_output_format": "json_schema",
+        "thinking_format": { "custom": "plaintext_content" }
+      },
+      "aliases": ["qwen3.5-4b", "local/qwen3.5-4b"],
+      "lifecycle": "active",
+      "source": {
+        "source": "smoke://127.0.0.1:8087/v1/chat/completions",
+        "checked_at": "2026-08-26",
+        "confidence": "verified"
+      }
+    },
+    {
+      "id": "local-vllm-qwen38/qwen3.8-27b",
+      "upstream_id": "Qwen3.8-27B",
+      "name": "Qwen3.8 27B (local vLLM)",
+      "provider": "local-vllm-qwen38",
+      "api": "open_ai_chat",
+      "base_url": null,
+      "cost": {
+        "base": { "input": "0", "output": "0", "cache_read": "0", "cache_write": "0" },
+        "tiers": [],
+        "long_cache_write": null
+      },
+      "capabilities": {
+        "context_window": 262144,
+        "max_output_tokens": 262144,
+        "input_modalities": ["text", "image"],
+        "tool_calling": true,
+        "structured_output": true,
+        "reasoning": "boolean",
+        "prompt_cache": {
+          "enabled": false,
+          "min_cacheable_tokens": 0,
+          "retention": "provider_default",
+          "explicit_control": false,
+          "session_affinity_header": null
+        }
+      },
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_usage_in_streaming": true,
+        "supports_finish_reason": true,
+        "supports_developer_role": false,
+        "tool_call_format": "open_ai",
+        "structured_output_format": "json_schema",
+        "thinking_format": { "custom": "qwen3_reasoning_field" }
+      },
+      "aliases": ["qwen3.8-27b", "local/qwen3.8-27b"],
+      "lifecycle": "active",
+      "source": {
+        "source": "smoke://127.0.0.1:19121/starvlm/v1/chat/completions",
+        "checked_at": "2026-08-26",
+        "confidence": "verified"
+      }
+    },
+    {
+      "id": "openai/gpt-5.6-terra",
+      "upstream_id": "gpt-5.6-terra",
+      "name": "GPT-5.6 Terra",
+      "provider": "openai",
+      "api": "open_ai_responses",
+      "base_url": null,
+      "cost": {
+        "base": { "input": "2", "output": "12", "cache_read": "0.2", "cache_write": "2.5" },
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "rates": { "input": "4", "output": "18", "cache_read": "0.4", "cache_write": "5" }
+          }
+        ],
+        "long_cache_write": null
+      },
+      "capabilities": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000,
+        "input_modalities": ["text", "image"],
+        "tool_calling": true,
+        "structured_output": true,
+        "reasoning": { "levels": ["none", "low", "medium", "high", "xhigh", "max"] },
+        "prompt_cache": {
+          "enabled": true,
+          "min_cacheable_tokens": 1024,
+          "retention": "provider_default",
+          "explicit_control": false,
+          "session_affinity_header": null
+        }
+      },
+      "compat": {
+        "max_tokens_field": "max_output_tokens",
+        "supports_usage_in_streaming": true,
+        "supports_finish_reason": true,
+        "supports_developer_role": true,
+        "tool_call_format": "open_ai",
+        "structured_output_format": "json_schema",
+        "thinking_format": "open_ai_effort"
+      },
+      "aliases": ["gpt-5.6-terra"],
+      "lifecycle": "active",
+      "source": {
+        "source": "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
+        "checked_at": "2026-08-25",
+        "confidence": "official"
+      }
+    }
+  ]
+}

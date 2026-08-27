@@ -1,6 +1,6 @@
 # uRouter 集成指南：在产品 Auto 模式中使用 uRouter
 
-> 版本：v2（2026-08-25 重写）
+> 版本：v2.1（2026-08-26 runtime alignment）
 > 定位：**模块集成契约**。uRouter 是一个与具体产品无关的基础模块；本文定义它对外暴露的能力与契约，以及集成方如何用这些原语拼出自己的 Auto 模式。
 > 受众：集成方工程团队 + uRouter 团队
 > 关联文档：`uRouter_设计文档.md`（模块内部设计，本文不重复）
@@ -169,7 +169,7 @@ route 的选择由**凭证归属**（API key 绑定的 route 集合）或 `X-URo
 
 `cost_index` 是相对 `efficient` tier 的归一化成本倍率（基于目录价格与该 route 的典型 in/out token 比估算），供集成方换算成自己的额度/计费单位。**uRouter 不定义"额度"这个概念。**
 
-### 3.2 能力必须是 tier 的交集，不是并集
+### 3.2 基线能力取交集，可路由能力取可达候选并集
 
 这是本文最重要的一条正确性约束。
 
@@ -189,11 +189,14 @@ route 的选择由**凭证归属**（API key 绑定的 route 集合）或 `X-URo
 
 同理适用于 `context_window`（取最小值）、`tool_calling`、`structured_output`。
 
-**正确的修复方向是补齐 tier，不是放宽声明**：想让 Auto 支持视觉，就把 efficient tier 换成一个支持视觉的便宜模型。
+运行时同时返回 `capabilities`（基线交集）和 `routable_capabilities`（至少一个可达
+候选支持的并集）。UI 可以区分“所有路径保证”与“Auto 可通过升级处理”，而不是阻止本可
+由强模型处理的请求。能力驱动的升级必须记录 `reason=capability_required`。
 
 **启动校验**（主设计文档 §16.1 追加）：
 
-> Auto route 对外声明的 `capabilities` 必须等于其所有 tier 的交集。声明超出交集 → **启动失败**；交集缺少 `tool_calling` 等基础能力 → **启动 warning**。
+> Auto route 的 `capabilities` 必须等于所有 tier 的交集；
+> `routable_capabilities` 必须由至少一个可达 tier 支持。请求只能落到满足其硬能力的模型。
 
 > 这与主文档 §16.1 第 12 条（同一 tier **内**各部署能力必须一致）是两回事：tier **间**允许不同（efficient 本来就弱），但对外承诺只能取交集。
 

@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo doc --workspace --no-deps
+      - run: cargo run -q -p urouter-catalog -- --json check catalog/catalog.json
+      - run: jq -e 'length >= 30' catalog/fixtures/pricing-golden.json
+      - name: Catalog semantic diff
+        if: github.event_name == 'pull_request'
+        run: |
+          git show "${{ github.event.pull_request.base.sha }}:catalog/catalog.json" > /tmp/base-catalog.json
+          cargo run -q -p urouter-catalog -- --json diff /tmp/base-catalog.json catalog/catalog.json

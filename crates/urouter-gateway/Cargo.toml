@@ -1,0 +1,26 @@
+[package]
+name = "urouter-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+redis.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+urouter-ai = { path = "../urouter-ai" }
+urouter-types = { path = "../urouter-types" }
+url.workspace = true
+
+[lints]
+workspace = true

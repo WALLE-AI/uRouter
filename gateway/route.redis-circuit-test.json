@@ -1,0 +1,35 @@
+{
+  "id": "urouter/auto",
+  "tiers": [
+    {
+      "tier": "efficient",
+      "model": "local-vllm/qwen3.5-4b",
+      "deployments": [
+        {
+          "id": "efficient-unavailable",
+          "model": "local-vllm/qwen3.5-4b",
+          "base_url": "http://127.0.0.1:18087/v1",
+          "weight": 1,
+          "order": 0,
+          "provider_scope": "local-vllm",
+          "credential_scope": "local-vllm-test"
+        },
+        {
+          "id": "efficient-live",
+          "model": "local-vllm/qwen3.5-4b",
+          "base_url": "http://127.0.0.1:8087/v1",
+          "weight": 1,
+          "order": 1,
+          "provider_scope": "local-vllm",
+          "credential_scope": "local-vllm-test"
+        }
+      ],
+      "fallbacks": ["capable"]
+    },
+    {
+      "tier": "capable",
+      "model": "local-vllm-qwen38/qwen3.8-27b"
+    }
+  ],
+  "default_preference_bias_millis": 0
+}

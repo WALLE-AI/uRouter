@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "keys": [
+    {
+      "id": "reader-2026-08",
+      "token_sha256": "sha256:REPLACE_WITH_64_LOWERCASE_HEX_CHARACTERS_______________________",
+      "role": "reader",
+      "tenant_keys": [
+        "sha256:REPLACE_WITH_TENANT_ID_SHA256________________________________"
+      ]
+    },
+    {
+      "id": "operator-2026-08",
+      "token_sha256": "sha256:REPLACE_WITH_64_LOWERCASE_HEX_CHARACTERS_______________________",
+      "role": "operator",
+      "tenant_keys": ["*"]
+    }
+  ]
+}

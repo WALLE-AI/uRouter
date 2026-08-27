@@ -14,3 +14,4 @@ packages/*/lib/
 .real-approval-workspace-*/
 real-smoke-report.log
 dist/
+target/
