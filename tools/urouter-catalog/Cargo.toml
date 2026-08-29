@@ -6,9 +6,15 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 clap.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
 urouter-ai = { path = "../../crates/urouter-ai" }
 urouter-types = { path = "../../crates/urouter-types" }
 

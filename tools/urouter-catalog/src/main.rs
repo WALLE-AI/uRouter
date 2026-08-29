@@ -15,6 +15,10 @@ use urouter_ai::{
 };
 use urouter_types::{CatalogHash, ModelId, Usage};
 
+mod provider_sync;
+
+use provider_sync::{ProviderCommand, SyncCommand};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "urouter-catalog",
@@ -115,10 +119,21 @@ enum Command {
     Manifest {
         path: PathBuf,
     },
+    /// Inspect and validate model provider instances.
+    Providers {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
+    /// Discover provider inventories without changing the production catalog.
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommand,
+    },
 }
 
-fn main() -> ExitCode {
-    match run(Args::parse()) {
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run(Args::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
@@ -127,7 +142,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let json = args.json;
     match args.command {
         Command::Check { path } => {
@@ -219,6 +234,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let manifest = CatalogManifest::from_source(&input, &catalog);
             println!("{}", serde_json::to_string_pretty(&manifest)?);
         }
+        Command::Providers { command } => provider_sync::run_provider(command, json)?,
+        Command::Sync { command } => provider_sync::run_sync(command, json).await?,
     }
     Ok(())
 }

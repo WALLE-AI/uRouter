@@ -21,6 +21,19 @@ cargo run -q -p urouter-catalog -- --json check catalog/catalog.json
 cargo run -q -p urouter-smoke -- --model local-vllm-qwen38/qwen3.8-27b --json
 ```
 
+Provider inventories are discovered separately from the production Catalog.
+Discovery never publishes a model or changes a route:
+
+```powershell
+cargo run -q -p urouter-catalog -- providers check
+cargo run -q -p urouter-catalog -- providers list
+cargo run -q -p urouter-catalog -- sync discover --instance siliconflow-main
+cargo run -q -p urouter-catalog -- sync status --instance siliconflow-main
+```
+
+See `catalog/providers/README.md` for instance configuration and credential
+environment variables.
+
 After an intentional catalog change, review the semantic diff and regenerate the
 manifest output. Do not update a hash merely to make CI pass; the source and
 pricing evidence must be reviewed first.

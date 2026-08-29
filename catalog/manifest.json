@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
   "hashes": {
-    "content": "sha256:0594d5f8b2b2c79e615aad31150aa9e7e28147ca2f52b125814df79928a194ec",
-    "pricing": "sha256:87503f5538d5bfc08cc64621b4fdb73ce948953b37fccc4f4a489ebcfea2c0e5",
-    "capabilities": "sha256:f1f777c3743e596c6338c19e2c7db55d116bad09c2926de38560883dd0a0e185",
-    "compat": "sha256:a857a5bf2397e9e7eecc9864f000fb4db8789de8b34dd3f17a5869c9093a3623"
+    "content": "sha256:c044fc98d46c05dbe9f3b401973e4ada06dc34b11fcf4a05b84e4849c92b90c8",
+    "pricing": "sha256:cdfe25b5a498344c7ee2adb355f61fc0e5cd23897dab81d5bcb2329474e3eae4",
+    "capabilities": "sha256:e5ef42eeb913a3b069f4865f9695839389cd5eb390a2866caedca03eb63cfa6e",
+    "compat": "sha256:cfa6689ba8b64dff0102fecf61860b42dab870dda6abe009bb7a726a7f6c2c1e"
   },
-  "catalog_file": "sha256:49c64ad17b0f2f757b3b16446fa1a22556024faea478a7d19ea2c340b1f773a0"
+  "catalog_file": "sha256:9d12a09b9dafb56e2b4f0a08a2cb2a1adb2beb4b67d04823a4f950aee353f513"
 }

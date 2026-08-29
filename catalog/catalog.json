@@ -62,6 +62,18 @@
         "checked_at": "2026-08-25",
         "confidence": "official"
       }
+    },
+    {
+      "id": "siliconflow",
+      "name": "SiliconFlow",
+      "base_url": "https://api.siliconflow.cn/v1",
+      "built_in": false,
+      "auth": { "kind": "api_key_env", "env": "SILICONFLOW_API_KEY" },
+      "source": {
+        "source": "https://docs.siliconflow.cn/docs/userguide/quickstart",
+        "checked_at": "2026-08-29",
+        "confidence": "official"
+      }
     }
   ],
   "models": [
@@ -239,6 +251,94 @@
         "source": "smoke://127.0.0.1:19121/starvlm/v1/chat/completions",
         "checked_at": "2026-08-26",
         "confidence": "verified"
+      }
+    },
+    {
+      "id": "siliconflow/qwen2.5-7b-instruct",
+      "upstream_id": "Qwen/Qwen2.5-7B-Instruct",
+      "name": "Qwen 2.5 7B Instruct (SiliconFlow)",
+      "provider": "siliconflow",
+      "api": "open_ai_chat",
+      "base_url": null,
+      "cost": {
+        "base": { "input": "0", "output": "0", "cache_read": "0", "cache_write": "0" },
+        "tiers": [],
+        "long_cache_write": null
+      },
+      "capabilities": {
+        "context_window": 32768,
+        "max_output_tokens": 8192,
+        "input_modalities": ["text"],
+        "tool_calling": false,
+        "structured_output": false,
+        "reasoning": "unsupported",
+        "prompt_cache": {
+          "enabled": false,
+          "min_cacheable_tokens": 0,
+          "retention": "provider_default",
+          "explicit_control": false,
+          "session_affinity_header": null
+        }
+      },
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_usage_in_streaming": false,
+        "supports_finish_reason": true,
+        "supports_developer_role": false,
+        "tool_call_format": "none",
+        "structured_output_format": "none",
+        "thinking_format": "none"
+      },
+      "aliases": ["siliconflow/qwen2.5-7b"],
+      "lifecycle": "active",
+      "source": {
+        "source": "https://www2.siliconflow.cn/pricing",
+        "checked_at": "2026-08-29",
+        "confidence": "verified"
+      }
+    },
+    {
+      "id": "siliconflow/deepseek-r1-pro",
+      "upstream_id": "Pro/deepseek-ai/DeepSeek-R1",
+      "name": "DeepSeek R1 Pro (SiliconFlow)",
+      "provider": "siliconflow",
+      "api": "open_ai_chat",
+      "base_url": null,
+      "cost": {
+        "base": { "input": "0.589875", "output": "2.3595", "cache_read": "0.589875", "cache_write": "0.589875" },
+        "tiers": [],
+        "long_cache_write": null
+      },
+      "capabilities": {
+        "context_window": 32768,
+        "max_output_tokens": 8192,
+        "input_modalities": ["text"],
+        "tool_calling": true,
+        "structured_output": false,
+        "reasoning": "boolean",
+        "prompt_cache": {
+          "enabled": false,
+          "min_cacheable_tokens": 0,
+          "retention": "provider_default",
+          "explicit_control": false,
+          "session_affinity_header": null
+        }
+      },
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "supports_usage_in_streaming": false,
+        "supports_finish_reason": true,
+        "supports_developer_role": false,
+        "tool_call_format": "open_ai",
+        "structured_output_format": "none",
+        "thinking_format": { "custom": "reasoning_content" }
+      },
+      "aliases": ["siliconflow/deepseek-r1"],
+      "lifecycle": "active",
+      "source": {
+        "source": "override://siliconflow/deepseek-r1-pro?cny_per_usd=6.7811",
+        "checked_at": "2026-08-29",
+        "confidence": "override"
       }
     },
     {

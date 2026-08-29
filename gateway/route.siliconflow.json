@@ -1,0 +1,15 @@
+{
+  "id": "urouter/auto",
+  "tiers": [
+    {
+      "tier": "efficient",
+      "model": "siliconflow/qwen2.5-7b-instruct",
+      "fallbacks": ["capable"]
+    },
+    {
+      "tier": "capable",
+      "model": "siliconflow/deepseek-r1-pro"
+    }
+  ],
+  "default_preference_bias_millis": 0
+}

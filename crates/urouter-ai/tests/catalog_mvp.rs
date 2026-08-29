@@ -28,7 +28,7 @@ fn capability_consumer_filters_without_global_intersection() {
     };
     let result = eligible_models(&catalog, &requirement);
     assert_eq!(result.eligible.len(), 3);
-    assert_eq!(result.excluded.len(), 2);
+    assert_eq!(result.excluded.len(), 4);
     assert!(
         result
             .excluded
@@ -40,6 +40,18 @@ fn capability_consumer_filters_without_global_intersection() {
             .excluded
             .iter()
             .any(|item| item.model.as_str() == "local-vllm/qwen3.5-4b")
+    );
+    assert!(
+        result
+            .excluded
+            .iter()
+            .any(|item| item.model.as_str() == "siliconflow/deepseek-r1-pro")
+    );
+    assert!(
+        result
+            .excluded
+            .iter()
+            .any(|item| item.model.as_str() == "siliconflow/qwen2.5-7b-instruct")
     );
 }
 
@@ -112,9 +124,19 @@ fn endpoint_plan_resolves_verified_qwen38_vllm() {
 }
 
 #[test]
+fn endpoint_plan_resolves_siliconflow() {
+    let catalog = catalog();
+    let id = ModelId::new("siliconflow/deepseek-r1-pro").unwrap();
+    let model = catalog.model(&id).unwrap();
+    let provider = catalog.provider(&model.provider).unwrap();
+    let endpoint = EndpointPlan::for_model(provider, model).unwrap();
+    assert_eq!(endpoint.url.as_str(), "https://api.siliconflow.cn/v1");
+}
+
+#[test]
 fn projection_is_stable_and_policy_free() {
     let projections = model_projections(&catalog());
-    assert_eq!(projections.len(), 5);
+    assert_eq!(projections.len(), 7);
     assert_eq!(projections[0].id.as_str(), "anthropic/claude-sonnet-4-6");
 }
 

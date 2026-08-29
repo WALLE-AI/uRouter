@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "instances": [
+    {
+      "id": "siliconflow-main",
+      "vendor": "siliconflow",
+      "catalog_provider_id": "siliconflow",
+      "runtime": {
+        "base_url": "https://api.siliconflow.cn/v1",
+        "protocols": ["open_ai_chat"],
+        "auth_env": "SILICONFLOW_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://api.siliconflow.cn/v1/models",
+        "auth_env": "SILICONFLOW_API_KEY",
+        "query": {
+          "sub_type": "chat",
+          "type": "text"
+        }
+      },
+      "credential_scope": "siliconflow-main",
+      "enabled": true
+    },
+    {
+      "id": "bailian-cn-beijing-main",
+      "vendor": "aliyun-bailian",
+      "catalog_provider_id": "bailian-cn-beijing-main",
+      "runtime": {
+        "base_url": "https://${BAILIAN_WORKSPACE_ID}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        "protocols": ["open_ai_chat"],
+        "auth_env": "DASHSCOPE_API_KEY"
+      },
+      "discovery": {
+        "kind": "bailian_catalog",
+        "url": "https://${BAILIAN_WORKSPACE_ID}.cn-beijing.maas.aliyuncs.com/api/v1/models",
+        "auth_env": "DASHSCOPE_API_KEY",
+        "page_size": 100,
+        "max_pages": 100,
+        "query": {
+          "language": "zh-CN",
+          "supports": "inference"
+        }
+      },
+      "credential_scope": "bailian-cn-beijing-main",
+      "enabled": true
+    },
+    {
+      "id": "ark-cn-beijing-main",
+      "vendor": "volcengine-ark",
+      "catalog_provider_id": "ark-cn-beijing-main",
+      "runtime": {
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "protocols": ["open_ai_chat"],
+        "auth_env": "ARK_API_KEY"
+      },
+      "discovery": {
+        "kind": "reviewed_static",
+        "path": "volcengine-ark/reviewed-models.json"
+      },
+      "credential_scope": "ark-cn-beijing-main",
+      "enabled": true
+    }
+  ]
+}
