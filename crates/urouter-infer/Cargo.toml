@@ -1,0 +1,15 @@
+[package]
+name = "urouter-infer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Bounded ONNX inference runtime for uRouter artifacts"
+
+[dependencies]
+thiserror.workspace = true
+onnx-pb.workspace = true
+urouter-artifact = { path = "../urouter-artifact" }
+
+[lints]
+workspace = true

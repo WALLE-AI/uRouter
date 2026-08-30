@@ -6,6 +6,7 @@ use std::{
     future::{Future, IntoFuture},
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
+    pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -22,7 +23,7 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use futures_util::{StreamExt, stream};
+use futures_util::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -44,9 +45,9 @@ use urouter_artifact::{
     RolloutPolicy, RouterArtifact,
 };
 use urouter_contracts::{
-    DecisionRecordContext, DeploymentDisposition, DeploymentEvaluation, DeploymentPicker,
-    FEATURE_SCHEMA_VERSION, FallbackTierSpec, FeatureFrame, RetryDirective, RevisionSet,
-    RoutingTrace, RuleEvaluation, RuleOutcome, plan_fallback_tiers,
+    CapacitySnapshot, DecisionRecordContext, DeploymentDisposition, DeploymentEvaluation,
+    DeploymentPicker, FEATURE_SCHEMA_VERSION, FallbackTierSpec, FeatureFrame, RetryDirective,
+    RevisionSet, RoutingTrace, RuleEvaluation, RuleOutcome, VectorRef, plan_fallback_tiers,
 };
 use urouter_gateway::{
     CallRole, DataPolicyContract, FallbackCause, MigrationBoundary, RecordingMode, RetryPolicy,
@@ -56,6 +57,7 @@ use urouter_gateway::{
     circuit::{
         CircuitPermit, LocalCircuitRepository, RedisCircuitRepository, SharedCircuitRepository,
     },
+    vector_store::VectorSideStore,
 };
 use urouter_protocol::{
     LossPolicy, TransportCapabilities, from_anthropic_messages, from_openai_chat,
@@ -67,6 +69,7 @@ mod adapter;
 mod binding;
 mod budget;
 mod control;
+mod credential;
 mod idempotency;
 mod management_auth;
 mod quota;
@@ -83,6 +86,7 @@ use budget::{
     RedisBudgetRepository,
 };
 use control::{ControlFailurePolicy, ControlPlane, ControlSnapshot};
+use credential::CredentialManager;
 use idempotency::{
     IdempotencyClaim, IdempotencyRepository, MemoryIdempotencyRepository,
     RedisIdempotencyRepository,
@@ -116,6 +120,10 @@ struct Args {
     records: Option<PathBuf>,
     #[arg(long)]
     feedback_records: Option<PathBuf>,
+    #[arg(long)]
+    vector_store: Option<PathBuf>,
+    #[arg(long, default_value_t = 268_435_456)]
+    vector_shard_max_bytes: u64,
     #[arg(long, default_value_t = 1_000)]
     record_capacity: usize,
     #[arg(long, default_value_t = 256)]
@@ -160,10 +168,14 @@ struct Args {
     quota_lease_ttl_seconds: u64,
     #[arg(long, default_value_t = 0)]
     tenant_budget_nano_usd: u64,
+    #[arg(long, default_value_t = 0)]
+    tenant_budget_soft_nano_usd: u64,
     #[arg(long, default_value_t = 2_592_000)]
     budget_period_seconds: u64,
     #[arg(long)]
     redis_url: Option<String>,
+    #[arg(long)]
+    on_state_unavailable: Option<String>,
     #[arg(long, default_value = "urouter")]
     redis_prefix: String,
     #[arg(long, default_value_t = 604_800)]
@@ -217,6 +229,7 @@ struct AppState {
     catalog: Arc<CatalogSnapshot>,
     route: Arc<RouteConfig>,
     client: reqwest::Client,
+    credentials: CredentialManager,
     records: RecordStore,
     record_repository: Arc<dyn DecisionRecordRepository>,
     feedback: FeedbackStore,
@@ -241,6 +254,7 @@ struct AppState {
     artifact: Option<ArtifactRuntime>,
     exploration: ExplorationPolicy,
     cache_affinity: CacheAffinityStore,
+    vector_store: Option<Arc<VectorSideStore>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -380,6 +394,8 @@ struct DecisionRecord {
     #[serde(default)]
     semantic_task: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    vector_ref: Option<VectorRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     exploration: Option<ExplorationRecord>,
     route_id: String,
     tier: String,
@@ -482,6 +498,11 @@ enum FeedbackCommand {
 #[derive(Clone)]
 struct GatewayMetrics {
     requests: Arc<AtomicU64>,
+    upstream_attempts: Arc<AtomicU64>,
+    usage_unavailable: Arc<AtomicU64>,
+    cache_affinity_hits: Arc<AtomicU64>,
+    vector_writes: Arc<AtomicU64>,
+    vector_write_errors: Arc<AtomicU64>,
     successes: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
     retries: Arc<AtomicU64>,
@@ -510,6 +531,11 @@ impl Default for GatewayMetrics {
     fn default() -> Self {
         Self {
             requests: Arc::default(),
+            upstream_attempts: Arc::default(),
+            usage_unavailable: Arc::default(),
+            cache_affinity_hits: Arc::default(),
+            vector_writes: Arc::default(),
+            vector_write_errors: Arc::default(),
             successes: Arc::default(),
             errors: Arc::default(),
             retries: Arc::default(),
@@ -684,6 +710,8 @@ struct AttemptRecord {
     retry: bool,
     #[serde(default)]
     selection_trace: Vec<DeploymentEvaluation>,
+    #[serde(default)]
+    capacity_snapshot: CapacitySnapshot,
 }
 
 #[derive(Clone, Copy)]
@@ -715,6 +743,7 @@ impl AttemptOutcome {
 }
 
 impl AttemptRecord {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         request_id: &str,
         attempt: u8,
@@ -722,6 +751,7 @@ impl AttemptRecord {
         deployment: &RouteDeployment,
         model: &ModelSpec,
         selection_trace: Vec<DeploymentEvaluation>,
+        capacity_snapshot: CapacitySnapshot,
         outcome: AttemptOutcome,
     ) -> Self {
         Self {
@@ -735,6 +765,7 @@ impl AttemptRecord {
             error_kind: outcome.error_kind,
             retry: outcome.retry,
             selection_trace,
+            capacity_snapshot,
         }
     }
 }
@@ -747,6 +778,7 @@ struct RecordSeed {
     route_revision: String,
     artifact: Option<ArtifactDecision>,
     exploration: Option<ExplorationRecord>,
+    vector_ref: Option<VectorRef>,
 }
 
 struct ResponseContext {
@@ -854,6 +886,7 @@ struct ExecutionLease {
     permit: Option<CircuitPermit>,
     tier_size: usize,
     selection_trace: Vec<DeploymentEvaluation>,
+    capacity_snapshot: CapacitySnapshot,
 }
 
 impl ExecutionLease {
@@ -1134,6 +1167,10 @@ async fn main() -> Result<(), BoxError> {
         args.record_max_bytes,
     )
     .await?;
+    let vector_store = match &args.vector_store {
+        Some(path) => Some(VectorSideStore::open(path, args.vector_shard_max_bytes).await?),
+        None => None,
+    };
     let record_repository =
         build_record_repository(shared_state.as_ref(), records.clone(), args.record_capacity);
     let feedback_store = FeedbackStore::open(
@@ -1147,13 +1184,15 @@ async fn main() -> Result<(), BoxError> {
     for tier in &route.tiers {
         capacity.register(&tier.effective_deployments());
     }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
+        .build()?;
     let state = AppState {
         catalog,
         route,
-        client: reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
-            .build()?,
+        client: client.clone(),
+        credentials: CredentialManager::new(client),
         records,
         record_repository,
         feedback: feedback_store,
@@ -1185,8 +1224,9 @@ async fn main() -> Result<(), BoxError> {
             maximum_budget_nano_usd: args.exploration_max_budget_nano_usd,
         },
         cache_affinity: CacheAffinityStore::new(args.task_binding_capacity),
+        vector_store,
     };
-    spawn_retention_sweeper(state.records.clone());
+    spawn_retention_sweeper(state.records.clone(), state.vector_store.clone());
     spawn_control_reloader(&args, &state, loaded_control.signing_key);
     let app = app_router(state.clone());
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
@@ -1347,6 +1387,35 @@ enum DryRunStatus {
     NotApplicable,
     Blocked,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ValidationCostClass {
+    Free,
+    Local,
+    Remote,
+    PostHoc,
+}
+
+const CASCADE_COST_CLASSES: [ValidationCostClass; 5] = [
+    ValidationCostClass::Free,
+    ValidationCostClass::Free,
+    ValidationCostClass::Local,
+    ValidationCostClass::Remote,
+    ValidationCostClass::PostHoc,
+];
+
+const FILTER_COST_CLASSES: [ValidationCostClass; 10] = [
+    ValidationCostClass::Free,
+    ValidationCostClass::Free,
+    ValidationCostClass::Free,
+    ValidationCostClass::Free,
+    ValidationCostClass::Free,
+    ValidationCostClass::Free,
+    ValidationCostClass::Local,
+    ValidationCostClass::Local,
+    ValidationCostClass::Local,
+    ValidationCostClass::Local,
+];
 
 #[derive(Debug, Serialize)]
 struct DryRunCheck {
@@ -1527,12 +1596,18 @@ fn dry_run_report(
     let mut checks = schema_dry_run_checks(args, catalog, route);
     checks.extend(route_dry_run_checks(
         args,
+        catalog,
+        route,
         route_status,
         &route_message,
         auth_status,
         auth_message,
     ));
-    checks.extend(catalog_dry_run_checks(manifest_status, manifest_message));
+    checks.extend(catalog_dry_run_checks(
+        catalog_source,
+        manifest_status,
+        manifest_message,
+    ));
     let valid = checks.iter().all(|item| item.status != DryRunStatus::Fail);
     DryRunReport {
         schema_version: 1,
@@ -1565,6 +1640,15 @@ fn referenced_auth_check(catalog: &CatalogSnapshot, route: &RouteConfig) -> (Dry
                 if std::env::var_os(env).is_none() =>
             {
                 Some(env.clone())
+            }
+            urouter_ai::auth::AuthSpec::OAuthClientCredentials {
+                client_id_env,
+                client_secret_env,
+                ..
+            } if std::env::var_os(client_id_env).is_none()
+                || std::env::var_os(client_secret_env).is_none() =>
+            {
+                Some(format!("{client_id_env},{client_secret_env}"))
             }
             _ => None,
         })
@@ -1642,14 +1726,14 @@ fn schema_dry_run_checks(
         check(
             1,
             DRY_RUN_CHECK_IDS[0],
-            DryRunStatus::NotApplicable,
-            "cascade CostClass is not represented by the current route schema",
+            monotonic_cost_class_status(&CASCADE_COST_CLASSES),
+            "compiled Rule/Signal/Model/Judge/Escalation cascade is cost-monotonic",
         ),
         check(
             2,
             DRY_RUN_CHECK_IDS[1],
-            DryRunStatus::NotApplicable,
-            "filter CostClass is not represented by the current route schema",
+            monotonic_cost_class_status(&FILTER_COST_CLASSES),
+            "compiled tenant/auth/catalog/capacity/policy filter chain is cost-monotonic",
         ),
         check(
             3,
@@ -1663,6 +1747,8 @@ fn schema_dry_run_checks(
 
 fn route_dry_run_checks(
     args: &Args,
+    catalog: &CatalogSnapshot,
+    route: &RouteConfig,
     route_status: DryRunStatus,
     route_message: &str,
     auth_status: DryRunStatus,
@@ -1674,52 +1760,63 @@ fn route_dry_run_checks(
         check(
             7,
             DRY_RUN_CHECK_IDS[6],
-            if args.exploration_epsilon_millionths == 0 {
-                DryRunStatus::NotApplicable
-            } else {
+            if args.exploration_epsilon_millionths == 0
+                || args.records.is_some()
+                || args.redis_url.is_some()
+            {
                 DryRunStatus::Pass
+            } else {
+                DryRunStatus::Fail
             },
             if args.exploration_epsilon_millionths == 0 {
                 "controlled exploration is disabled"
+            } else if args.records.is_some() || args.redis_url.is_some() {
+                "controlled exploration has a persistent DecisionRecord sink"
             } else {
-                "controlled exploration requires per-request recording, training consent, explicit authorization, and a bounded budget"
+                "controlled exploration requires --records so propensity evidence is persisted"
             },
         ),
         check(8, DRY_RUN_CHECK_IDS[7], route_status, route_message),
         check(
             9,
             DRY_RUN_CHECK_IDS[8],
-            DryRunStatus::NotApplicable,
-            "budget limits are not represented by the current route schema",
+            budget_boundary_status(args),
+            budget_boundary_message(args),
         ),
         check(
             10,
             DRY_RUN_CHECK_IDS[9],
-            if args.redis_url.is_some() {
+            if args.redis_url.is_none()
+                || args.on_state_unavailable.as_deref() == Some("fail_closed")
+            {
+                DryRunStatus::Pass
+            } else {
                 DryRunStatus::Fail
-            } else {
-                DryRunStatus::NotApplicable
             },
-            if args.redis_url.is_some() {
-                "Redis enables multi-instance state, but on_state_unavailable is not represented by the current configuration"
+            if args.redis_url.is_none() {
+                "single-instance state does not require a cross-instance failure policy"
+            } else if args.on_state_unavailable.as_deref() == Some("fail_closed") {
+                "multi-instance correctness state explicitly fails closed"
             } else {
-                "single-instance configuration"
+                "Redis requires --on-state-unavailable fail_closed"
             },
         ),
         check(
             11,
             DRY_RUN_CHECK_IDS[10],
-            DryRunStatus::Warning,
-            "tool-call expectation and model decider are not represented by the current route schema",
+            tool_decider_status(args, catalog, route),
+            tool_decider_message(args, catalog, route),
         ),
         check(12, DRY_RUN_CHECK_IDS[11], route_status, route_message),
     ]
 }
 
 fn catalog_dry_run_checks(
+    catalog_source: &[u8],
     manifest_status: DryRunStatus,
     manifest_message: String,
 ) -> Vec<DryRunCheck> {
+    let (override_status, override_message) = cost_override_reason_check(catalog_source);
     vec![
         check(13, DRY_RUN_CHECK_IDS[12], manifest_status, manifest_message),
         check(
@@ -1734,13 +1831,124 @@ fn catalog_dry_run_checks(
             DryRunStatus::Pass,
             "catalog validation resolved every endpoint placeholder from provider env",
         ),
-        check(
-            16,
-            DRY_RUN_CHECK_IDS[15],
-            DryRunStatus::NotApplicable,
-            "route deployments do not support cost overrides",
-        ),
+        check(16, DRY_RUN_CHECK_IDS[15], override_status, override_message),
     ]
+}
+
+fn monotonic_cost_class_status(classes: &[ValidationCostClass]) -> DryRunStatus {
+    if classes.windows(2).all(|pair| pair[0] <= pair[1]) {
+        DryRunStatus::Pass
+    } else {
+        DryRunStatus::Fail
+    }
+}
+
+fn budget_boundary_status(args: &Args) -> DryRunStatus {
+    if (args.tenant_budget_nano_usd == 0 && args.tenant_budget_soft_nano_usd == 0)
+        || (args.tenant_budget_soft_nano_usd > 0
+            && args.tenant_budget_soft_nano_usd < args.tenant_budget_nano_usd)
+    {
+        DryRunStatus::Pass
+    } else {
+        DryRunStatus::Fail
+    }
+}
+
+fn budget_boundary_message(args: &Args) -> &'static str {
+    if args.tenant_budget_nano_usd == 0 && args.tenant_budget_soft_nano_usd == 0 {
+        "tenant budget is disabled"
+    } else if args.tenant_budget_soft_nano_usd > 0
+        && args.tenant_budget_soft_nano_usd < args.tenant_budget_nano_usd
+    {
+        "tenant soft budget is positive and below the hard budget"
+    } else {
+        "enabled budget requires 0 < --tenant-budget-soft-nano-usd < --tenant-budget-nano-usd"
+    }
+}
+
+fn route_supports_tools(catalog: &CatalogSnapshot, route: &RouteConfig) -> bool {
+    route.tiers.iter().any(|tier| {
+        catalog
+            .model(&tier.model)
+            .is_some_and(|model| model.capabilities.tool_calling)
+    })
+}
+
+fn tool_decider_status(
+    args: &Args,
+    catalog: &CatalogSnapshot,
+    route: &RouteConfig,
+) -> DryRunStatus {
+    let expects_tools = route_supports_tools(catalog, route);
+    if !expects_tools || args.artifact_active.is_some() || args.artifact_candidate.is_some() {
+        DryRunStatus::Pass
+    } else {
+        DryRunStatus::Warning
+    }
+}
+
+fn tool_decider_message(
+    args: &Args,
+    catalog: &CatalogSnapshot,
+    route: &RouteConfig,
+) -> &'static str {
+    let expects_tools = route_supports_tools(catalog, route);
+    if !expects_tools {
+        "route has no enabled targets"
+    } else if args.artifact_active.is_some() || args.artifact_candidate.is_some() {
+        "route has a configured model decider artifact"
+    } else {
+        "route has enabled targets but no model decider artifact; rule/signal routing remains active"
+    }
+}
+
+fn cost_override_reason_check(catalog_source: &[u8]) -> (DryRunStatus, String) {
+    let Ok(value) = serde_json::from_slice::<Value>(catalog_source) else {
+        return (
+            DryRunStatus::Fail,
+            "catalog could not be decoded for cost override validation".to_owned(),
+        );
+    };
+    let mut overrides = 0_usize;
+    let mut missing_reason = 0_usize;
+    visit_cost_overrides(&value, &mut overrides, &mut missing_reason);
+    if missing_reason == 0 {
+        (
+            DryRunStatus::Pass,
+            format!("validated {overrides} catalog cost override(s)"),
+        )
+    } else {
+        (
+            DryRunStatus::Fail,
+            format!("{missing_reason} of {overrides} cost override(s) lack a non-empty reason"),
+        )
+    }
+}
+
+fn visit_cost_overrides(value: &Value, overrides: &mut usize, missing_reason: &mut usize) {
+    match value {
+        Value::Object(object) => {
+            if let Some(cost_override) = object.get("cost_override") {
+                *overrides += 1;
+                if cost_override
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .is_none_or(|reason| reason.trim().is_empty())
+                {
+                    *missing_reason += 1;
+                }
+            }
+            for child in object.values() {
+                visit_cost_overrides(child, overrides, missing_reason);
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                visit_cost_overrides(child, overrides, missing_reason);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn app_router(state: AppState) -> Router {
@@ -1768,6 +1976,7 @@ fn app_router(state: AppState) -> Router {
             post(adapter_chat_completions),
         )
         .route("/v1/decisions", get(decisions))
+        .route("/v1/stats", get(stats))
         .route(
             "/v1/decisions/{id}",
             get(decision_by_id).delete(delete_decision),
@@ -1807,6 +2016,9 @@ fn validate_args(args: &Args) -> Result<(), BoxError> {
                 .into(),
         );
     }
+    if args.vector_store.is_some() && args.vector_shard_max_bytes < 4 {
+        return Err("vector shard size must be at least four bytes".into());
+    }
     if args.cooldown_failure_threshold_millis > 1_000 {
         return Err("cooldown threshold must be <= 1000".into());
     }
@@ -1824,6 +2036,9 @@ fn validate_args(args: &Args) -> Result<(), BoxError> {
     }
     if args.budget_period_seconds == 0 {
         return Err("budget period must be greater than zero".into());
+    }
+    if budget_boundary_status(args) == DryRunStatus::Fail {
+        return Err(budget_boundary_message(args).into());
     }
     if args.management_keyring_reload_seconds == 0 {
         return Err("management keyring reload interval must be greater than zero".into());
@@ -1849,6 +2064,10 @@ fn validate_args(args: &Args) -> Result<(), BoxError> {
     if args.exploration_epsilon_millionths > 0 && args.exploration_max_budget_nano_usd == 0 {
         return Err("enabled exploration requires a non-zero maximum budget".into());
     }
+    if args.exploration_epsilon_millionths > 0 && args.records.is_none() && args.redis_url.is_none()
+    {
+        return Err("enabled exploration requires --records or Redis authoritative state".into());
+    }
     if (args.artifact_active.is_some() || args.artifact_candidate.is_some())
         && args.artifact_signing_key_env.is_none()
     {
@@ -1866,6 +2085,9 @@ fn validate_args(args: &Args) -> Result<(), BoxError> {
         return Err(
             "--records/--feedback-records cannot be combined with Redis authoritative state".into(),
         );
+    }
+    if args.redis_url.is_some() && args.on_state_unavailable.as_deref() != Some("fail_closed") {
+        return Err("Redis requires --on-state-unavailable fail_closed".into());
     }
     Ok(())
 }
@@ -2258,6 +2480,7 @@ async fn delete_session_binding(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn metrics(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2269,6 +2492,18 @@ async fn metrics(
         concat!(
             "# TYPE urouter_requests_total counter\n",
             "urouter_requests_total {}\n",
+            "# TYPE urouter_llm_calls_total counter\n",
+            "urouter_llm_calls_total {}\n",
+            "# TYPE urouter_upstream_attempts_total counter\n",
+            "urouter_upstream_attempts_total {}\n",
+            "# TYPE urouter_usage_unavailable_total counter\n",
+            "urouter_usage_unavailable_total {}\n",
+            "# TYPE urouter_cache_affinity_hit_total counter\n",
+            "urouter_cache_affinity_hit_total {}\n",
+            "# TYPE urouter_vector_write_total counter\n",
+            "urouter_vector_write_total {}\n",
+            "# TYPE urouter_vector_write_errors_total counter\n",
+            "urouter_vector_write_errors_total {}\n",
             "# TYPE urouter_success_total counter\n",
             "urouter_success_total {}\n",
             "# TYPE urouter_errors_total counter\n",
@@ -2314,6 +2549,12 @@ async fn metrics(
             "process_resident_memory_bytes {}\n"
         ),
         metric.requests.load(Ordering::Relaxed),
+        metric.requests.load(Ordering::Relaxed),
+        metric.upstream_attempts.load(Ordering::Relaxed),
+        metric.usage_unavailable.load(Ordering::Relaxed),
+        metric.cache_affinity_hits.load(Ordering::Relaxed),
+        metric.vector_writes.load(Ordering::Relaxed),
+        metric.vector_write_errors.load(Ordering::Relaxed),
         metric.successes.load(Ordering::Relaxed),
         metric.errors.load(Ordering::Relaxed),
         metric.retries.load(Ordering::Relaxed),
@@ -3040,6 +3281,139 @@ async fn decisions(
     })))
 }
 
+#[derive(Debug, Default, Serialize)]
+struct ValueStats {
+    records: u64,
+    successful_records: u64,
+    usage_available: u64,
+    usage_unavailable: u64,
+    catalog_revision_mismatch: u64,
+    actual_cost_nano_usd: u64,
+    always_capable_cost_nano_usd: u64,
+    downgrade_savings_nano_usd: u64,
+    cache_savings_nano_usd: u64,
+    total_savings_nano_usd: u64,
+    feedback_signals: u64,
+    quality_mean: Option<f64>,
+    quality_loss_vs_perfect: Option<f64>,
+}
+
+async fn stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, GatewayError> {
+    let state = state.with_active_control();
+    let tenant_key = resolve_tenant_key(&state, &headers)?;
+    authorize_management(
+        &state,
+        &headers,
+        &tenant_key,
+        ManagementRole::Reader,
+        "stats.read",
+        None,
+    )
+    .await?;
+    let records = records_for_tenant(&state, &tenant_key).await?;
+    let capable_model = state
+        .route
+        .tiers
+        .last()
+        .and_then(|tier| state.catalog.model(&tier.model));
+    let value = calculate_value_stats(&records, &state.catalog, capable_model);
+    Ok(Json(json!({
+        "schema_version": 1,
+        "tenant": tenant_key,
+        "route": state.route.id,
+        "value": value,
+        "methodology": {
+            "downgrade": "same_usage_uncached_reprice_against_last_route_tier",
+            "cache": "selected_model_same_usage_reprice_without_cache",
+            "quality": "mean_of_observed_feedback_strengths",
+            "limitations": [
+                "counterfactual pricing assumes identical token usage",
+                "records from another catalog revision are excluded from repricing",
+                "quality is null until feedback exists"
+            ]
+        }
+    })))
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn calculate_value_stats(
+    records: &[DecisionRecord],
+    catalog: &CatalogSnapshot,
+    capable_model: Option<&ModelSpec>,
+) -> ValueStats {
+    let mut stats = ValueStats {
+        records: u64::try_from(records.len()).unwrap_or(u64::MAX),
+        ..ValueStats::default()
+    };
+    let mut feedback_sum = 0.0;
+    for record in records {
+        stats.successful_records += u64::from(record.execution.ok);
+        stats.feedback_signals = stats
+            .feedback_signals
+            .saturating_add(u64::try_from(record.outcome_signals.len()).unwrap_or(u64::MAX));
+        feedback_sum += record
+            .outcome_signals
+            .iter()
+            .map(|signal| signal.strength)
+            .sum::<f64>();
+        let Some(usage) = record.execution.usage else {
+            stats.usage_unavailable = stats.usage_unavailable.saturating_add(1);
+            continue;
+        };
+        stats.usage_available = stats.usage_available.saturating_add(1);
+        if record.evidence.content_hash != catalog.hashes().content {
+            stats.catalog_revision_mismatch = stats.catalog_revision_mismatch.saturating_add(1);
+            continue;
+        }
+        let Some(selected) = catalog.model(&record.evidence.model_id) else {
+            stats.catalog_revision_mismatch = stats.catalog_revision_mismatch.saturating_add(1);
+            continue;
+        };
+        let Ok(actual) = calculate_actual_cost(&selected.cost, usage) else {
+            continue;
+        };
+        let uncached_usage = Usage {
+            input: usage
+                .input
+                .saturating_add(usage.cache_read)
+                .saturating_add(usage.cache_write),
+            output: usage.output,
+            reasoning: usage.reasoning,
+            ..Usage::default()
+        };
+        let Ok(selected_uncached) = calculate_actual_cost(&selected.cost, uncached_usage) else {
+            continue;
+        };
+        let actual_nano = money_to_u64(actual.total);
+        let selected_uncached_nano = money_to_u64(selected_uncached.total);
+        stats.actual_cost_nano_usd = stats.actual_cost_nano_usd.saturating_add(actual_nano);
+        stats.cache_savings_nano_usd = stats
+            .cache_savings_nano_usd
+            .saturating_add(selected_uncached_nano.saturating_sub(actual_nano));
+        let capable_uncached_nano = capable_model
+            .and_then(|model| calculate_actual_cost(&model.cost, uncached_usage).ok())
+            .map_or(selected_uncached_nano, |cost| money_to_u64(cost.total));
+        stats.always_capable_cost_nano_usd = stats
+            .always_capable_cost_nano_usd
+            .saturating_add(capable_uncached_nano);
+        stats.downgrade_savings_nano_usd = stats
+            .downgrade_savings_nano_usd
+            .saturating_add(capable_uncached_nano.saturating_sub(selected_uncached_nano));
+    }
+    stats.total_savings_nano_usd = stats
+        .downgrade_savings_nano_usd
+        .saturating_add(stats.cache_savings_nano_usd);
+    if stats.feedback_signals > 0 {
+        let mean = feedback_sum / stats.feedback_signals as f64;
+        stats.quality_mean = Some(mean);
+        stats.quality_loss_vs_perfect = Some(1.0 - mean);
+    }
+    stats
+}
+
 async fn decision_by_id(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3082,14 +3456,19 @@ async fn delete_decision(
         Some(management_target_key(&tenant_key, "decision", &id)),
     )
     .await?;
-    let turn = record_for_id(&state, &tenant_key, &id)
-        .await?
-        .and_then(|record| record.trace_turn);
+    let record = record_for_id(&state, &tenant_key, &id).await?;
+    let turn = record.as_ref().and_then(|record| record.trace_turn.clone());
     let deleted = state
         .record_repository
         .delete(&tenant_key, RecordDelete::Decisions(vec![id.clone()]))
         .await
         .map_err(record_repository_error)?;
+    if deleted > 0
+        && let Some(record) = record.as_ref()
+    {
+        tombstone_record_vectors(state.vector_store.as_deref(), std::slice::from_ref(record))
+            .await?;
+    }
     if let Some(turn) = turn
         && !records_for_tenant(&state, &tenant_key)
             .await?
@@ -3159,6 +3538,9 @@ async fn delete_task_records(
         )
         .await
         .map_err(record_repository_error)?;
+    if deleted > 0 {
+        tombstone_record_vectors(state.vector_store.as_deref(), &matching).await?;
+    }
     let retained_turns = records_for_tenant(&state, &tenant_key)
         .await?
         .into_iter()
@@ -3218,6 +3600,9 @@ async fn delete_tenant_records(
         )
         .await
         .map_err(record_repository_error)?;
+    if deleted > 0 {
+        tombstone_record_vectors(state.vector_store.as_deref(), &existing).await?;
+    }
     let local_feedback_deleted = state
         .feedback
         .delete_matching(|tenant, turn| {
@@ -3670,12 +4055,7 @@ async fn openai_responses(
 ) -> Result<Response, GatewayError> {
     let normalized = from_openai_responses(&request)
         .map_err(|error| GatewayError::bad_request("invalid_responses_request", error))?;
-    if normalized.stream {
-        return Err(GatewayError::bad_request(
-            "unsupported_protocol_streaming",
-            "Responses streaming is not available; use /v1/chat/completions for streaming",
-        ));
-    }
+    let streaming = normalized.stream;
     let (chat, loss) = to_openai_chat(
         &normalized,
         &internal_chat_capabilities(),
@@ -3684,7 +4064,14 @@ async fn openai_responses(
     .map_err(|error| GatewayError::bad_request("protocol_semantic_loss", error))?;
     debug_assert!(loss.losses.is_empty());
     let response = Box::pin(chat_completions(State(state), headers, Json(chat))).await?;
-    translate_chat_response(response, ProtocolResponse::Responses).await
+    if streaming {
+        Ok(translate_chat_stream_response(
+            response,
+            ProtocolResponse::Responses,
+        ))
+    } else {
+        translate_chat_response(response, ProtocolResponse::Responses).await
+    }
 }
 
 async fn anthropic_messages(
@@ -3694,12 +4081,7 @@ async fn anthropic_messages(
 ) -> Result<Response, GatewayError> {
     let normalized = from_anthropic_messages(&request)
         .map_err(|error| GatewayError::bad_request("invalid_anthropic_request", error))?;
-    if normalized.stream {
-        return Err(GatewayError::bad_request(
-            "unsupported_protocol_streaming",
-            "Anthropic streaming is not available; use /v1/chat/completions for streaming",
-        ));
-    }
+    let streaming = normalized.stream;
     let (chat, loss) = to_openai_chat(
         &normalized,
         &internal_chat_capabilities(),
@@ -3708,13 +4090,303 @@ async fn anthropic_messages(
     .map_err(|error| GatewayError::bad_request("protocol_semantic_loss", error))?;
     debug_assert!(loss.losses.is_empty());
     let response = Box::pin(chat_completions(State(state), headers, Json(chat))).await?;
-    translate_chat_response(response, ProtocolResponse::Anthropic).await
+    if streaming {
+        Ok(translate_chat_stream_response(
+            response,
+            ProtocolResponse::Anthropic,
+        ))
+    } else {
+        translate_chat_response(response, ProtocolResponse::Anthropic).await
+    }
 }
 
 #[derive(Clone, Copy)]
 enum ProtocolResponse {
     Responses,
     Anthropic,
+}
+
+type ProtocolBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, axum::Error>> + Send>>;
+
+struct ProtocolStreamState {
+    upstream: ProtocolBodyStream,
+    buffer: Vec<u8>,
+    protocol: ProtocolResponse,
+    translation: ProtocolTranslationState,
+    eof: bool,
+}
+
+#[derive(Default)]
+struct ProtocolTranslationState {
+    started: bool,
+    response_id: String,
+    opened_blocks: BTreeSet<u64>,
+}
+
+fn translate_chat_stream_response(response: Response, protocol: ProtocolResponse) -> Response {
+    if !response.status().is_success() {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let state = ProtocolStreamState {
+        upstream: Box::pin(body.into_data_stream()),
+        buffer: Vec::new(),
+        protocol,
+        translation: ProtocolTranslationState::default(),
+        eof: false,
+    };
+    let translated = stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(end) = find_sse_event_end(&state.buffer) {
+                let event = state.buffer.drain(..end).collect::<Vec<_>>();
+                while state
+                    .buffer
+                    .first()
+                    .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+                {
+                    state.buffer.remove(0);
+                }
+                let bytes =
+                    translate_chat_sse_event(&event, state.protocol, &mut state.translation);
+                if !bytes.is_empty() {
+                    return Some((Ok::<Bytes, axum::Error>(Bytes::from(bytes)), state));
+                }
+                continue;
+            }
+            if state.eof {
+                return None;
+            }
+            match state.upstream.next().await {
+                Some(Ok(chunk)) => state.buffer.extend_from_slice(&chunk),
+                Some(Err(error)) => return Some((Err(error), state)),
+                None => {
+                    state.eof = true;
+                    if !state.buffer.is_empty() {
+                        state.buffer.extend_from_slice(b"\n\n");
+                    }
+                }
+            }
+        }
+    });
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    Response::from_parts(parts, Body::from_stream(translated))
+}
+
+fn find_sse_event_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(2).position(|window| window == b"\n\n")
+}
+
+fn translate_chat_sse_event(
+    event: &[u8],
+    protocol: ProtocolResponse,
+    state: &mut ProtocolTranslationState,
+) -> Vec<u8> {
+    let source = String::from_utf8_lossy(event);
+    let event_name = source
+        .lines()
+        .find_map(|line| line.strip_prefix("event:"))
+        .map(str::trim);
+    let data = source
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if event_name == Some("urouter.decision") {
+        return match protocol {
+            ProtocolResponse::Responses => named_sse("response.urouter", &data),
+            ProtocolResponse::Anthropic => named_sse("urouter.decision", &data),
+        };
+    }
+    if data == "[DONE]" {
+        return finish_protocol_stream(protocol, state);
+    }
+    let Ok(chunk) = serde_json::from_str::<Value>(&data) else {
+        return Vec::new();
+    };
+    if state.response_id.is_empty() {
+        chunk
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("urouter-stream")
+            .clone_into(&mut state.response_id);
+    }
+    let mut output = Vec::new();
+    if !state.started {
+        state.started = true;
+        match protocol {
+            ProtocolResponse::Responses => append_json_sse(
+                &mut output,
+                "response.created",
+                json!({"type": "response.created", "response": {"id": state.response_id, "status": "in_progress"}}),
+            ),
+            ProtocolResponse::Anthropic => append_json_sse(
+                &mut output,
+                "message_start",
+                json!({"type": "message_start", "message": {"id": state.response_id, "type": "message", "role": "assistant", "content": [], "stop_reason": null}}),
+            ),
+        }
+    }
+    let Some(delta) = chunk.pointer("/choices/0/delta") else {
+        return output;
+    };
+    if let Some(text) = delta.get("content").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        append_protocol_delta(&mut output, protocol, state, 0, "text", text, None, None);
+    }
+    if let Some(reasoning) = delta
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        append_protocol_delta(
+            &mut output,
+            protocol,
+            state,
+            1,
+            "reasoning",
+            reasoning,
+            None,
+            None,
+        );
+    }
+    if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+        for tool in tool_calls {
+            let index = tool.get("index").and_then(Value::as_u64).unwrap_or(0) + 2;
+            let arguments = tool
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            append_protocol_delta(
+                &mut output,
+                protocol,
+                state,
+                index,
+                "tool",
+                arguments,
+                tool.get("id").and_then(Value::as_str),
+                tool.pointer("/function/name").and_then(Value::as_str),
+            );
+        }
+    }
+    output
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_protocol_delta(
+    output: &mut Vec<u8>,
+    protocol: ProtocolResponse,
+    state: &mut ProtocolTranslationState,
+    index: u64,
+    kind: &str,
+    delta: &str,
+    id: Option<&str>,
+    name: Option<&str>,
+) {
+    match protocol {
+        ProtocolResponse::Responses => match kind {
+            "text" => append_json_sse(
+                output,
+                "response.output_text.delta",
+                json!({"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": delta}),
+            ),
+            "reasoning" => append_json_sse(
+                output,
+                "response.reasoning_text.delta",
+                json!({"type": "response.reasoning_text.delta", "output_index": 0, "delta": delta}),
+            ),
+            "tool" => {
+                if state.opened_blocks.insert(index) {
+                    append_json_sse(
+                        output,
+                        "response.output_item.added",
+                        json!({"type": "response.output_item.added", "output_index": index - 1, "item": {"type": "function_call", "id": id.unwrap_or("call"), "name": name.unwrap_or("tool"), "arguments": ""}}),
+                    );
+                }
+                if !delta.is_empty() {
+                    append_json_sse(
+                        output,
+                        "response.function_call_arguments.delta",
+                        json!({"type": "response.function_call_arguments.delta", "output_index": index - 1, "delta": delta}),
+                    );
+                }
+            }
+            _ => {}
+        },
+        ProtocolResponse::Anthropic => {
+            if state.opened_blocks.insert(index) {
+                let content = match kind {
+                    "tool" => {
+                        json!({"type": "tool_use", "id": id.unwrap_or("call"), "name": name.unwrap_or("tool"), "input": {}})
+                    }
+                    "reasoning" => json!({"type": "thinking", "thinking": ""}),
+                    _ => json!({"type": "text", "text": ""}),
+                };
+                append_json_sse(
+                    output,
+                    "content_block_start",
+                    json!({"type": "content_block_start", "index": index, "content_block": content}),
+                );
+            }
+            if !delta.is_empty() {
+                let value = match kind {
+                    "tool" => json!({"type": "input_json_delta", "partial_json": delta}),
+                    "reasoning" => json!({"type": "thinking_delta", "thinking": delta}),
+                    _ => json!({"type": "text_delta", "text": delta}),
+                };
+                append_json_sse(
+                    output,
+                    "content_block_delta",
+                    json!({"type": "content_block_delta", "index": index, "delta": value}),
+                );
+            }
+        }
+    }
+}
+
+fn finish_protocol_stream(
+    protocol: ProtocolResponse,
+    state: &mut ProtocolTranslationState,
+) -> Vec<u8> {
+    let mut output = Vec::new();
+    match protocol {
+        ProtocolResponse::Responses => append_json_sse(
+            &mut output,
+            "response.completed",
+            json!({"type": "response.completed", "response": {"id": state.response_id, "status": "completed"}}),
+        ),
+        ProtocolResponse::Anthropic => {
+            for index in &state.opened_blocks {
+                append_json_sse(
+                    &mut output,
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": index}),
+                );
+            }
+            append_json_sse(
+                &mut output,
+                "message_delta",
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}}),
+            );
+            append_json_sse(&mut output, "message_stop", json!({"type": "message_stop"}));
+        }
+    }
+    output
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn append_json_sse(output: &mut Vec<u8>, event: &str, value: Value) {
+    let data = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned());
+    output.extend_from_slice(&named_sse(event, &data));
+}
+
+fn named_sse(event: &str, data: &str) -> Vec<u8> {
+    format!("event: {event}\ndata: {data}\n\n").into_bytes()
 }
 
 async fn translate_chat_response(
@@ -3873,6 +4545,7 @@ async fn chat_completions_inner(
     apply_task_binding(&state, &governance, &mut decision).await?;
     ingest_piggyback(&state, &governance, &decision.signals).await?;
     let messages_hash = messages_hash(&request)?;
+    let vector_ref = persist_semantic_vector(&state, &request, &governance).await?;
     let record_seed = RecordSeed {
         request_id,
         messages_hash,
@@ -3880,6 +4553,7 @@ async fn chat_completions_inner(
         route_revision,
         artifact,
         exploration,
+        vector_ref,
     };
     let stream = request
         .get("stream")
@@ -4752,6 +5426,50 @@ fn messages_hash(request: &Value) -> Result<String, GatewayError> {
     Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
 }
 
+async fn persist_semantic_vector(
+    state: &AppState,
+    request: &Value,
+    governance: &RequestGovernance,
+) -> Result<Option<VectorRef>, GatewayError> {
+    let Some(value) = request.pointer("/urouter/semantic_vector") else {
+        return Ok(None);
+    };
+    if !governance.policy.allow_training
+        || governance.policy.recording != RecordingMode::MetadataOnly
+        || governance.compatibility_mode
+    {
+        return Ok(None);
+    }
+    let store = state.vector_store.as_ref().ok_or_else(|| {
+        GatewayError::bad_request(
+            "vector_store_unavailable",
+            "semantic_vector requires a configured vector side-store",
+        )
+    })?;
+    let vector = serde_json::from_value::<Vec<f32>>(value.clone()).map_err(|_| {
+        GatewayError::bad_request(
+            "invalid_semantic_vector",
+            "semantic_vector must be an array of finite numbers",
+        )
+    })?;
+    if vector.is_empty() || vector.len() > 4_096 {
+        return Err(GatewayError::bad_request(
+            "invalid_semantic_vector",
+            "semantic_vector dimensions must be in 1..=4096",
+        ));
+    }
+    if let Ok(reference) = store.append(&vector).await {
+        state.metrics.vector_writes.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(reference))
+    } else {
+        state
+            .metrics
+            .vector_write_errors
+            .fetch_add(1, Ordering::Relaxed);
+        Err(GatewayError::internal("semantic vector persistence failed"))
+    }
+}
+
 async fn execute_routed_upstream(
     state: &AppState,
     decision: &RouteDecision,
@@ -4920,8 +5638,9 @@ async fn execute_tier(
             break;
         };
         let deployment = lease.deployment.clone();
-        let prepared =
-            prepare_deployment_request(state, &deployment, request).map_err(|error| *error)?;
+        let prepared = prepare_deployment_request(state, &deployment, request)
+            .await
+            .map_err(|error| *error)?;
         let model = prepared.model;
         let url = prepared.url;
         let headers = prepared.headers;
@@ -4944,6 +5663,7 @@ async fn execute_tier(
                     &deployment,
                     &model,
                     selection_trace,
+                    lease.capacity_snapshot.clone(),
                     AttemptOutcome::success(response.status().as_u16(), latency_ms),
                 ));
                 return Ok(TierSuccess {
@@ -4956,6 +5676,7 @@ async fn execute_tier(
                 let attempt =
                     observe_attempt(state, &deployment.id, failure.latency_ms, attempts.len());
                 let selection_trace = lease.selection_trace.clone();
+                let capacity_snapshot = lease.capacity_snapshot.clone();
                 if let Err(error) = lease.complete(Err(failure.kind)).await {
                     return Err(TierExhausted {
                         error: Some(error),
@@ -4976,6 +5697,7 @@ async fn execute_tier(
                     &deployment,
                     &model,
                     selection_trace,
+                    capacity_snapshot,
                     AttemptOutcome::failure(&failure, retry),
                 ));
                 last_error = Some(upstream_error(
@@ -5018,6 +5740,10 @@ fn record_cache_affinity_success(
     if !hit {
         return trace;
     }
+    state
+        .metrics
+        .cache_affinity_hits
+        .fetch_add(1, Ordering::Relaxed);
     if let Some(selected) = trace
         .iter_mut()
         .find(|item| item.deployment == deployment.id)
@@ -5039,12 +5765,16 @@ const fn tier_exhausted(error: Option<GatewayError>, model: ModelSpec) -> TierEx
 
 fn observe_attempt(state: &AppState, deployment: &str, latency_ms: u128, attempts: usize) -> u8 {
     state
+        .metrics
+        .upstream_attempts
+        .fetch_add(1, Ordering::Relaxed);
+    state
         .capacity
         .observe_latency(deployment, u64::try_from(latency_ms).unwrap_or(u64::MAX));
     attempt_number(attempts)
 }
 
-fn prepare_deployment_request(
+async fn prepare_deployment_request(
     state: &AppState,
     deployment: &RouteDeployment,
     request: &Value,
@@ -5056,12 +5786,14 @@ fn prepare_deployment_request(
             model: model.clone(),
         })
     })?;
-    let headers = resolve_headers(&endpoint).map_err(|error| {
-        Box::new(TierExhausted {
-            error: Some(error),
-            model: model.clone(),
-        })
-    })?;
+    let headers = resolve_headers(&state.credentials, &endpoint)
+        .await
+        .map_err(|error| {
+            Box::new(TierExhausted {
+                error: Some(error),
+                model: model.clone(),
+            })
+        })?;
     let request = provider_request(request, &model).map_err(|error| {
         Box::new(TierExhausted {
             error: Some(error),
@@ -5213,7 +5945,8 @@ fn deployment_filter_reasons(
     match state.catalog.model(&deployment.model) {
         Some(model) => match endpoint_for_deployment(state, deployment, model) {
             Ok((endpoint, _))
-                if deployment.credential_available && resolve_headers(&endpoint).is_err() =>
+                if deployment.credential_available
+                    && !credential_source_configured(&endpoint.auth) =>
             {
                 reasons.push("credential_unavailable".to_owned());
             }
@@ -5223,6 +5956,24 @@ fn deployment_filter_reasons(
         None => reasons.push("model_unavailable".to_owned()),
     }
     reasons
+}
+
+fn credential_source_configured(plan: &AuthPlan) -> bool {
+    match plan {
+        AuthPlan::ApiKeyEnv { env, .. } | AuthPlan::AmbientEnv { env, .. } => {
+            std::env::var_os(env).is_some()
+        }
+        AuthPlan::OAuthBearerFile { path, .. } => FsPath::new(path).is_file(),
+        AuthPlan::OAuthClientCredentials {
+            client_id_env,
+            client_secret_env,
+            ..
+        } => {
+            std::env::var_os(client_id_env).is_some()
+                && std::env::var_os(client_secret_env).is_some()
+        }
+        AuthPlan::None => true,
+    }
 }
 
 fn unix_seconds() -> u64 {
@@ -5267,7 +6018,8 @@ async fn acquire_execution_lease(
 ) -> Result<Option<ExecutionLease>, GatewayError> {
     let mut selection_trace = Vec::new();
     loop {
-        let local = match state.capacity.select(candidates, excluded) {
+        let snapshot = combined_capacity_snapshot(state, candidates, excluded).await?;
+        let local = match state.capacity.select_from_snapshot(candidates, snapshot) {
             Ok(lease) => lease,
             Err(CapacityError::Exhausted(evaluations)) => {
                 selection_trace.extend(evaluations);
@@ -5279,6 +6031,7 @@ async fn acquire_execution_lease(
         selection_trace.extend(local.evaluations.clone());
         let deployment_id = local.deployment.id.clone();
         let deployment = local.deployment.clone();
+        let capacity_snapshot = local.snapshot.clone();
         if let Some(permit) = state
             .shared_circuits
             .acquire(&local.deployment)
@@ -5293,6 +6046,7 @@ async fn acquire_execution_lease(
                 permit: Some(permit),
                 tier_size: candidates.len(),
                 selection_trace,
+                capacity_snapshot,
             }));
         }
         selection_trace.push(DeploymentEvaluation {
@@ -5302,6 +6056,48 @@ async fn acquire_execution_lease(
         });
         excluded.insert(deployment_id);
     }
+}
+
+async fn combined_capacity_snapshot(
+    state: &AppState,
+    candidates: &[RouteDeployment],
+    excluded: &BTreeSet<String>,
+) -> Result<CapacitySnapshot, GatewayError> {
+    let mut snapshot = state.capacity.capacity_snapshot(candidates, excluded);
+    for deployment in candidates {
+        let shared = state
+            .shared_circuits
+            .snapshot(deployment)
+            .await
+            .map_err(state_backend_unavailable)?;
+        let Some(candidate) = snapshot
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.id == deployment.id)
+        else {
+            return Err(GatewayError::internal(
+                "capacity snapshot omitted a configured deployment",
+            ));
+        };
+        for circuit in shared {
+            match circuit.state {
+                urouter_gateway::capacity::CircuitState::Open => {
+                    candidate.circuit = urouter_contracts::LocalCircuitAvailability::Open;
+                    candidate.unavailable_reasons.push(format!(
+                        "shared_{}_circuit_unavailable",
+                        circuit.scope.as_str()
+                    ));
+                }
+                urouter_gateway::capacity::CircuitState::HalfOpen
+                    if candidate.circuit == urouter_contracts::LocalCircuitAvailability::Closed =>
+                {
+                    candidate.circuit = urouter_contracts::LocalCircuitAvailability::HalfOpen;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(snapshot)
 }
 
 async fn send_deployment_request(
@@ -5788,37 +6584,17 @@ fn normalize_max_tokens(object: &mut serde_json::Map<String, Value>, model: &Mod
     object.insert(field.to_owned(), value);
 }
 
-fn resolve_headers(endpoint: &EndpointPlan) -> Result<BTreeMap<String, String>, GatewayError> {
+async fn resolve_headers(
+    credentials: &CredentialManager,
+    endpoint: &EndpointPlan,
+) -> Result<BTreeMap<String, String>, GatewayError> {
     let mut headers = endpoint.public_headers.clone();
-    match &endpoint.auth {
-        AuthPlan::ApiKeyEnv {
-            env: variable,
-            header,
-            prefix,
-        }
-        | AuthPlan::AmbientEnv {
-            env: variable,
-            header,
-            prefix,
-        } => {
-            let secret = env::var(variable)
-                .map_err(|_| GatewayError::internal("credential environment is unavailable"))?;
-            headers.insert(header.clone(), format!("{prefix}{secret}"));
-        }
-        AuthPlan::OAuthBearerFile {
-            path,
-            header,
-            prefix,
-        } => {
-            let secret = fs::read_to_string(path)
-                .map_err(|_| GatewayError::internal("OAuth credential file is unavailable"))?;
-            let secret = secret.trim();
-            if secret.is_empty() {
-                return Err(GatewayError::internal("OAuth credential file is empty"));
-            }
-            headers.insert(header.clone(), format!("{prefix}{secret}"));
-        }
-        AuthPlan::None => {}
+    if let Some((header, value)) = credentials
+        .resolve(&endpoint.auth)
+        .await
+        .map_err(|_| GatewayError::internal("credential resolution failed"))?
+    {
+        headers.insert(header, value);
     }
     Ok(headers)
 }
@@ -5864,6 +6640,12 @@ async fn non_stream_response(
     };
     lease.complete(Ok(())).await?;
     let usage = parse_usage(&body);
+    if usage.is_none() {
+        state
+            .metrics
+            .usage_unavailable
+            .fetch_add(1, Ordering::Relaxed);
+    }
     settle_quota_usage(&quota, usage, quota_input_tokens, attempts.len()).await;
     let cost = calculate_cost(&model, usage)?;
     observe_execution_metrics(
@@ -5913,6 +6695,7 @@ async fn non_stream_response(
 
 const STREAM_TAIL_BYTES: usize = 64;
 
+#[allow(clippy::too_many_lines)]
 fn stream_response(
     state: AppState,
     execution: UpstreamExecution,
@@ -5968,6 +6751,12 @@ fn stream_response(
             return Ok::<Bytes, BoxError>(Bytes::new());
         }
         let usage = parse_stream_usage(&complete);
+        if usage.is_none() {
+            state
+                .metrics
+                .usage_unavailable
+                .fetch_add(1, Ordering::Relaxed);
+        }
         settle_quota_usage(&quota, usage, quota_input_tokens, attempts.len()).await;
         let cost = calculate_cost(&model, usage).ok().flatten();
         observe_stream_execution_metrics(
@@ -6244,6 +7033,7 @@ fn build_record(
         created_at_unix_s: now,
         redaction_profile: "metadata-v1".to_owned(),
         semantic_task,
+        vector_ref: record.vector_ref.clone(),
         exploration: record.exploration.clone(),
         route_id: decision.route_id,
         tier: decision.tier,
@@ -6481,11 +7271,40 @@ impl RecordStore {
     }
 }
 
-fn spawn_retention_sweeper(records: RecordStore) {
+async fn tombstone_record_vectors(
+    store: Option<&VectorSideStore>,
+    records: &[DecisionRecord],
+) -> Result<(), GatewayError> {
+    let Some(store) = store else {
+        return Ok(());
+    };
+    for reference in records
+        .iter()
+        .filter_map(|record| record.vector_ref.as_ref())
+    {
+        store
+            .tombstone(reference)
+            .await
+            .map_err(|_| GatewayError::internal("semantic vector deletion failed"))?;
+    }
+    Ok(())
+}
+
+fn spawn_retention_sweeper(records: RecordStore, vectors: Option<Arc<VectorSideStore>>) {
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(60)).await;
-            let _ = records.prune_expired().await;
+            let expired = records
+                .records
+                .read()
+                .await
+                .iter()
+                .filter(|record| record_expired(record))
+                .cloned()
+                .collect::<Vec<_>>();
+            if records.prune_expired().await.is_ok() {
+                let _ = tombstone_record_vectors(vectors.as_deref(), &expired).await;
+            }
         }
     });
 }
@@ -6941,6 +7760,64 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_rejects_exploration_without_a_persistent_record_authority() {
+        let catalog =
+            CatalogSnapshot::from_json_str(include_str!("../../../catalog/catalog.json")).unwrap();
+        let route = route();
+        let mut args = Args::parse_from(["urouter-gateway", "--dry-run"]);
+        args.exploration_epsilon_millionths = 10_000;
+        args.exploration_max_budget_nano_usd = 1;
+        let report = dry_run_report(
+            &args,
+            include_bytes!("../../../catalog/catalog.json"),
+            &catalog,
+            &route,
+        );
+        assert!(!report.valid);
+        assert_eq!(report.checks[6].status, DryRunStatus::Fail);
+    }
+
+    #[test]
+    fn dry_run_rejects_invalid_budget_and_implicit_redis_failure_policy() {
+        let catalog =
+            CatalogSnapshot::from_json_str(include_str!("../../../catalog/catalog.json")).unwrap();
+        let route = route();
+        let mut args = Args::parse_from(["urouter-gateway", "--dry-run"]);
+        args.tenant_budget_soft_nano_usd = 100;
+        args.tenant_budget_nano_usd = 100;
+        args.redis_url = Some("redis://127.0.0.1:6379".to_owned());
+        let report = dry_run_report(
+            &args,
+            include_bytes!("../../../catalog/catalog.json"),
+            &catalog,
+            &route,
+        );
+        assert!(!report.valid);
+        assert_eq!(report.checks[8].status, DryRunStatus::Fail);
+        assert_eq!(report.checks[9].status, DryRunStatus::Fail);
+    }
+
+    #[test]
+    fn cost_override_check_requires_a_nonempty_reason() {
+        let valid = br#"{"targets":[{"cost_override":{"reason":"contract","cost":{}}}]}"#;
+        let invalid = br#"{"targets":[{"cost_override":{"reason":" ","cost":{}}}]}"#;
+        assert_eq!(cost_override_reason_check(valid).0, DryRunStatus::Pass);
+        assert_eq!(cost_override_reason_check(invalid).0, DryRunStatus::Fail);
+    }
+
+    #[test]
+    fn cost_class_validation_detects_regressions() {
+        assert_eq!(
+            monotonic_cost_class_status(&CASCADE_COST_CLASSES),
+            DryRunStatus::Pass
+        );
+        assert_eq!(
+            monotonic_cost_class_status(&[ValidationCostClass::Remote, ValidationCostClass::Free,]),
+            DryRunStatus::Fail
+        );
+    }
+
+    #[test]
     fn configuration_dry_run_returns_structured_failure() {
         let args = Args::parse_from([
             "urouter-gateway",
@@ -6987,6 +7864,7 @@ mod tests {
             "/v1/artifacts/observe",
             "/v1/adapters/{harness}/chat/completions",
             "/v1/decisions",
+            "/v1/stats",
             "/v1/decisions/{id}",
             "/v1/tasks/{id}/records",
             "/v1/tenant/records",
@@ -7029,6 +7907,62 @@ mod tests {
         assert_eq!(anthropic["content"][1]["type"], "tool_use");
         assert_eq!(anthropic["stop_reason"], "tool_use");
         assert_eq!(anthropic["usage"]["output_tokens"], 7);
+    }
+
+    #[test]
+    fn protocol_stream_event_matrix_preserves_text_reasoning_tools_and_disclosure() {
+        let chunk = br#"data: {"id":"chat-1","choices":[{"delta":{"content":"hello","reasoning_content":"think","tool_calls":[{"index":0,"id":"call-1","function":{"name":"weather","arguments":"{\"city\":"}}]}}]}"#;
+        for protocol in [ProtocolResponse::Responses, ProtocolResponse::Anthropic] {
+            let mut state = ProtocolTranslationState::default();
+            let output =
+                String::from_utf8(translate_chat_sse_event(chunk, protocol, &mut state)).unwrap();
+            match protocol {
+                ProtocolResponse::Responses => {
+                    assert!(output.contains("response.output_text.delta"));
+                    assert!(output.contains("response.reasoning_text.delta"));
+                    assert!(output.contains("response.function_call_arguments.delta"));
+                }
+                ProtocolResponse::Anthropic => {
+                    assert!(output.contains("text_delta"));
+                    assert!(output.contains("thinking_delta"));
+                    assert!(output.contains("input_json_delta"));
+                }
+            }
+            let disclosure = String::from_utf8(translate_chat_sse_event(
+                b"event: urouter.decision\ndata: {\"tier\":\"capable\"}",
+                protocol,
+                &mut state,
+            ))
+            .unwrap();
+            assert!(disclosure.contains("urouter"));
+            let done = String::from_utf8(translate_chat_sse_event(
+                b"data: [DONE]",
+                protocol,
+                &mut state,
+            ))
+            .unwrap();
+            assert!(done.contains(match protocol {
+                ProtocolResponse::Responses => "response.completed",
+                ProtocolResponse::Anthropic => "message_stop",
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_stream_translation_handles_fragmented_sse_chunks() {
+        let chunks = stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"content\":\"hel",
+            )),
+            Ok(Bytes::from_static(b"lo\"}}]}\n\ndata: [DONE]\n\n")),
+        ]);
+        let response = Response::new(Body::from_stream(chunks));
+        let translated = translate_chat_stream_response(response, ProtocolResponse::Responses);
+        let bytes = to_bytes(translated.into_body(), 1_048_576).await.unwrap();
+        let output = std::str::from_utf8(&bytes).unwrap();
+        assert!(output.contains("response.output_text.delta"));
+        assert!(output.contains("hello"));
+        assert!(output.contains("response.completed"));
     }
 
     #[test]
@@ -7457,6 +8391,12 @@ mod tests {
         let body = to_bytes(response.into_body(), 1_048_576).await.unwrap();
         let body = std::str::from_utf8(&body).unwrap();
         for metric in [
+            "urouter_llm_calls_total",
+            "urouter_upstream_attempts_total",
+            "urouter_usage_unavailable_total",
+            "urouter_cache_affinity_hit_total",
+            "urouter_vector_write_total",
+            "urouter_vector_write_errors_total",
             "urouter_request_duration_milliseconds_bucket",
             "urouter_upstream_duration_milliseconds_bucket",
             "urouter_time_to_first_token_milliseconds_bucket",
@@ -7559,6 +8499,7 @@ mod tests {
             route_revision: route.revision(),
             artifact: None,
             exploration: None,
+            vector_ref: None,
         };
         build_record(
             &catalog,
@@ -7570,6 +8511,60 @@ mod tests {
             successful_execution(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn value_stats_separate_downgrade_and_cache_savings() {
+        let mut document: Value =
+            serde_json::from_str(include_str!("../../../catalog/catalog.json")).unwrap();
+        for model in document["models"].as_array_mut().unwrap() {
+            match model["id"].as_str() {
+                Some("local-vllm/qwen3.5-4b") => {
+                    model["cost"]["base"] = json!({"input": "2", "output": "4", "cache_read": "0.2", "cache_write": "2.5"});
+                }
+                Some("local-vllm-qwen38/qwen3.8-27b") => {
+                    model["cost"]["base"] = json!({"input": "10", "output": "20", "cache_read": "1", "cache_write": "12.5"});
+                }
+                _ => {}
+            }
+        }
+        let catalog = CatalogSnapshot::from_document(
+            serde_json::from_value(document).expect("valid fixture catalog"),
+        )
+        .unwrap();
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let mut record = record_for(&request, "value-stats");
+        record.evidence = CatalogEvidence::from_catalog(
+            &catalog,
+            &ModelId::new("local-vllm/qwen3.5-4b").unwrap(),
+            PriceSource::Catalog,
+        )
+        .unwrap();
+        record.execution.usage = Some(Usage {
+            input: 100,
+            output: 100,
+            cache_read: 900,
+            ..Usage::default()
+        });
+        record.outcome_signals = vec![FeedbackSignal {
+            kind: "quality".to_owned(),
+            strength: 0.8,
+        }];
+        let capable = catalog
+            .model(&ModelId::new("local-vllm-qwen38/qwen3.8-27b").unwrap())
+            .unwrap();
+
+        let stats = calculate_value_stats(&[record], &catalog, Some(capable));
+
+        assert_eq!(stats.actual_cost_nano_usd, 780_000);
+        assert_eq!(stats.cache_savings_nano_usd, 1_620_000);
+        assert_eq!(stats.downgrade_savings_nano_usd, 9_600_000);
+        assert_eq!(stats.total_savings_nano_usd, 11_220_000);
+        assert_eq!(stats.quality_mean, Some(0.8));
+        assert!((stats.quality_loss_vs_perfect.unwrap() - 0.2).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -7592,6 +8587,50 @@ mod tests {
             urouter_contracts::TraceCompleteness::Full
         );
         assert_eq!(context.trace.policy_filters.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn authorized_semantic_vector_is_side_stored_and_only_referenced() {
+        let mut state = test_state_with_route(route()).await;
+        let root = std::env::temp_dir().join(format!(
+            "urouter-gateway-vectors-{}-{}",
+            std::process::id(),
+            unix_seconds()
+        ));
+        let store = VectorSideStore::open(&root, 1_024).await.unwrap();
+        state.vector_store = Some(Arc::clone(&store));
+        let mut governance = test_governance();
+        governance.policy.allow_training = true;
+        governance.policy.recording = RecordingMode::MetadataOnly;
+        governance.compatibility_mode = false;
+        let request = json!({
+            "urouter": {"semantic_vector": [0.25, -0.5, 1.0]}
+        });
+        let reference = persist_semantic_vector(&state, &request, &governance)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reference.dimensions, 3);
+        assert_eq!(store.read(&reference).await.unwrap(), vec![0.25, -0.5, 1.0]);
+        assert!(!serde_json::to_string(&reference).unwrap().contains("0.25"));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn semantic_vector_requires_configured_store_when_training_is_authorized() {
+        let state = test_state_with_route(route()).await;
+        let mut governance = test_governance();
+        governance.policy.allow_training = true;
+        governance.policy.recording = RecordingMode::MetadataOnly;
+        governance.compatibility_mode = false;
+        let error = persist_semantic_vector(
+            &state,
+            &json!({"urouter": {"semantic_vector": [1.0]}}),
+            &governance,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "vector_store_unavailable");
     }
 
     #[test]
@@ -7627,10 +8666,12 @@ mod tests {
             ControlFailurePolicy::LastGood,
             None,
         );
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
         AppState {
             catalog,
             route,
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            client: client.clone(),
+            credentials: CredentialManager::new(client),
             records: records.clone(),
             record_repository: MemoryDecisionRecordRepository::new(records),
             feedback: FeedbackStore::default(),
@@ -7662,6 +8703,7 @@ mod tests {
                 maximum_budget_nano_usd: 0,
             },
             cache_affinity: CacheAffinityStore::new(100),
+            vector_store: None,
         }
     }
 
@@ -8761,6 +9803,7 @@ mod tests {
             route_revision: state.route.revision(),
             artifact: None,
             exploration: None,
+            vector_ref: None,
         };
         let record = build_record(
             catalog,
@@ -9782,6 +10825,7 @@ mod tests {
                     route_revision: state.route.revision(),
                     artifact: None,
                     exploration: None,
+                    vector_ref: None,
                 },
                 headers: HeaderMap::new(),
                 quota,
@@ -9886,6 +10930,7 @@ mod tests {
                     route_revision: state.route.revision(),
                     artifact: None,
                     exploration: None,
+                    vector_ref: None,
                 },
                 headers: HeaderMap::new(),
                 quota,

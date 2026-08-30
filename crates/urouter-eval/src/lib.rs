@@ -23,7 +23,17 @@ pub struct EvaluationRecord {
     pub governance: ExportGovernance,
     pub exploration: Option<ExplorationEvidence>,
     #[serde(default)]
+    pub flags: SampleFlags,
+    #[serde(default)]
     pub feedback: Vec<FeedbackEvidence>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SampleFlags {
+    pub usage_unavailable: bool,
+    pub capacity_constrained: bool,
+    pub catalog_drift: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +104,14 @@ pub fn evaluation_record_from_gateway(value: &Value) -> Result<EvaluationRecord,
         .cloned()
         .map(serde_json::from_value)
         .transpose()?;
+    let flags = SampleFlags {
+        usage_unavailable: value
+            .pointer("/execution/usage_unavailable")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        capacity_constrained: gateway_capacity_constrained(value, &context),
+        catalog_drift: false,
+    };
     Ok(EvaluationRecord {
         schema_version: DATASET_SCHEMA_VERSION,
         tenant_key,
@@ -141,8 +159,35 @@ pub fn evaluation_record_from_gateway(value: &Value) -> Result<EvaluationRecord,
             body_retained: false,
         },
         exploration,
+        flags,
         feedback: Vec::new(),
     })
+}
+
+fn gateway_capacity_constrained(value: &Value, context: &DecisionRecordContext) -> bool {
+    let removed = value
+        .pointer("/execution/runtime_filter_trace")
+        .and_then(Value::as_array)
+        .map_or(0, |trace| {
+            trace
+                .iter()
+                .filter(|entry| {
+                    entry.get("disposition").and_then(Value::as_str) == Some("filtered")
+                        && entry
+                            .get("reasons")
+                            .and_then(Value::as_array)
+                            .is_some_and(|reasons| {
+                                reasons.iter().any(|reason| {
+                                    reason.as_str().is_some_and(|reason| {
+                                        reason.contains("quota") || reason.contains("circuit")
+                                    })
+                                })
+                            })
+                })
+                .count()
+        });
+    let candidates = context.eligible_candidates.len();
+    candidates > 0 && removed.saturating_mul(2) > candidates
 }
 
 fn required_gateway_string(value: &Value, field: &'static str) -> Result<String, IngestError> {
@@ -212,6 +257,18 @@ pub struct DatasetManifest {
     pub records: usize,
     pub quarantined: usize,
     pub privacy_audit_samples: Vec<String>,
+    pub quality: DatasetQuality,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DatasetQuality {
+    pub matching_records: usize,
+    pub usage_unavailable: usize,
+    pub usage_unavailable_millionths: u32,
+    pub maximum_usage_unavailable_tier_share_millionths: u32,
+    pub capacity_constrained: usize,
+    pub capacity_constrained_millionths: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +300,7 @@ pub enum QuarantineReason {
     DeletedGeneration,
     InvalidExploration,
     SuspiciousFeedback,
+    UsageUnavailable,
 }
 
 pub fn build_dataset(
@@ -256,11 +314,15 @@ pub fn build_dataset(
             .cmp(&right.timestamp_unix)
             .then_with(|| left.context.request_id.cmp(&right.context.request_id))
     });
-    let baseline = records
+    let matching = records
         .iter()
-        .find(|record| matches_filter(record, filter))
+        .filter(|record| matches_filter(record, filter))
+        .collect::<Vec<_>>();
+    let baseline = matching
+        .first()
         .map(|record| record.context.revisions.clone())
         .ok_or(DatasetError::NoMatchingRecords)?;
+    let quality = dataset_quality(&matching);
     let mut accepted = Vec::new();
     let mut quarantine = Vec::new();
     for record in records
@@ -302,10 +364,50 @@ pub fn build_dataset(
             records: accepted.len(),
             quarantined: quarantine.len(),
             privacy_audit_samples,
+            quality,
         },
         records: accepted,
         quarantine,
     })
+}
+
+fn dataset_quality(records: &[&EvaluationRecord]) -> DatasetQuality {
+    let usage_unavailable = records
+        .iter()
+        .filter(|record| record.flags.usage_unavailable)
+        .count();
+    let capacity_constrained = records
+        .iter()
+        .filter(|record| record.flags.capacity_constrained)
+        .count();
+    let mut unavailable_by_tier = BTreeMap::<&str, usize>::new();
+    for record in records
+        .iter()
+        .filter(|record| record.flags.usage_unavailable)
+    {
+        *unavailable_by_tier
+            .entry(record.selected_tier.as_str())
+            .or_default() += 1;
+    }
+    DatasetQuality {
+        matching_records: records.len(),
+        usage_unavailable,
+        usage_unavailable_millionths: ratio_millionths(usage_unavailable, records.len()),
+        maximum_usage_unavailable_tier_share_millionths: unavailable_by_tier
+            .values()
+            .copied()
+            .max()
+            .map_or(0, |maximum| ratio_millionths(maximum, usage_unavailable)),
+        capacity_constrained,
+        capacity_constrained_millionths: ratio_millionths(capacity_constrained, records.len()),
+    }
+}
+
+fn ratio_millionths(numerator: usize, denominator: usize) -> u32 {
+    if denominator == 0 {
+        return 0;
+    }
+    u32::try_from(numerator.saturating_mul(1_000_000) / denominator).unwrap_or(1_000_000)
 }
 
 fn matches_filter(record: &EvaluationRecord, filter: &ExportFilter) -> bool {
@@ -350,6 +452,9 @@ fn quarantine_reasons(
     }
     if record.outcome.is_none() {
         reasons.insert(QuarantineReason::MissingOutcome);
+    }
+    if record.flags.usage_unavailable {
+        reasons.insert(QuarantineReason::UsageUnavailable);
     }
     if record.governance.recording == RecordingClass::None {
         reasons.insert(QuarantineReason::RecordingDisabled);
@@ -762,6 +867,7 @@ mod tests {
                 selected_by_exploration: true,
                 authorized_budget_nano_usd: 1_000,
             }),
+            flags: SampleFlags::default(),
             feedback: vec![FeedbackEvidence {
                 source: "user".to_owned(),
                 source_event_id: format!("feedback-{id}"),

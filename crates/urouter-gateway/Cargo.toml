@@ -21,6 +21,7 @@ tokio.workspace = true
 urouter-ai = { path = "../urouter-ai" }
 urouter-artifact = { path = "../urouter-artifact" }
 urouter-contracts = { path = "../urouter-contracts" }
+urouter-core = { path = "../urouter-core" }
 urouter-protocol = { path = "../urouter-protocol" }
 urouter-types = { path = "../urouter-types" }
 url.workspace = true

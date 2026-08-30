@@ -14,13 +14,13 @@ the existence of code alone is not completion evidence.
 |---|---|---|---|---|
 | Catalog facts and pricing | Design sections 5.1-5.5 | code_complete | `crates/urouter-ai`, catalog tests | P3-02 |
 | API-key endpoint planning | Design section 5.6 | code_complete | `urouter-ai` auth and endpoint plans | P15-02 |
-| OAuth and ambient credentials | Design section 5.6 | code_complete | externally rotated OAuth bearer-file and ambient-env plans; per-request reread and redacted errors | cloud identity integration |
+| OAuth and ambient credentials | Design section 5.6 | code_complete | bearer-file/ambient plans plus client-credentials refresh, shared token-file lock, single-flight concurrency and redacted failure tests | cloud identity integration |
 | Compatibility facts | Design section 5.7 | code_complete | `Compat`, catalog validation | P6-02 |
 | Catalog discovery | Design section 5.8 | code_complete | OpenAI, Bailian and reviewed-static drivers share immutable evidence, auth and throttling contracts | controlled non-SiliconFlow discovery |
 | Catalog candidate/review/publish | Design section 5.8 | code_complete | field-evidence review, quarantine schemas, control-last publish, HMAC and rollback tests | real provider-owner review |
 | Catalog hot refresh | Design sections 5.8, 15.9 | code_complete | revision/ETag, periodic validation, atomic per-request snapshot and last-good/fail-closed policies | multi-Gateway rollout drill |
 | Provider-neutral deployments | Design section 5.9 | code_complete | typed provider/credential scope, region/residency/tenant/quota/lifecycle fields, API family from Catalog, route revision binding and filter tests | multi-cloud production metadata review |
-| Cross-provider message handoff | Design section 5.10 | code_complete | `urouter-protocol` normalized IR, explicit loss policy, OpenAI Responses/Anthropic non-stream transports and conversion tests | cross-cloud staging drill |
+| Cross-provider message handoff | Design section 5.10 | code_complete | `urouter-protocol` normalized IR, explicit loss policy, OpenAI Responses/Anthropic request/response transports and client-facing incremental stream conversion tests | cross-cloud staging drill and provider-specific upstream stream validation |
 | Versioned FeatureFrame | Design section 6 | code_complete | `urouter-contracts` v1 is shared by Gateway records, eval, artifact infer and Embed | schema evolution review |
 | Lazy semantic features | Design section 6.3 | code_complete | rule-first greeting/weather/equation classifier with confidence and abstention | multilingual evaluation expansion |
 | Feature normalization parity | Design section 6.4 | code_complete | Gateway and Embed call the same `FeatureFrame::from_openai_chat`; corpus parity test | production corpus expansion |
@@ -42,16 +42,16 @@ the existence of code alone is not completion evidence.
 | Memory and Redis binding state | Design section 12 | code_complete | binding/circuit/idempotency/DecisionRecord/quota ports with memory/Redis adapters | P1-08 |
 | Shared circuit state | Design section 12 | code_complete | Redis circuit gate | P2-10 |
 | Per-state failure matrix | Design section 12.3 | code_complete | correctness domains fail closed; metrics/latency domains fail open; documented matrix and contract test | Redis HA drill |
-| DecisionRecord and feedback | Design section 13 | code_complete | v2 context plus created time, semantic task, redaction profile, artifact/exploration evidence; memory/Redis authority and normalization tests | production retention audit |
+| DecisionRecord and feedback | Design section 13 | code_complete | v2 context, exact per-attempt CapacitySnapshot and optional VectorRef; float32 side-store has rotation, integrity checks and persistent deletion tombstones propagated by explicit/TTL record deletion | production retention and recovery audit |
 | Exploration propensity | Design section 13 | code_complete | default-off epsilon exploration requires recording, training consent, explicit authorization and bounded budget; records eligible set and propensity | tenant-authorized traffic exercise |
 | Step/Driver model-call unload | Design section 14.1 | code_complete | `urouter-artifact::StepBudget` bounds depth, calls, cost, cancellation and recursive Judge; rule fallback tests | enable a real Judge only after approval |
 | OpenAI chat translation | Design section 14.2 | code_complete | request rewrite and streaming proxy | P6-01 |
-| Responses/Anthropic translation | Design section 14.2 | code_complete | normalized request IR, `/v1/responses`, `/v1/messages`, provider-side non-stream adapters and output/tool/usage tests | demand-led streaming adapters |
+| Responses/Anthropic translation | Design section 14.2 | code_complete | normalized request IR, `/v1/responses`, `/v1/messages`, provider-side adapters and incremental client-facing SSE text/reasoning/tool/disclosure tests | provider-specific upstream streaming adapters |
 | Cancellation propagation | Design sections 14.3, 15.7 | code_complete | execution lease and stream cancellation tests | P2-06 |
-| Startup dry-run checks | Design section 16.1 | code_complete | stable 16-item report now validates configured artifact signature/schema/revisions/tiers and exploration constraints | deployment config regression |
+| Startup dry-run checks | Design section 16.1 | code_complete | real CLI reports 16 structured checks; compiled CostClass order, exploration persistence, budget bounds, Redis failure policy and cost override reasons have pass/fail tests; artifact-only checks are conditional | deployment config regression |
 | Dataset build/export | Design section 17.1 | code_complete | `urouter-eval` deterministic export, revisions/privacy/deletion/feedback quarantine and `urouter-lab normalize/dataset` | one-week authorized dataset acceptance |
 | Counterfactual evaluation | Design section 17.2 | code_complete | IPS, SNIPS, DR, variance, 95% CI and ESS tests plus CLI | real propensity sample acceptance |
-| Artifact export gates | Design section 17.3 | code_complete | deterministic `urouter-lab train`, benchmark/support/privacy/counterfactual gates, HMAC build/verify | independent reproduction and signer review |
+| Artifact export gates | Design section 17.3 | code_complete | deterministic MLP/KNN/contrastive train, DR/Pareto sweep, bounded standard ONNX MLP export/load parity, replay agreement and p99 gates | independent Python reproduction, shadow and signer review |
 | Basic Prometheus metrics | Design section 18.1 | code_complete | counters plus OpenMetrics cumulative histograms | dashboard provisioning |
 | Full routing/cost/SLO metrics | Design sections 18.1-18.2 | code_complete | duration, upstream, TTFT, cost and fallback histograms; trace exemplar and low-cardinality test | dashboard and chaos acceptance |
 | Health endpoint | Design section 18.3 | code_complete | liveness, dependency/revision readiness and bounded drain tests | orchestrator exercise |
@@ -59,10 +59,10 @@ the existence of code alone is not completion evidence.
 | Control revision coordination | Design sections 15.9, 18.3 | code_complete | signed Catalog/Route manifest, required revision readiness, last-good/fail-closed, rollback | distribution outage drill |
 | Semantic tool requirement and Host continuation | Design sections 7, 14 | code_complete | weather requires disclosed Host tool; missing tool rejects; tool-result continuation tested | Agent Host end-to-end run |
 | OpenAI-compatible Gateway | Design milestone M0 | accepted | chat, stream, models, explain and smoke evidence | regression gate |
-| Multi-instance state | Design milestone M1 | code_complete | Redis continuity and restart evidence | X-02 |
-| Evaluation and model profiles | Design milestone M2 | code_complete | governed dataset pipeline, five-category benchmark, IPS/SNIPS/DR and support-domain gates | real authorized dataset acceptance |
-| Learned router release | Design milestone M3 | code_complete | signed artifacts, bounded inference, shadow/canary/rollback/kill and management APIs | staged production canary acceptance |
-| Embeddable decision facade | Design milestone M4 | code_complete | `urouter-client`, `urouter-embed`, normalized protocol crate and exact core parity test | crate publication and downstream adoption |
+| Multi-instance state and closed-loop data | Design milestone M1 | partial | local code gates for shared CapacitySnapshot, vector side-store/deletion, metrics and value attribution are complete | one-week authorized traffic, Redis HA and retention/recovery evidence |
+| Trainable evaluation and model profiles | Design milestone M2 | partial | local code gates for PyO3 parity, MLP/KNN/contrastive, DR/Pareto sweep, ONNX parity, replay and data-quality export gates are complete | Python import reproduction, M1 dataset artifact and shadow evidence |
+| Productionized learned router | Design milestone M3 | partial | local code gates for OAuth locking, client-facing three-protocol streaming, staged soak/canary and automatic rollback are complete | cloud identity/staging, 24h soak and real 10% canary confidence evidence |
+| Embeddable decision facade | Design milestone M4 | code_complete | `urouter-core` owns the zero-I/O Route decision API; Embed has explicit CapacitySnapshot injection, host Driver, two runnable examples, and same-artifact Gateway-Core parity without gateway/state/client dependencies | crate publication and downstream adoption |
 
 ## Update Rule
 

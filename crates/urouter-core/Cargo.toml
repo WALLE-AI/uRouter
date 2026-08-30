@@ -1,19 +1,20 @@
 [package]
-name = "urouter-embed"
+name = "urouter-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "In-process facade over the uRouter gateway decision core"
-readme = "README.md"
+description = "Pure, zero-I/O uRouter decision core"
 
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 urouter-ai = { version = "0.1.0", path = "../urouter-ai" }
-urouter-artifact = { version = "0.1.0", path = "../urouter-artifact" }
 urouter-contracts = { version = "0.1.0", path = "../urouter-contracts" }
-urouter-core = { version = "0.1.0", path = "../urouter-core" }
+urouter-types = { version = "0.1.0", path = "../urouter-types" }
+url.workspace = true
 
 [lints]
 workspace = true

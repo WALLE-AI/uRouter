@@ -325,7 +325,8 @@ pub struct DeploymentSelection {
     pub evaluations: Vec<DeploymentEvaluation>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LocalCircuitAvailability {
     Closed,
     Open,
@@ -333,7 +334,8 @@ pub enum LocalCircuitAvailability {
     HalfOpenProbeInFlight,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapacityCandidateSnapshot {
     pub id: String,
     pub order: u16,
@@ -343,6 +345,62 @@ pub struct CapacityCandidateSnapshot {
     pub in_flight: u64,
     pub latency_ewma_ms: Option<u64>,
     pub quota_usage_millis: Option<u16>,
+    #[serde(default)]
+    pub unavailable_reasons: Vec<String>,
+}
+
+pub const CAPACITY_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VectorRef {
+    pub shard: String,
+    pub offset_bytes: u64,
+    pub dimensions: u32,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacitySnapshot {
+    pub schema_version: u16,
+    pub candidates: Vec<CapacityCandidateSnapshot>,
+}
+
+impl Default for CapacitySnapshot {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl CapacitySnapshot {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            schema_version: CAPACITY_SNAPSHOT_SCHEMA_VERSION,
+            candidates: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn new(candidates: Vec<CapacityCandidateSnapshot>) -> Self {
+        Self {
+            schema_version: CAPACITY_SNAPSHOT_SCHEMA_VERSION,
+            candidates,
+        }
+    }
+
+    #[must_use]
+    pub fn candidate(&self, deployment: &str) -> Option<&CapacityCandidateSnapshot> {
+        self.candidates
+            .iter()
+            .find(|candidate| candidate.id == deployment)
+    }
+
+    #[must_use]
+    pub fn is_compatible(&self) -> bool {
+        self.schema_version == CAPACITY_SNAPSHOT_SCHEMA_VERSION
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -386,7 +444,7 @@ pub fn plan_capacity_lease_with_picker(
     let mut policy_candidates = candidates
         .iter()
         .map(|candidate| {
-            let mut unavailable_reasons = Vec::new();
+            let mut unavailable_reasons = candidate.unavailable_reasons.clone();
             if candidate.retry_excluded {
                 unavailable_reasons.push("retry_excluded".to_owned());
             }
@@ -1239,6 +1297,7 @@ mod tests {
                 in_flight: 0,
                 latency_ewma_ms: None,
                 quota_usage_millis: None,
+                unavailable_reasons: Vec::new(),
             },
             CapacityCandidateSnapshot {
                 id: "half-open".to_owned(),
@@ -1249,6 +1308,7 @@ mod tests {
                 in_flight: 0,
                 latency_ewma_ms: None,
                 quota_usage_millis: None,
+                unavailable_reasons: Vec::new(),
             },
             CapacityCandidateSnapshot {
                 id: "backup".to_owned(),
@@ -1259,6 +1319,7 @@ mod tests {
                 in_flight: 0,
                 latency_ewma_ms: None,
                 quota_usage_millis: None,
+                unavailable_reasons: Vec::new(),
             },
         ];
         let plan = plan_capacity_lease(&candidates, 0).unwrap();
@@ -1282,6 +1343,7 @@ mod tests {
                 in_flight: 0,
                 latency_ewma_ms: None,
                 quota_usage_millis: None,
+                unavailable_reasons: Vec::new(),
             },
             CapacityCandidateSnapshot {
                 id: "busy-probe".to_owned(),
@@ -1292,6 +1354,7 @@ mod tests {
                 in_flight: 0,
                 latency_ewma_ms: None,
                 quota_usage_millis: None,
+                unavailable_reasons: Vec::new(),
             },
         ];
         let CapacityLeasePlanError::Exhausted(evaluations) =
@@ -1318,6 +1381,7 @@ mod tests {
             in_flight: load,
             latency_ewma_ms: latency,
             quota_usage_millis: quota,
+            unavailable_reasons: Vec::new(),
         };
         let candidates = vec![
             candidate("a", 2, Some(30), Some(500)),

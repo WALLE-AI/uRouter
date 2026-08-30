@@ -10,9 +10,9 @@ use std::{
 use serde::Serialize;
 use thiserror::Error;
 use urouter_contracts::{
-    CapacityCandidateSnapshot, CapacityLeasePlanError, CooldownDirective, DeploymentEvaluation,
-    DeploymentPicker, FailureWindow, LocalCircuitAvailability, cooldown_directive,
-    plan_capacity_lease_with_picker,
+    CapacityCandidateSnapshot, CapacityLeasePlanError, CapacitySnapshot, CooldownDirective,
+    DeploymentEvaluation, DeploymentPicker, FailureWindow, LocalCircuitAvailability,
+    cooldown_directive, plan_capacity_lease_with_picker,
 };
 
 use crate::{RouteDeployment, UpstreamErrorKind};
@@ -58,6 +58,8 @@ pub enum CapacityError {
     EmptyTier,
     #[error("all deployments are cooling or excluded")]
     Exhausted(Vec<DeploymentEvaluation>),
+    #[error("capacity snapshot does not match the candidate set")]
+    InvalidSnapshot,
 }
 
 #[derive(Debug, Default)]
@@ -103,28 +105,28 @@ impl CapacityManager {
         candidates: &[RouteDeployment],
         excluded: &BTreeSet<String>,
     ) -> Result<CapacityLease, CapacityError> {
+        let snapshot = self.capacity_snapshot(candidates, excluded);
+        self.select_from_snapshot(candidates, snapshot)
+    }
+
+    pub fn select_from_snapshot(
+        self: &Arc<Self>,
+        candidates: &[RouteDeployment],
+        snapshot: CapacitySnapshot,
+    ) -> Result<CapacityLease, CapacityError> {
         if candidates.is_empty() {
             return Err(CapacityError::EmptyTier);
         }
-        let now = Instant::now();
-        let mut health = self.health.lock().expect("capacity lock poisoned");
-        let mut snapshots = Vec::with_capacity(candidates.len());
-        for deployment in candidates {
-            let state = health.entry(deployment.id.clone()).or_default();
-            prune_events(state, now, self.policy.window);
-            snapshots.push(CapacityCandidateSnapshot {
-                id: deployment.id.clone(),
-                order: deployment.order,
-                weight: deployment.weight,
-                retry_excluded: excluded.contains(&deployment.id),
-                circuit: local_circuit_availability(state, now),
-                in_flight: state.in_flight,
-                latency_ewma_ms: state.latency_ewma_ms,
-                quota_usage_millis: deployment.quota_usage_millis,
-            });
+        if !snapshot.is_compatible()
+            || snapshot.candidates.len() != candidates.len()
+            || candidates
+                .iter()
+                .any(|candidate| snapshot.candidate(&candidate.id).is_none())
+        {
+            return Err(CapacityError::InvalidSnapshot);
         }
         let plan = plan_capacity_lease_with_picker(
-            &snapshots,
+            &snapshot.candidates,
             self.ticket.fetch_add(1, Ordering::Relaxed),
             self.picker,
         )
@@ -138,9 +140,8 @@ impl CapacityManager {
             .iter()
             .find(|deployment| deployment.id == selection.selected)
             .expect("policy selection references an input deployment");
-        let selected_health = health
-            .get_mut(&selected.id)
-            .expect("eligible deployment health exists");
+        let mut health = self.health.lock().expect("capacity lock poisoned");
+        let selected_health = health.entry(selected.id.clone()).or_default();
         if plan.reserve_half_open_probe {
             selected_health.half_open_probe = true;
         }
@@ -161,6 +162,7 @@ impl CapacityManager {
             deployment: (*selected).clone(),
             runners_up,
             evaluations: selection.evaluations,
+            snapshot,
             tier_size: candidates.len(),
             completed: false,
         })
@@ -171,6 +173,17 @@ impl CapacityManager {
         for deployment in deployments {
             health.entry(deployment.id.clone()).or_default();
         }
+    }
+
+    #[must_use]
+    pub fn capacity_snapshot(
+        &self,
+        candidates: &[RouteDeployment],
+        excluded: &BTreeSet<String>,
+    ) -> CapacitySnapshot {
+        let now = Instant::now();
+        let mut health = self.health.lock().expect("capacity lock poisoned");
+        snapshot_locked(&mut health, candidates, excluded, now, self.policy.window)
     }
 
     #[must_use]
@@ -274,8 +287,38 @@ pub struct CapacityLease {
     pub deployment: RouteDeployment,
     pub runners_up: Vec<RouteDeployment>,
     pub evaluations: Vec<DeploymentEvaluation>,
+    pub snapshot: CapacitySnapshot,
     tier_size: usize,
     completed: bool,
+}
+
+fn snapshot_locked(
+    health: &mut BTreeMap<String, DeploymentHealth>,
+    candidates: &[RouteDeployment],
+    excluded: &BTreeSet<String>,
+    now: Instant,
+    window: Duration,
+) -> CapacitySnapshot {
+    CapacitySnapshot::new(
+        candidates
+            .iter()
+            .map(|deployment| {
+                let state = health.entry(deployment.id.clone()).or_default();
+                prune_events(state, now, window);
+                CapacityCandidateSnapshot {
+                    id: deployment.id.clone(),
+                    order: deployment.order,
+                    weight: deployment.weight,
+                    retry_excluded: excluded.contains(&deployment.id),
+                    circuit: local_circuit_availability(state, now),
+                    in_flight: state.in_flight,
+                    latency_ewma_ms: state.latency_ewma_ms,
+                    quota_usage_millis: deployment.quota_usage_millis,
+                    unavailable_reasons: Vec::new(),
+                }
+            })
+            .collect(),
+    )
 }
 
 impl CapacityLease {
@@ -361,6 +404,52 @@ mod tests {
                 .state,
             CircuitState::Open
         );
+    }
+
+    #[test]
+    fn lease_retains_the_exact_pre_reservation_capacity_snapshot() {
+        let manager = CapacityManager::new(CooldownPolicy::default());
+        let deployments = vec![deployment("primary", 0), deployment("backup", 1)];
+        let lease = manager.select(&deployments, &BTreeSet::new()).unwrap();
+        assert!(lease.snapshot.is_compatible());
+        assert_eq!(lease.snapshot.candidate("primary").unwrap().in_flight, 0);
+
+        let live = manager.capacity_snapshot(&deployments, &BTreeSet::new());
+        assert_eq!(live.candidate("primary").unwrap().in_flight, 1);
+        assert_eq!(lease.snapshot.candidate("primary").unwrap().in_flight, 0);
+        lease.complete(Ok(()));
+    }
+
+    #[test]
+    fn externally_enriched_snapshot_excludes_shared_circuit_before_selection() {
+        let manager = CapacityManager::new(CooldownPolicy::default());
+        let deployments = vec![deployment("primary", 0), deployment("backup", 1)];
+        let mut snapshot = manager.capacity_snapshot(&deployments, &BTreeSet::new());
+        let primary = snapshot
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.id == "primary")
+            .unwrap();
+        primary.circuit = LocalCircuitAvailability::Open;
+        primary
+            .unavailable_reasons
+            .push("shared_provider_circuit_unavailable".to_owned());
+
+        let lease = manager
+            .select_from_snapshot(&deployments, snapshot)
+            .unwrap();
+        assert_eq!(lease.deployment.id, "backup");
+        let primary = lease
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.deployment == "primary")
+            .unwrap();
+        assert!(
+            primary
+                .reasons
+                .contains(&"shared_provider_circuit_unavailable".to_owned())
+        );
+        lease.complete(Ok(()));
     }
 
     #[test]

@@ -5,8 +5,11 @@ members = [
     "crates/urouter-ai",
     "crates/urouter-eval",
     "crates/urouter-artifact",
+    "crates/urouter-infer",
     "crates/urouter-protocol",
+    "crates/urouter-py",
     "crates/urouter-client",
+    "crates/urouter-core",
     "crates/urouter-embed",
     "crates/urouter-gateway",
     "tools/urouter-catalog",
@@ -37,6 +40,7 @@ thiserror = "2.0"
 tokio = { version = "1.52", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
 url = "2.5"
+onnx-pb = "0.1.4"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

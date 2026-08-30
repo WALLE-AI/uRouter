@@ -11,8 +11,11 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+onnx-pb.workspace = true
 urouter-artifact = { path = "../../crates/urouter-artifact" }
+urouter-contracts = { path = "../../crates/urouter-contracts" }
 urouter-eval = { path = "../../crates/urouter-eval" }
+urouter-infer = { path = "../../crates/urouter-infer" }
 urouter-types = { path = "../../crates/urouter-types" }
 
 [lints]

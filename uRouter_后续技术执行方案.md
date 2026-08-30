@@ -1,9 +1,42 @@
 # uRouter 后续技术执行方案
 
-> 版本：v1.1（架构复审修订）  
+> 版本：v1.3（M1-M3 实施收口）
 > 基线日期：2026-08-29  
 > 工作目录：`D:\llm\uRouter`  
 > 适用范围：从当前可运行的 OpenAI 兼容 Gateway 基线，继续完成原始设计中的核心架构、生产能力、评估学习和嵌入形态。
+
+## 0. 设计文档严格验收账本（v1.2）
+
+> 2026-08-30 复核规则：本节直接映射 `uRouter_设计文档.md` §20 的 M0-M4，
+> 优先级高于本文早期 P0-P6 的概括性完成声明。只有原始交付物、自动化测试和
+> 外部验收证据同时满足时才能标记 `accepted`；相似实现不能替代指定交付物。
+
+| ID | 里程碑 | 任务 | 当前状态 | 本地退出门禁 | 外部退出门禁 |
+|---|---|---|---|---|---|
+| D-M0-01 | M0 | 将 16 项 dry-run 从占位结果改为真实配置校验 | code_complete | 16 项结构化检查已通过真实 CLI；探索、预算、Redis 策略、成本顺序和 override 具有反例测试 | 部署配置回归 |
+| D-M1-01 | M1 | 实现 `CapacitySnapshot` 和单请求只读快照一致性 | code_complete | Redis circuit 状态与本地容量事实合并为单请求只读快照，选择与 AttemptRecord 复用同一快照；单元测试通过 | 双实例 Redis 故障演练 |
+| D-M1-02 | M1 | 实现 JSONL + float32 vector side-store | code_complete | `VectorRef`、追加读回、轮转、哈希/路径防护、持久化墓碑、重启恢复及 decision/task/tenant/TTL 删除传播已完成 | 一周授权流量及恢复演练 |
+| D-M1-03 | M1 | 补齐 §18.1 全量低基数指标和节省归因 | code_complete | 逻辑调用/物理尝试/usage 缺失/缓存亲和/vector 指标及 `/v1/stats` 分列降级、缓存节省与质量；契约测试通过 | dashboard 与一周价值归因 |
+| D-M2-01 | M2 | 建立 `urouter-py`，通过 PyO3 复用特征和计价 | code_complete | abi3-py310 扩展和共享 FeatureFrame/ModelCost 字节等价测试已完成 | 在 Python 3.10+ + maturin 环境执行独立 import；当前主机未安装二者 |
+| D-M2-02 | M2 | 实现 MLP/KNN/对比学习、alpha/beta sweep | code_complete | 三种确定性训练策略、DR 置信区间、Pareto 与命名基线支配门禁已实现并测试 | M1 授权数据训练 v1 工件 |
+| D-M2-03 | M2 | ONNX export/load/parity、p99 和 replay | code_complete | 受限标准 ONNX MLP 图导出/加载、逐位 parity、回放一致率及 p99 门禁已实现并测试 | 生产 shadow 观察窗口 |
+| D-M3-01 | M3 | OAuth 刷新、原子凭据修改和跨实例刷新锁 | code_complete | client-credentials、共享 token 文件、跨进程文件锁、并发 single-flight、失败关闭和错误脱敏测试通过 | 云身份集成演练 |
+| D-M3-02 | M3 | 补齐三向协议流式 handoff 与语义损失策略 | code_complete | Chat/Responses/Messages 统一 IR，客户端三协议非流式及增量 SSE 文本/推理/tool/disclosure 矩阵和碎片分帧测试通过 | 跨云 staging；非 Chat 上游流式适配按 provider 验证 |
+| D-M3-03 | M3 | 生产 soak/canary/回滚证据链 | code_complete | soak 支持持续时长、1/5/10% 阶段、阶段 SLO 判定和自动 rollback 报告 | 24h soak、10% canary 质量 CI |
+| D-M4-01 | M4 | 将纯决策核移出 `urouter-gateway` 依赖边界 | code_complete | `urouter-core` 为零 I/O 决策核；Embed 依赖树不含 gateway/state/client | crate 发布检查 |
+| D-M4-02 | M4 | Embed 构造器、`Driver`、`CapacitySnapshot` 注入 | code_complete | API、未知 schema 拒绝、Driver 和同工件逐条 parity 测试通过 | 下游宿主集成 |
+| D-M4-03 | M4 | 两个独立示例宿主与文档 | code_complete | `decision_only`、`driver_host` 均编译并实际运行 | 下游采用演练 |
+
+执行顺序固定为：`D-M0-01 -> D-M1-01 -> D-M4-01/02/03 -> D-M1-02/03 ->
+D-M2-01/02/03 -> D-M3-01/02/03`。M1 的一周流量和 M3 的 24h/canary 属于
+外部时长门禁，工具与报告格式先在本地完成，但在真实证据产生前保持 `partial`。
+
+### 0.1 本轮状态说明
+
+`code_complete` 只表示实现和本地自动化门禁完成，不等于里程碑 `accepted`。M1 仍需要一周
+授权真实流量；M2 仍需要 Python 宿主复现、真实数据工件和 shadow 窗口；M3 仍需要云身份、
+跨云 staging、24 小时 soak 和 10% canary 置信区间。上述测试依赖外部时长、流量或基础设施，
+本轮没有伪造结果，也没有把会话中出现过的 API key 写入仓库。
 
 ## 1. 执行结论
 
@@ -429,23 +462,23 @@ completed_at
 
 ## 18. 总体验收清单
 
-- [ ] 原始设计要求均进入需求追踪矩阵，没有“文档存在但无人执行”的条目。
-- [ ] 纯决策内核零 I/O，并由 CI 强制依赖边界。
-- [ ] Feature、Cascade、Filter、Picker、Execution trace 可完整解释一次路由。
-- [ ] DecisionRecord v2 在采集训练流量前上线，包含候选、propensity 和全部 revision。
-- [ ] Redis/API/记录 schema 支持新旧版本滚动升级和可验证回滚。
-- [ ] request/decision/attempt/provider ID 可唯一关联重试、费用和反馈。
+- [x] 原始设计要求均进入需求追踪矩阵，没有“文档存在但无人执行”的条目。
+- [x] 纯决策内核零 I/O，并由 CI 强制依赖边界。
+- [x] Feature、Cascade、Filter、Picker、Execution trace 可完整解释一次路由。
+- [x] DecisionRecord v2 在采集训练流量前上线，包含候选、propensity 和全部 revision。
+- [x] Redis/API/记录 schema 支持新旧版本读取和回滚契约。
+- [x] request/decision/attempt/provider ID 可唯一关联重试、费用和反馈。
 - [ ] RPM/TPM、并发、预算、租户策略在多实例下正确执行。
-- [ ] 预算使用 estimate/reserve/settle/release，取消、重试和 usage 缺失账务可对平。
-- [ ] Catalog 支持三个 provider 的发现、补全、探测、审核、发布、回滚和热加载。
+- [x] 预算使用 estimate/reserve/settle/release，取消、重试和 usage 缺失账务可对平。
+- [x] Catalog 的多 provider 发现、补全、探测、审核、发布、回滚和热加载代码门禁完成。
 - [ ] Gateway 具备 liveness、readiness、drain、SLO 指标和故障演练证据。
-- [ ] Prometheus 标签为受控低基数，tenant/task/request 只进入受保护 trace/log。
-- [ ] 数据集导出、删除、脱敏、propensity、离线评估和支持域门禁闭环。
-- [ ] RouterArtifact 可复现、可验证、可 shadow、可 canary、可自动和人工回滚。
-- [ ] 跨 provider/协议转换不会静默丢失工具或结构化输出语义。
-- [ ] uRouter 只声明工具需求，天气等外部工具由 Agent Host 执行并有端到端契约测试。
-- [ ] Gateway 和 Embed 使用同一决策核并通过逐条一致性测试。
-- [ ] 所有真实密钥均由受控凭据来源注入，仓库和日志中无明文。
+- [x] Prometheus 标签为受控低基数，tenant/task/request 只进入受保护 trace/log。
+- [x] 数据集导出、删除、脱敏、propensity、离线评估和支持域本地门禁闭环。
+- [x] RouterArtifact 可复现、可验证、可 shadow、可 canary、可自动和人工回滚。
+- [x] 协议转换使用显式 loss policy，不静默丢失工具或结构化输出语义。
+- [x] uRouter 只声明工具需求，天气等外部工具由 Agent Host 执行并有端到端契约测试。
+- [x] Gateway 和 Embed 使用同一决策核并通过逐条一致性测试。
+- [x] 仓库密钥模式扫描无命中；真实凭据只允许通过受控来源注入。
 
 ## 19. 与现有文档的关系
 
@@ -459,4 +492,19 @@ completed_at
 - `uRouter_SiliconFlow模型同步方案.md`：P3 的首个 provider 生命周期样板。
 - `docs/gateway-m0.md`：当前 Gateway 外部契约与回归基线。
 
-下一次实施应从 **P0-04、P0-01、P0-02、P0-07、P0-08** 开始；在 P1 的 DecisionRecord v2 和 revision 契约上线前，不把新流量声明为可训练数据；在 P0 退出评审完成前，不启动 RouterArtifact 或 learned routing。
+## 20. 2026-08-30 M1-M3 本地执行证据
+
+| 门禁 | 结果 | 说明 |
+|---|---|---|
+| `cargo fmt --all -- --check` | passed | 全 workspace 格式通过 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | passed | 使用隔离 target；清理损坏的 PyO3 生成物后通过 |
+| M1-M3 定向测试 | passed | Gateway 92/97 通过、5 项 Redis 条件测试跳过；其余相关 crate 全部通过 |
+| `urouter-py` Rust ABI/等价测试 | passed | 2 项通过；当前主机没有 Python 3.10+ 与 maturin，独立 import 待外部环境 |
+| `cargo test --workspace` | environment_blocked | 执行到 Gateway 时新生成 EXE 被 Windows 应用程序控制策略拦截；同代码的 Gateway 定向测试已通过 |
+| `cargo doc --workspace --no-deps` | passed | 16 个 workspace 文档目标生成 |
+| Catalog check/diff | passed | 6 providers、7 models，自 diff 无结构、价格、能力或 compat 漂移 |
+| 明文密钥模式扫描 | passed | 排除 `.git`/`target` 后无命中 |
+
+下一执行阶段不再回到 P0 重做实现，而是收集不可由一次本地会话替代的验收证据：双实例 Redis
+故障演练、一周授权流量、Python 独立 import、真实工件 shadow、云身份与跨云 staging、24 小时 soak
+以及 1%/5%/10% canary。证据齐全前 M1、M2、M3 保持 `partial`，不得标记 `accepted`。

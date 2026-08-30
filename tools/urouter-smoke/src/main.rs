@@ -289,6 +289,9 @@ fn resolve_headers(
             }
             headers.insert(header.clone(), format!("{prefix}{secret}"));
         }
+        AuthPlan::OAuthClientCredentials { .. } => {
+            return Err("OAuth client-credentials refresh is supported by the Gateway; smoke accepts a resolved bearer file".into());
+        }
         AuthPlan::None => {}
     }
     Ok(headers)

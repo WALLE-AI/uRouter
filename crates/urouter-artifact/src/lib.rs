@@ -24,6 +24,8 @@ pub struct RouterArtifact {
     pub seed: u64,
     pub training_rows: usize,
     pub model: LinearPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_model: Option<LearnedPolicy>,
     pub support: ArtifactSupportDomain,
     pub export_gates: ExportGates,
     pub content_hash: String,
@@ -49,6 +51,59 @@ pub struct FeatureWeights {
     pub image_millis: i64,
     pub structured_millis: i64,
     pub reasoning_millis: i64,
+}
+
+pub const LEARNED_FEATURE_DIMENSIONS: usize = 6;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LearnedPolicy {
+    Mlp(MlpPolicy),
+    Knn(KnnPolicy),
+    Contrastive(ContrastivePolicy),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MlpPolicy {
+    pub baseline_tier: String,
+    pub promoted_tier: String,
+    pub hidden: Vec<MlpHiddenUnit>,
+    pub output_bias: i64,
+    pub threshold: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MlpHiddenUnit {
+    pub weights: [i64; LEARNED_FEATURE_DIMENSIONS],
+    pub bias: i64,
+    pub output_weight: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnnPolicy {
+    pub baseline_tier: String,
+    pub promoted_tier: String,
+    pub k: usize,
+    pub prototypes: Vec<KnnPrototype>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnnPrototype {
+    pub features: [i64; LEARNED_FEATURE_DIMENSIONS],
+    pub promoted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContrastivePolicy {
+    pub baseline_tier: String,
+    pub promoted_tier: String,
+    pub baseline_centroid: [i64; LEARNED_FEATURE_DIMENSIONS],
+    pub promoted_centroid: [i64; LEARNED_FEATURE_DIMENSIONS],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +138,8 @@ struct ArtifactPayload<'a> {
     seed: u64,
     training_rows: usize,
     model: &'a LinearPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    learned_model: Option<&'a LearnedPolicy>,
     support: &'a ArtifactSupportDomain,
     export_gates: &'a ExportGates,
 }
@@ -125,6 +182,7 @@ impl RouterArtifact {
             seed,
             training_rows,
             model,
+            learned_model: None,
             support,
             export_gates,
             content_hash: String::new(),
@@ -132,6 +190,14 @@ impl RouterArtifact {
         };
         artifact.content_hash = artifact.compute_hash()?;
         Ok(artifact)
+    }
+
+    pub fn with_learned_model(mut self, model: LearnedPolicy) -> Result<Self, ArtifactError> {
+        validate_learned_policy(&model)?;
+        self.learned_model = Some(model);
+        self.content_hash = self.compute_hash()?;
+        self.signature = None;
+        Ok(self)
     }
 
     pub fn sign(&mut self, key: &[u8]) -> Result<(), ArtifactError> {
@@ -189,8 +255,11 @@ impl RouterArtifact {
         semantic_task: &str,
         operation_limit: u32,
     ) -> Result<Inference, InferenceError> {
-        const REQUIRED_OPERATIONS: u32 = 6;
-        if operation_limit < REQUIRED_OPERATIONS {
+        let required_operations = self
+            .learned_model
+            .as_ref()
+            .map_or(6, learned_operation_count);
+        if operation_limit < required_operations {
             return Err(InferenceError::OperationBudgetExceeded);
         }
         if !self.support.semantic_tasks.contains(semantic_task)
@@ -198,6 +267,15 @@ impl RouterArtifact {
             || (features.available_tool_count > 0 && !self.support.tools_supported)
         {
             return Err(InferenceError::OutOfSupportDomain);
+        }
+        if let Some(model) = &self.learned_model {
+            let (tier, score) = infer_learned(model, feature_vector(features));
+            return Ok(Inference {
+                artifact_revision: self.artifact_revision.clone(),
+                tier,
+                score_millis: score,
+                operations: required_operations,
+            });
         }
         let input_kib = i64::try_from(features.input_text_bytes / 1_024).unwrap_or(i64::MAX);
         let messages = i64::from(features.message_count);
@@ -225,7 +303,7 @@ impl RouterArtifact {
             artifact_revision: self.artifact_revision.clone(),
             tier,
             score_millis: score,
-            operations: REQUIRED_OPERATIONS,
+            operations: required_operations,
         })
     }
 
@@ -240,6 +318,7 @@ impl RouterArtifact {
             seed: self.seed,
             training_rows: self.training_rows,
             model: &self.model,
+            learned_model: self.learned_model.as_ref(),
             support: &self.support,
             export_gates: &self.export_gates,
         };
@@ -255,6 +334,126 @@ impl RouterArtifact {
             self.schema_version, self.artifact_revision, self.content_hash
         )
     }
+}
+
+fn feature_vector(features: &FeatureFrame) -> [i64; LEARNED_FEATURE_DIMENSIONS] {
+    [
+        i64::try_from(features.input_text_bytes / 1_024).unwrap_or(i64::MAX),
+        i64::from(features.message_count),
+        i64::from(features.available_tool_count),
+        i64::from(features.content.contains_image) * 100,
+        i64::from(features.requests.structured_output) * 100,
+        i64::from(features.requests.reasoning) * 100,
+    ]
+}
+
+fn validate_learned_policy(model: &LearnedPolicy) -> Result<(), ArtifactError> {
+    let valid = match model {
+        LearnedPolicy::Mlp(model) => !model.hidden.is_empty() && model.hidden.len() <= 64,
+        LearnedPolicy::Knn(model) => {
+            !model.prototypes.is_empty()
+                && model.prototypes.len() <= 4_096
+                && model.k > 0
+                && model.k <= model.prototypes.len()
+        }
+        LearnedPolicy::Contrastive(_) => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ArtifactError::InvalidLearnedPolicy)
+    }
+}
+
+fn learned_operation_count(model: &LearnedPolicy) -> u32 {
+    let dimensions = u32::try_from(LEARNED_FEATURE_DIMENSIONS).unwrap_or(u32::MAX);
+    match model {
+        LearnedPolicy::Mlp(model) => u32::try_from(model.hidden.len())
+            .unwrap_or(u32::MAX)
+            .saturating_mul(dimensions.saturating_add(2)),
+        LearnedPolicy::Knn(model) => u32::try_from(model.prototypes.len())
+            .unwrap_or(u32::MAX)
+            .saturating_mul(dimensions.saturating_add(1)),
+        LearnedPolicy::Contrastive(_) => dimensions.saturating_mul(2),
+    }
+}
+
+fn infer_learned(
+    model: &LearnedPolicy,
+    features: [i64; LEARNED_FEATURE_DIMENSIONS],
+) -> (String, i64) {
+    match model {
+        LearnedPolicy::Mlp(model) => {
+            let score = model.hidden.iter().fold(model.output_bias, |score, unit| {
+                let activation = dot(unit.weights, features).saturating_add(unit.bias).max(0);
+                score.saturating_add(activation.saturating_mul(unit.output_weight))
+            });
+            let tier = if score >= model.threshold {
+                model.promoted_tier.clone()
+            } else {
+                model.baseline_tier.clone()
+            };
+            (tier, score)
+        }
+        LearnedPolicy::Knn(model) => {
+            let mut neighbors = model
+                .prototypes
+                .iter()
+                .enumerate()
+                .map(|(index, prototype)| {
+                    (
+                        squared_distance(features, prototype.features),
+                        index,
+                        prototype.promoted,
+                    )
+                })
+                .collect::<Vec<_>>();
+            neighbors.sort_by_key(|(distance, index, _)| (*distance, *index));
+            let promoted = neighbors
+                .iter()
+                .take(model.k)
+                .filter(|(_, _, promoted)| *promoted)
+                .count();
+            let score = i64::try_from(promoted).unwrap_or(i64::MAX);
+            let tier = if promoted.saturating_mul(2) >= model.k {
+                model.promoted_tier.clone()
+            } else {
+                model.baseline_tier.clone()
+            };
+            (tier, score)
+        }
+        LearnedPolicy::Contrastive(model) => {
+            let baseline = squared_distance(features, model.baseline_centroid);
+            let promoted = squared_distance(features, model.promoted_centroid);
+            let score = i64::try_from(baseline.saturating_sub(promoted)).unwrap_or(i64::MAX);
+            let tier = if promoted <= baseline {
+                model.promoted_tier.clone()
+            } else {
+                model.baseline_tier.clone()
+            };
+            (tier, score)
+        }
+    }
+}
+
+fn dot(left: [i64; LEARNED_FEATURE_DIMENSIONS], right: [i64; LEARNED_FEATURE_DIMENSIONS]) -> i64 {
+    left.into_iter()
+        .zip(right)
+        .fold(0_i64, |sum, (left, right)| {
+            sum.saturating_add(left.saturating_mul(right))
+        })
+}
+
+fn squared_distance(
+    left: [i64; LEARNED_FEATURE_DIMENSIONS],
+    right: [i64; LEARNED_FEATURE_DIMENSIONS],
+) -> u128 {
+    left.into_iter()
+        .zip(right)
+        .fold(0_u128, |sum, (left, right)| {
+            let delta = i128::from(left).saturating_sub(i128::from(right));
+            sum.saturating_add(delta.unsigned_abs().saturating_pow(2))
+        })
 }
 
 fn all_export_gates_pass(gates: &ExportGates) -> bool {
@@ -689,6 +888,8 @@ pub enum ArtifactError {
     InvalidSignature,
     #[error("artifact signing key is empty")]
     EmptySigningKey,
+    #[error("learned artifact policy is empty or exceeds runtime bounds")]
+    InvalidLearnedPolicy,
     #[error("artifact rollout requires canary basis points <= 10000 and operation limit >= 6")]
     InvalidRollout,
     #[error(transparent)]
@@ -829,6 +1030,37 @@ mod tests {
         assert!(matches!(
             artifact.infer(&features(0), "greeting", 5),
             Err(InferenceError::OperationBudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn learned_mlp_is_hash_bound_and_used_by_inference() {
+        let mut artifact = artifact(9)
+            .with_learned_model(LearnedPolicy::Mlp(MlpPolicy {
+                baseline_tier: "efficient".to_owned(),
+                promoted_tier: "capable".to_owned(),
+                hidden: vec![MlpHiddenUnit {
+                    weights: [0, 0, 10, 0, 0, 0],
+                    bias: 0,
+                    output_weight: 1,
+                }],
+                output_bias: 0,
+                threshold: 5,
+            }))
+            .unwrap();
+        artifact.sign(b"learned-key").unwrap();
+        assert_eq!(
+            artifact.infer(&features(0), "greeting", 8).unwrap().tier,
+            "efficient"
+        );
+        assert_eq!(
+            artifact.infer(&features(1), "greeting", 8).unwrap().tier,
+            "capable"
+        );
+        artifact.learned_model = None;
+        assert!(matches!(
+            artifact.verify(1, "catalog-1", "route-1", Some(b"learned-key")),
+            Err(ArtifactError::ContentHashMismatch)
         ));
     }
 

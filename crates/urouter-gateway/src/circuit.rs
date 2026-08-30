@@ -25,7 +25,8 @@ pub enum FailureScope {
 }
 
 impl FailureScope {
-    const fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Deployment => "deployment",
             Self::Credential => "credential",

@@ -1,19 +1,22 @@
 [package]
-name = "urouter-embed"
+name = "urouter-py"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "In-process facade over the uRouter gateway decision core"
-readme = "README.md"
+description = "Python bindings for uRouter feature extraction and exact pricing"
+
+[lib]
+name = "urouter_py"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+pyo3 = { version = "0.29", features = ["abi3-py310", "extension-module"] }
 serde_json.workspace = true
 thiserror.workspace = true
 urouter-ai = { version = "0.1.0", path = "../urouter-ai" }
-urouter-artifact = { version = "0.1.0", path = "../urouter-artifact" }
 urouter-contracts = { version = "0.1.0", path = "../urouter-contracts" }
-urouter-core = { version = "0.1.0", path = "../urouter-core" }
+urouter-types = { version = "0.1.0", path = "../urouter-types" }
 
 [lints]
 workspace = true
