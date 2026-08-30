@@ -17,7 +17,8 @@
         "query": {
           "sub_type": "chat",
           "type": "text"
-        }
+        },
+        "min_request_interval_ms": 250
       },
       "credential_scope": "siliconflow-main",
       "enabled": true
@@ -40,7 +41,8 @@
         "query": {
           "language": "zh-CN",
           "supports": "inference"
-        }
+        },
+        "min_request_interval_ms": 500
       },
       "credential_scope": "bailian-cn-beijing-main",
       "enabled": true

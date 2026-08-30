@@ -1,0 +1,199 @@
+{
+  "schema_version": 1,
+  "started_at_unix_s": 1788093111,
+  "base_url": "http://127.0.0.1:8792/v1",
+  "requested_budget_nano_usd": 10000000,
+  "observed_cost_nano_usd": 0,
+  "planned_requests": 5,
+  "completed_requests": 5,
+  "budget_exceeded": false,
+  "passed": 0,
+  "failed": 5,
+  "runs": [
+    {
+      "id": "daily-greeting-run-1",
+      "category": "daily",
+      "status": 502,
+      "passed": false,
+      "latency_ms": 326,
+      "cost_nano_usd": 0,
+      "tier": null,
+      "model": null,
+      "reason": null,
+      "checks": [
+        {
+          "name": "http_status",
+          "passed": false,
+          "expected": "200",
+          "actual": "502"
+        },
+        {
+          "name": "tier",
+          "passed": false,
+          "expected": "efficient",
+          "actual": "missing"
+        },
+        {
+          "name": "model",
+          "passed": false,
+          "expected": "siliconflow/qwen2.5-7b-instruct",
+          "actual": "missing"
+        }
+      ]
+    },
+    {
+      "id": "tool-weather-run-1",
+      "category": "tool",
+      "status": 502,
+      "passed": false,
+      "latency_ms": 128,
+      "cost_nano_usd": 0,
+      "tier": null,
+      "model": null,
+      "reason": null,
+      "checks": [
+        {
+          "name": "http_status",
+          "passed": false,
+          "expected": "200",
+          "actual": "502"
+        },
+        {
+          "name": "tier",
+          "passed": false,
+          "expected": "capable",
+          "actual": "missing"
+        },
+        {
+          "name": "model",
+          "passed": false,
+          "expected": "siliconflow/deepseek-r1-pro",
+          "actual": "missing"
+        },
+        {
+          "name": "tool_name",
+          "passed": false,
+          "expected": "get_weather",
+          "actual": "missing"
+        }
+      ]
+    },
+    {
+      "id": "math-equation-run-1",
+      "category": "math",
+      "status": 502,
+      "passed": false,
+      "latency_ms": 128,
+      "cost_nano_usd": 0,
+      "tier": null,
+      "model": null,
+      "reason": null,
+      "checks": [
+        {
+          "name": "http_status",
+          "passed": false,
+          "expected": "200",
+          "actual": "502"
+        },
+        {
+          "name": "tier",
+          "passed": false,
+          "expected": "capable",
+          "actual": "missing"
+        },
+        {
+          "name": "model",
+          "passed": false,
+          "expected": "siliconflow/deepseek-r1-pro",
+          "actual": "missing"
+        },
+        {
+          "name": "content_contains",
+          "passed": false,
+          "expected": "6",
+          "actual": "content_length=0"
+        },
+        {
+          "name": "content_contains",
+          "passed": false,
+          "expected": "4",
+          "actual": "content_length=0"
+        }
+      ]
+    },
+    {
+      "id": "code-rust-gcd-run-1",
+      "category": "code",
+      "status": 502,
+      "passed": false,
+      "latency_ms": 276,
+      "cost_nano_usd": 0,
+      "tier": null,
+      "model": null,
+      "reason": null,
+      "checks": [
+        {
+          "name": "http_status",
+          "passed": false,
+          "expected": "200",
+          "actual": "502"
+        },
+        {
+          "name": "tier",
+          "passed": false,
+          "expected": "efficient",
+          "actual": "missing"
+        },
+        {
+          "name": "model",
+          "passed": false,
+          "expected": "siliconflow/qwen2.5-7b-instruct",
+          "actual": "missing"
+        },
+        {
+          "name": "content_contains",
+          "passed": false,
+          "expected": "fn gcd",
+          "actual": "content_length=0"
+        }
+      ]
+    },
+    {
+      "id": "long-context-recall-run-1",
+      "category": "long_context",
+      "status": 502,
+      "passed": false,
+      "latency_ms": 284,
+      "cost_nano_usd": 0,
+      "tier": null,
+      "model": null,
+      "reason": null,
+      "checks": [
+        {
+          "name": "http_status",
+          "passed": false,
+          "expected": "200",
+          "actual": "502"
+        },
+        {
+          "name": "tier",
+          "passed": false,
+          "expected": "efficient",
+          "actual": "missing"
+        },
+        {
+          "name": "model",
+          "passed": false,
+          "expected": "siliconflow/qwen2.5-7b-instruct",
+          "actual": "missing"
+        },
+        {
+          "name": "content_contains",
+          "passed": false,
+          "expected": "UROUTER_LONG_CONTEXT_OK",
+          "actual": "content_length=0"
+        }
+      ]
+    }
+  ]
+}

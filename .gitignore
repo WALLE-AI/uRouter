@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 .venv/
 __pycache__/
 *.pyc
@@ -15,4 +17,4 @@ packages/*/lib/
 real-smoke-report.log
 dist/
 target/
-catalog/providers/state/
+# catalog/providers/state/

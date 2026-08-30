@@ -1,6 +1,6 @@
 # uRouter Gateway M0
 
-Last updated: 2026-08-26
+Last updated: 2026-08-30
 
 ## Outcome
 
@@ -31,6 +31,9 @@ cargo run -q -p urouter-gateway -- \
 Endpoints:
 
 - `GET /health`
+- `GET /health/live`
+- `GET /health/ready`
+- `GET /openapi.json`
 - `GET /v1/models`
 - `POST /v1/explain`
 - `POST /v1/chat/completions`
@@ -43,11 +46,41 @@ Endpoints:
 - `POST /v1/feedback`
 - `GET /v1/feedback/{turn}`
 - `GET /v1/tiers`
+- `GET /v1/catalog`
+- `POST /v1/catalog/refresh`
+- `POST /v1/catalog/rollback`
 - `GET /v1/tasks/{id}/binding`
 - `DELETE /v1/tasks/{id}/binding`
 - `GET /v1/sessions/{conversation}/{branch}/binding`
 - `DELETE /v1/sessions/{conversation}/{branch}/binding`
 - `GET /metrics`
+
+## P2/P3 Continuation
+
+The current Gateway extends M0 without changing the OpenAI chat surface:
+
+- typed error-specific fallback chains and Bad Request hard stops;
+- atomic tenant quota and hard-budget reserve/settle semantics;
+- dependency and control-revision readiness plus bounded graceful drain;
+- OpenMetrics histograms with trace exemplars outside normal labels;
+- a signed Catalog/Route control manifest, periodic validated hot reload,
+  last-good/fail-closed policies and per-request immutable snapshots;
+- RBAC/audit protected Catalog status, refresh and rollback;
+- deployment retirement with task/session binding grace;
+- conservative greeting, equation and realtime-weather semantic requirements.
+
+Generate an initial manifest with `urouter-catalog sync control-manifest`. In
+production, pass `--signing-key-env` to that command and the matching
+`--control-signing-key-env` to the Gateway. `GET /v1/catalog` returns the active
+revision as JSON and as an HTTP ETag. Refresh always reads server-configured
+paths and never accepts credentials or file paths from a client request.
+
+Realtime weather is a Host/Gateway contract, not an embedded weather feature.
+The Host must disclose a `get_weather` function in the OpenAI `tools` array,
+execute the emitted tool call, and send the tool result in the continuation.
+Without that disclosure, the Gateway returns `missing_required_tool` before
+contacting a model. Equations select a reasoning-capable model; unknown semantic
+classes abstain and preserve the established routing policy.
 
 Example request:
 
@@ -99,9 +132,14 @@ rewrites `developer` to `system` when catalog compatibility requires it.
 
 Decisions are disclosed through:
 
-- response headers `x-urouter-decision-id`, `tier`, `model`, `reason`, and `alternatives`;
+- response headers `x-urouter-request-id`, `x-urouter-decision-id`, `tier`, `model`, `reason`, and `alternatives`;
 - a top-level `urouter` object for non-streaming responses;
 - a final `event: urouter.decision` SSE event before `data: [DONE]` for streams.
+
+`POST /v1/chat/completions` accepts an optional tenant-scoped `Idempotency-Key` of
+1-256 visible ASCII bytes. Reusing it with the same canonical request reuses the
+logical `request_id`; using it with a different request returns HTTP 409. Only a
+SHA-256 key is retained. This identity contract does not yet cache or replay responses.
 
 Each successful execution creates a `DecisionRecord` containing the capability
 requirement, full admission result, selected alternatives, catalog and pricing
@@ -211,6 +249,29 @@ cooldown expires, only one gateway receives the global Half-Open probe token;
 stream cancellation abandons that token with a bounded Redis timeout fallback.
 `GET /v1/tiers` merges local health with each shared scope's Closed/Open/Half-Open
 state and remaining cooldown.
+
+Tenant admission can additionally be bounded with `--tenant-max-in-flight` and
+`--tenant-requests-per-minute`; `--tenant-tokens-per-minute` applies a third weighted
+window, and all three limits default to `0` (unlimited). The concurrency limit acquires one
+permit after routing governance and releases it after a non-stream response, completed
+stream, error, or client cancellation. The latter counts each admitted request in a
+rolling 60-second window and is deliberately not returned on completion or cancellation.
+Memory mode is process-local. Redis mode uses tenant-scoped sorted sets and one Lua
+check/prune/reserve operation, so multiple gateways share both limits. Exhaustion returns
+HTTP 429 with `tenant_concurrency_exhausted`, `tenant_rate_limit_exhausted`, or
+`tenant_token_limit_exhausted`; Redis
+errors return the stable state-backend HTTP 503. In-flight permits have a configurable
+`--quota-lease-ttl-seconds` safety expiry (default 86,400 seconds). Streams longer than
+that TTL require a larger configured value until lease renewal is implemented.
+
+TPM reserves estimated input for the configured retry allowance plus requested output.
+Input currently uses serialized request bytes divided by four; absent output limits use
+`--quota-default-max-output-tokens` (default 4,096). Successful non-stream and terminal
+stream Usage replaces the reservation, with estimated input retained for earlier failed
+attempts. Failure, cancellation, or unavailable Usage keeps the reservation until window
+expiry. Settlement backend errors do not hide an already successful provider response;
+the conservative reservation remains. Provider-tokenizer estimation and controlled
+multi-instance Redis verification remain acceptance work.
 
 ## Task-Aware Continuity
 
@@ -486,9 +547,9 @@ zero while still exercising the same fixed-point calculator used for paid models
 
 ## Deferred After Capacity Continuation
 
-- Redis/object storage, multi-instance coordination, and retention beyond one file generation;
+- Object storage and retention beyond the implemented Redis/one-file-generation modes;
 - end-user authentication and external identity-provider integration;
 - dataset export and offline paired-sample quality evaluation;
 - cross-provider wire translation beyond OpenAI-compatible chat;
-- sustained load/soak testing and production SLO dashboards;
-- learned routing, budget control, affinity, and escalation latch behavior.
+- production SLO dashboards and cloud chaos exercises;
+- production acceptance of learned routing/cache-affinity tuning and activation of a real remote Judge/Escalation model call.

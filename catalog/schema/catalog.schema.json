@@ -42,6 +42,28 @@
         },
         {
           "type": "object",
+          "required": ["kind", "path"],
+          "properties": {
+            "kind": { "const": "oauth_bearer_file" },
+            "path": { "type": "string", "minLength": 1 },
+            "header": { "type": "string" },
+            "prefix": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "env"],
+          "properties": {
+            "kind": { "const": "ambient_env" },
+            "env": { "type": "string", "minLength": 1 },
+            "header": { "type": "string" },
+            "prefix": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "required": ["kind"],
           "properties": {
             "kind": { "const": "none" },

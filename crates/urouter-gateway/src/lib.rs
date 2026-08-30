@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use urouter_ai::{
     admission::{AdmissionResult, eligible_models},
@@ -10,42 +11,14 @@ use urouter_ai::{
 };
 use urouter_types::ModelId;
 
+pub use urouter_contracts::{FallbackCause, RetryPolicy, UpstreamErrorKind};
+use urouter_contracts::{
+    RuleEvaluation, RuleOutcome, TierCandidate, TierDecisionError, TierDecisionInput,
+    TierSelection, select_tier_with_cascade,
+};
+
 pub mod capacity;
 pub mod circuit;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UpstreamErrorKind {
-    Transport,
-    Timeout,
-    RateLimited,
-    ServerError,
-    ProviderUnavailable,
-    Unauthorized,
-    NotFound,
-    BadRequest,
-}
-
-impl UpstreamErrorKind {
-    #[must_use]
-    pub const fn retryable(self) -> bool {
-        matches!(
-            self,
-            Self::Transport
-                | Self::Timeout
-                | Self::RateLimited
-                | Self::ServerError
-                | Self::ProviderUnavailable
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetryPolicy {
-    pub max_retries: u8,
-    pub base_backoff_ms: u64,
-    pub max_backoff_ms: u64,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,30 +35,30 @@ pub struct RouteDeployment {
     pub provider_scope: Option<String>,
     #[serde(default)]
     pub credential_scope: Option<String>,
+    #[serde(default = "bool_true")]
+    pub enabled: bool,
+    #[serde(default = "bool_true")]
+    pub credential_available: bool,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub residency: Vec<String>,
+    #[serde(default)]
+    pub tenant_allowlist: Vec<String>,
+    #[serde(default)]
+    pub quota_usage_millis: Option<u16>,
+    #[serde(default = "bool_true")]
+    pub accept_new_requests: bool,
+    #[serde(default)]
+    pub binding_grace_until_unix: Option<u64>,
 }
 
 const fn default_weight() -> u32 {
     1
 }
 
-impl RetryPolicy {
-    #[must_use]
-    pub const fn should_retry(self, kind: UpstreamErrorKind, retries_used: u8) -> bool {
-        kind.retryable() && retries_used < self.max_retries
-    }
-
-    #[must_use]
-    pub fn backoff_ms(self, retries_used: u8, retry_after_ms: Option<u64>) -> u64 {
-        retry_after_ms.unwrap_or_else(|| {
-            self.base_backoff_ms
-                .saturating_mul(
-                    1_u64
-                        .checked_shl(u32::from(retries_used))
-                        .unwrap_or(u64::MAX),
-                )
-                .min(self.max_backoff_ms)
-        })
-    }
+const fn bool_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,9 +70,24 @@ pub struct TierConfig {
     pub deployments: Vec<RouteDeployment>,
     #[serde(default)]
     pub fallbacks: Vec<String>,
+    #[serde(default)]
+    pub fallbacks_by_error: BTreeMap<FallbackCause, Vec<String>>,
 }
 
 impl TierConfig {
+    #[must_use]
+    pub fn fallbacks_for(&self, cause: FallbackCause) -> &[String] {
+        self.fallbacks_by_error
+            .get(&cause)
+            .map_or(&self.fallbacks, Vec::as_slice)
+    }
+
+    fn all_fallbacks(&self) -> impl Iterator<Item = &String> {
+        self.fallbacks
+            .iter()
+            .chain(self.fallbacks_by_error.values().flatten())
+    }
+
     #[must_use]
     pub fn effective_deployments(&self) -> Vec<RouteDeployment> {
         if self.deployments.is_empty() {
@@ -111,6 +99,14 @@ impl TierConfig {
                 order: 0,
                 provider_scope: None,
                 credential_scope: None,
+                enabled: true,
+                credential_available: true,
+                region: None,
+                residency: Vec::new(),
+                tenant_allowlist: Vec::new(),
+                quota_usage_millis: None,
+                accept_new_requests: true,
+                binding_grace_until_unix: None,
             }]
         } else {
             self.deployments.clone()
@@ -125,6 +121,8 @@ pub struct RouteConfig {
     pub tiers: Vec<TierConfig>,
     #[serde(default)]
     pub default_preference_bias_millis: i32,
+    #[serde(default)]
+    pub long_context_quality_threshold_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -199,7 +197,16 @@ pub struct DataPolicyContract {
     pub recording: RecordingMode,
     pub allow_training: bool,
     pub allow_remote_judge: bool,
+    pub allow_exploration: bool,
+    pub exploration_budget_nano_usd: u64,
     pub retention_days: u16,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutingPolicyContract {
+    pub region: Option<String>,
+    pub residency: Option<String>,
 }
 
 impl Default for DataPolicyContract {
@@ -208,6 +215,8 @@ impl Default for DataPolicyContract {
             recording: RecordingMode::MetadataOnly,
             allow_training: false,
             allow_remote_judge: false,
+            allow_exploration: false,
+            exploration_budget_nano_usd: 0,
             retention_days: 7,
         }
     }
@@ -246,6 +255,7 @@ pub struct RequestContract {
     pub agent: AgentContract,
     pub call: CallContract,
     pub data_policy: Option<DataPolicyContract>,
+    pub policy: RoutingPolicyContract,
     pub trace: TraceContract,
     pub hint: HintContract,
     pub preference: PreferenceContract,
@@ -274,6 +284,8 @@ pub struct RouteDecision {
     pub tier: String,
     pub model: ModelId,
     pub reason: String,
+    pub semantic: SemanticClassification,
+    pub cascade_trace: Vec<RuleEvaluation>,
     pub alternatives: Vec<ModelId>,
     pub requirement: CapabilityRequirement,
     pub admission: AdmissionResult,
@@ -289,8 +301,28 @@ pub struct RouteDecision {
     pub call_role: Option<CallRole>,
     pub migration_boundary: Option<MigrationBoundary>,
     pub data_policy: Option<DataPolicyContract>,
+    pub policy: RoutingPolicyContract,
     pub compatibility_mode: bool,
     pub signals: Vec<SignalContract>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticTask {
+    Greeting,
+    RealtimeWeather,
+    EquationSolving,
+    General,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticClassification {
+    pub task: SemanticTask,
+    pub confidence_millis: u16,
+    pub abstained: bool,
+    pub requires_tools: bool,
+    pub requires_reasoning: bool,
+    pub required_tool: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -314,6 +346,8 @@ pub enum RouteError {
     InvalidDeploymentUrl(String),
     #[error("deployment failure scope is invalid: {0}")]
     InvalidFailureScope(String),
+    #[error("deployment policy metadata is invalid: {0}")]
+    InvalidPolicyMetadata(String),
     #[error("deployment model capabilities differ within tier: {0}")]
     InconsistentTierCapabilities(String),
     #[error("tier fallback references unknown tier: {0}")]
@@ -334,9 +368,17 @@ pub enum RouteError {
     UnknownTier(String),
     #[error("no configured tier is eligible for the request")]
     NoEligibleTier,
+    #[error("semantic task requires an available host tool: {0}")]
+    RequiredToolUnavailable(String),
 }
 
 impl RouteConfig {
+    #[must_use]
+    pub fn revision(&self) -> String {
+        let encoded = serde_json::to_vec(self).expect("RouteConfig serialization cannot fail");
+        format!("sha256:{:x}", Sha256::digest(encoded))
+    }
+
     pub fn validate(&self, catalog: &CatalogSnapshot) -> Result<(), RouteError> {
         if self.id.trim().is_empty() || self.tiers.iter().any(|tier| tier.tier.trim().is_empty()) {
             return Err(RouteError::EmptyName);
@@ -382,6 +424,27 @@ impl RouteConfig {
                     {
                         return Err(RouteError::InvalidFailureScope(deployment.id.clone()));
                     }
+                }
+                if deployment
+                    .region
+                    .as_ref()
+                    .is_some_and(|value| value.trim().is_empty())
+                    || deployment
+                        .residency
+                        .iter()
+                        .any(|value| value.trim().is_empty())
+                    || deployment
+                        .tenant_allowlist
+                        .iter()
+                        .any(|value| value.trim().is_empty())
+                {
+                    return Err(RouteError::InvalidPolicyMetadata(deployment.id));
+                }
+                if deployment
+                    .quota_usage_millis
+                    .is_some_and(|value| value > 1_000)
+                {
+                    return Err(RouteError::InvalidPolicyMetadata(deployment.id));
                 }
                 let model = catalog
                     .model(&deployment.model)
@@ -477,7 +540,7 @@ impl RouteConfig {
             .ok_or(RouteError::InvalidRequestModel)?;
         let contract = parse_contract(request)?;
         let compatibility_mode = contract.compatibility_mode();
-        let requirement = analyze_requirement(request);
+        let (semantic, requirement) = semantic_requirement(request)?;
         if requested_model != self.id {
             let requested =
                 ModelId::new(requested_model).map_err(|_| RouteError::InvalidRequestModel)?;
@@ -493,6 +556,8 @@ impl RouteConfig {
                 tier: "pinned".to_owned(),
                 model: model.id.clone(),
                 reason: "explicit_model".to_owned(),
+                semantic,
+                cascade_trace: vec![selected_rule("explicit_model", "explicit_model")],
                 alternatives: Vec::new(),
                 requirement,
                 admission,
@@ -508,6 +573,7 @@ impl RouteConfig {
                 call_role: contract.call.role,
                 migration_boundary: contract.call.migration_boundary,
                 data_policy: contract.data_policy,
+                policy: contract.policy,
                 compatibility_mode,
                 signals: contract.signals,
             });
@@ -523,13 +589,18 @@ impl RouteConfig {
         if eligible.is_empty() {
             return Err(RouteError::NoEligibleTier);
         }
-        let (selected_index, mut reason) = select_tier(self, &contract, &eligible)?;
+        let mut selection = select_tier(self, &contract, request, &eligible)?;
+        let selected_index = selection.index;
+        let mut reason = selection.reason;
         if eligible.len() < self.tiers.len()
             && eligible
                 .first()
                 .is_some_and(|(index, _)| *index == selected_index)
         {
             "capability_required".clone_into(&mut reason);
+            selection
+                .evaluations
+                .push(selected_rule("capability_filter", "capability_required"));
         }
         let selected = &self.tiers[selected_index];
         let alternatives = eligible
@@ -542,6 +613,8 @@ impl RouteConfig {
             tier: selected.tier.clone(),
             model: selected.model.clone(),
             reason,
+            semantic,
+            cascade_trace: selection.evaluations,
             alternatives,
             requirement,
             admission,
@@ -557,6 +630,7 @@ impl RouteConfig {
             call_role: contract.call.role,
             migration_boundary: contract.call.migration_boundary,
             data_policy: contract.data_policy,
+            policy: contract.policy,
             compatibility_mode,
             signals: contract.signals,
         })
@@ -594,7 +668,18 @@ impl RouteConfig {
             .filter(|model| model != model_id && decision.admission.eligible.contains(model))
             .collect();
         "task_binding".clone_into(&mut decision.reason);
+        decision
+            .cascade_trace
+            .push(selected_rule("task_binding", "task_binding"));
         Ok(decision)
+    }
+}
+
+fn selected_rule(rule: &str, reason: &str) -> RuleEvaluation {
+    RuleEvaluation {
+        rule: rule.to_owned(),
+        outcome: RuleOutcome::Selected,
+        reason: reason.to_owned(),
     }
 }
 
@@ -605,7 +690,7 @@ fn validate_fallbacks(tiers: &[TierConfig]) -> Result<(), RouteError> {
         .map(|(index, tier)| (tier.tier.as_str(), index))
         .collect::<BTreeMap<_, _>>();
     for tier in tiers {
-        for fallback in &tier.fallbacks {
+        for fallback in tier.all_fallbacks() {
             if !indexes.contains_key(fallback.as_str()) {
                 return Err(RouteError::UnknownFallbackTier(fallback.clone()));
             }
@@ -631,7 +716,7 @@ fn visit_fallback(
         return Err(RouteError::FallbackCycle(tiers[index].tier.clone()));
     }
     states[index] = 1;
-    for fallback in &tiers[index].fallbacks {
+    for fallback in tiers[index].all_fallbacks() {
         visit_fallback(indexes[fallback.as_str()], tiers, indexes, states)?;
     }
     states[index] = 2;
@@ -658,6 +743,18 @@ fn parse_contract(request: &Value) -> Result<RequestContract, RouteError> {
         return Err(RouteError::InvalidContract(
             "data_policy.retention_days must be in 1..=365".to_owned(),
         ));
+    }
+    for (name, value) in [
+        ("policy.region", contract.policy.region.as_deref()),
+        ("policy.residency", contract.policy.residency.as_deref()),
+    ] {
+        if value.is_some_and(|value| {
+            value.trim().is_empty() || value.len() > 64 || value.chars().any(char::is_control)
+        }) {
+            return Err(RouteError::InvalidContract(format!(
+                "{name} must contain 1..=64 non-control characters"
+            )));
+        }
     }
     if contract.contract_version == Some(2) && contract.is_primary_call() {
         let required = [
@@ -719,7 +816,23 @@ fn parse_contract(request: &Value) -> Result<RequestContract, RouteError> {
     Ok(contract)
 }
 
-fn analyze_requirement(request: &Value) -> CapabilityRequirement {
+fn semantic_requirement(
+    request: &Value,
+) -> Result<(SemanticClassification, CapabilityRequirement), RouteError> {
+    let semantic = classify_semantic_task(request);
+    if let Some(required) = semantic.required_tool.as_deref()
+        && !host_provides_tool(request, required)
+    {
+        return Err(RouteError::RequiredToolUnavailable(required.to_owned()));
+    }
+    let requirement = analyze_requirement(request, &semantic);
+    Ok((semantic, requirement))
+}
+
+fn analyze_requirement(
+    request: &Value,
+    semantic: &SemanticClassification,
+) -> CapabilityRequirement {
     let mut requirement = CapabilityRequirement::default();
     requirement.input_modalities.insert(Modality::Text);
     let mut characters = 0_u64;
@@ -728,18 +841,20 @@ fn analyze_requirement(request: &Value) -> CapabilityRequirement {
             analyze_content(message.get("content"), &mut requirement, &mut characters);
         }
     }
-    requirement.tool_calling = request
-        .get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|tools| !tools.is_empty());
+    requirement.tool_calling = semantic.requires_tools
+        || request
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
     requirement.structured_output = request
         .pointer("/response_format/type")
         .and_then(Value::as_str)
         .is_some_and(|kind| matches!(kind, "json_schema" | "json_object"));
-    requirement.reasoning = request
-        .get("reasoning_effort")
-        .and_then(Value::as_str)
-        .is_some_and(|effort| effort != "none")
+    requirement.reasoning = semantic.requires_reasoning
+        || request
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .is_some_and(|effort| effort != "none")
         || request
             .pointer("/chat_template_kwargs/enable_thinking")
             .and_then(Value::as_bool)
@@ -753,6 +868,107 @@ fn analyze_requirement(request: &Value) -> CapabilityRequirement {
         .unwrap_or(0);
     requirement.min_context_window = prompt_tokens.saturating_add(output_tokens);
     requirement
+}
+
+#[must_use]
+pub fn classify_semantic_task(request: &Value) -> SemanticClassification {
+    let text = latest_user_text(request).to_lowercase();
+    let normalized = text.trim_matches(|character: char| {
+        character.is_whitespace()
+            || matches!(character, '!' | '?' | '.' | ',' | '。' | '！' | '？' | '，')
+    });
+    if matches!(normalized, "你好" | "您好" | "hello" | "hi" | "hey") {
+        return semantic_classification(SemanticTask::Greeting, 980, false, false, None);
+    }
+    if ["天气", "气温", "weather", "forecast"]
+        .iter()
+        .any(|keyword| normalized.contains(keyword))
+    {
+        return semantic_classification(
+            SemanticTask::RealtimeWeather,
+            950,
+            true,
+            false,
+            Some("weather"),
+        );
+    }
+    if [
+        "二元一次方程",
+        "方程组",
+        "solve the equation",
+        "solve equation",
+    ]
+    .iter()
+    .any(|keyword| normalized.contains(keyword))
+        || (normalized.contains('=') && normalized.contains('x') && normalized.contains('y'))
+    {
+        return semantic_classification(SemanticTask::EquationSolving, 930, false, true, None);
+    }
+    semantic_classification(SemanticTask::General, 0, false, false, None)
+}
+
+fn semantic_classification(
+    task: SemanticTask,
+    confidence_millis: u16,
+    requires_tools: bool,
+    requires_reasoning: bool,
+    required_tool: Option<&str>,
+) -> SemanticClassification {
+    SemanticClassification {
+        task,
+        confidence_millis,
+        abstained: confidence_millis == 0,
+        requires_tools,
+        requires_reasoning,
+        required_tool: required_tool.map(str::to_owned),
+    }
+}
+
+fn latest_user_text(request: &Value) -> String {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|message| message.get("content"))
+        .map(content_text)
+        .unwrap_or_default()
+}
+
+fn content_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
+}
+
+fn host_provides_tool(request: &Value, required: &str) -> bool {
+    let declared = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+        .any(|name| {
+            let name = name.to_lowercase();
+            name.contains(required) || (required == "weather" && name.contains("天气"))
+        });
+    declared
+        || request
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+            })
 }
 
 fn analyze_content(
@@ -789,15 +1005,9 @@ fn analyze_content(
 fn select_tier(
     route: &RouteConfig,
     contract: &RequestContract,
+    request: &Value,
     eligible: &[(usize, &TierConfig)],
-) -> Result<(usize, String), RouteError> {
-    if let Some(pin) = &contract.preference.pin_tier {
-        return eligible
-            .iter()
-            .find(|(_, tier)| tier.tier == *pin)
-            .map(|(index, _)| (*index, "preference_pin".to_owned()))
-            .ok_or_else(|| RouteError::UnknownTier(pin.clone()));
-    }
+) -> Result<TierSelection, RouteError> {
     let floor = contract
         .preference
         .floor_tier
@@ -811,38 +1021,96 @@ fn select_tier(
         })
         .transpose()?
         .unwrap_or(0);
-    let eligible = eligible
-        .iter()
-        .filter(|(index, _)| *index >= floor)
-        .collect::<Vec<_>>();
-    if eligible.is_empty() {
-        return Err(RouteError::NoEligibleTier);
-    }
     let auxiliary = contract.call.role == Some(CallRole::Auxiliary);
+    let signal_quality = signal_score(
+        contract,
+        &["severity", "spinning", "exploring", "production_intensity"],
+    ) > 500;
+    let signal_low_cost = signal_score(contract, &["cost_sensitive", "disposable"]) > 500;
+    let long_context_quality = route.long_context_quality_threshold_tokens > 0
+        && estimated_input_tokens(request) >= route.long_context_quality_threshold_tokens;
     let high_quality = contract.hint.difficulty.as_deref() == Some("hard")
         || contract.hint.workload.as_deref() == Some("plan")
-        || preference_bias_millis(contract, route.default_preference_bias_millis) < -500;
-    if high_quality && !auxiliary {
-        return Ok((
-            eligible.last().expect("eligible is non-empty").0,
-            "quality_guard".to_owned(),
-        ));
-    }
+        || preference_bias_millis(contract, route.default_preference_bias_millis) < -500
+        || signal_quality
+        || long_context_quality;
     let low_cost = auxiliary
         || matches!(
             contract.hint.value_class.as_deref(),
             Some("auxiliary" | "disposable")
         )
-        || preference_bias_millis(contract, route.default_preference_bias_millis) > 500;
-    let selected = eligible.first().expect("eligible is non-empty").0;
-    Ok((
-        selected,
-        if low_cost {
-            "cost_preference".to_owned()
-        } else {
-            "default_efficient".to_owned()
-        },
-    ))
+        || preference_bias_millis(contract, route.default_preference_bias_millis) > 500
+        || signal_low_cost;
+    let mut selection = select_tier_with_cascade(&TierDecisionInput {
+        candidates: eligible
+            .iter()
+            .map(|(index, tier)| TierCandidate {
+                index: *index,
+                tier: tier.tier.clone(),
+            })
+            .collect(),
+        pin_tier: contract.preference.pin_tier.clone(),
+        floor_index: floor,
+        auxiliary,
+        high_quality,
+        low_cost,
+    })
+    .map_err(|error| match error {
+        TierDecisionError::UnknownPinnedTier(tier) => RouteError::UnknownTier(tier),
+        TierDecisionError::NoEligibleTier => RouteError::NoEligibleTier,
+    })?;
+    if long_context_quality {
+        selection.evaluations.insert(
+            0,
+            selected_rule("structural_decider", "long_context_quality"),
+        );
+    }
+    if signal_quality || signal_low_cost {
+        selection.evaluations.insert(
+            0,
+            selected_rule(
+                "signal_decider",
+                if signal_quality {
+                    "signal_quality"
+                } else {
+                    "signal_low_cost"
+                },
+            ),
+        );
+    }
+    Ok(selection)
+}
+
+fn estimated_input_tokens(request: &Value) -> u64 {
+    let mut requirement = CapabilityRequirement::default();
+    let mut characters = 0_u64;
+    if let Some(messages) = request.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            analyze_content(message.get("content"), &mut requirement, &mut characters);
+        }
+    }
+    characters.div_ceil(4)
+}
+
+fn signal_score(contract: &RequestContract, kinds: &[&str]) -> i32 {
+    contract
+        .signals
+        .iter()
+        .filter(|signal| {
+            signal
+                .kind
+                .as_deref()
+                .is_some_and(|kind| kinds.contains(&kind))
+        })
+        .filter_map(|signal| {
+            signal
+                .strength
+                .as_ref()
+                .and_then(serde_json::Number::as_f64)
+        })
+        .map(quantize_bias)
+        .max()
+        .unwrap_or(0)
 }
 
 fn preference_bias_millis(contract: &RequestContract, default: i32) -> i32 {
@@ -909,6 +1177,76 @@ mod tests {
     }
 
     #[test]
+    fn semantic_greeting_stays_efficient() {
+        let decision = route()
+            .decide(
+                &catalog(),
+                &json!({"model": "urouter/auto", "messages": [{"role": "user", "content": "你好"}]}),
+            )
+            .unwrap();
+        assert_eq!(decision.tier, "efficient");
+        assert_eq!(decision.semantic.task, SemanticTask::Greeting);
+        assert!(!decision.semantic.abstained);
+    }
+
+    #[test]
+    fn semantic_equation_requires_reasoning_model() {
+        let decision = route()
+            .decide(
+                &catalog(),
+                &json!({"model": "urouter/auto", "messages": [{"role": "user", "content": "求解二元一次方程组：x+y=5, x-y=1"}]}),
+            )
+            .unwrap();
+        assert_eq!(decision.tier, "capable");
+        assert_eq!(decision.semantic.task, SemanticTask::EquationSolving);
+        assert!(decision.requirement.reasoning);
+    }
+
+    #[test]
+    fn semantic_weather_requires_a_real_host_tool() {
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "今天武汉的天气怎么样？"}]
+        });
+        assert!(matches!(
+            route().decide(&catalog(), &request),
+            Err(RouteError::RequiredToolUnavailable(tool)) if tool == "weather"
+        ));
+
+        let mut with_tool = request;
+        with_tool["tools"] = json!([{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}}
+        }]);
+        let decision = route().decide(&catalog(), &with_tool).unwrap();
+        assert_eq!(decision.tier, "capable");
+        assert_eq!(decision.semantic.task, SemanticTask::RealtimeWeather);
+        assert!(decision.requirement.tool_calling);
+
+        let continuation = json!({
+            "model": "urouter/auto",
+            "messages": [
+                {"role": "user", "content": "今天武汉的天气怎么样？"},
+                {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"武汉\"}"}}]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "晴，30摄氏度"}
+            ]
+        });
+        let continued = route().decide(&catalog(), &continuation).unwrap();
+        assert_eq!(continued.tier, "capable");
+        assert_eq!(continued.semantic.task, SemanticTask::RealtimeWeather);
+    }
+
+    #[test]
+    fn unknown_semantics_abstain_to_existing_policy() {
+        let classification = classify_semantic_task(&json!({
+            "messages": [{"role": "user", "content": "整理这段内容"}]
+        }));
+        assert_eq!(classification.task, SemanticTask::General);
+        assert!(classification.abstained);
+        assert_eq!(classification.confidence_millis, 0);
+    }
+
+    #[test]
     fn hard_request_selects_capable() {
         let decision = route()
             .decide(
@@ -922,6 +1260,41 @@ mod tests {
             .unwrap();
         assert_eq!(decision.tier, "capable");
         assert_eq!(decision.reason, "quality_guard");
+    }
+
+    #[test]
+    fn configured_long_context_threshold_selects_quality_tier_and_is_traced() {
+        let mut route = route();
+        route.long_context_quality_threshold_tokens = 8;
+        let decision = route
+            .decide(
+                &catalog(),
+                &json!({
+                    "model": "urouter/auto",
+                    "messages": [{"role": "user", "content": "0123456789abcdef0123456789abcdef"}],
+                    "max_tokens": 1
+                }),
+            )
+            .unwrap();
+        assert_eq!(decision.tier, "capable");
+        assert_eq!(decision.reason, "quality_guard");
+        assert_eq!(decision.cascade_trace[0].rule, "structural_decider");
+        assert_eq!(decision.cascade_trace[0].reason, "long_context_quality");
+    }
+
+    #[test]
+    fn high_confidence_operational_signal_selects_quality_tier_and_is_traced() {
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "analyze this"}],
+            "urouter": {
+                "signals": [{"kind": "severity", "strength": 0.9}]
+            }
+        });
+        let decision = route().decide(&catalog(), &request).unwrap();
+        assert_eq!(decision.tier, "capable");
+        assert_eq!(decision.cascade_trace[0].rule, "signal_decider");
+        assert_eq!(decision.cascade_trace[0].reason, "signal_quality");
     }
 
     #[test]

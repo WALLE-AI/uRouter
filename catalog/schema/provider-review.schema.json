@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://urouter.local/schema/provider-review-v1.json",
+  "title": "uRouter reviewed provider inventory projection",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "instance_id", "models"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "instance_id": { "type": "string", "minLength": 1 },
+    "provider": {
+      "anyOf": [
+        { "$ref": "catalog.schema.json#/$defs/provider" },
+        { "type": "null" }
+      ]
+    },
+    "models": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/reviewed_model" }
+    }
+  },
+  "$defs": {
+    "reviewed_model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["upstream_id", "model", "evidence"],
+      "properties": {
+        "upstream_id": { "type": "string", "minLength": 1 },
+        "model": { "$ref": "catalog.schema.json#/$defs/model" },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": { "type": "string", "minLength": 1 },
+          "required": ["pricing", "capabilities", "compat", "lifecycle", "source"]
+        }
+      }
+    }
+  }
+}

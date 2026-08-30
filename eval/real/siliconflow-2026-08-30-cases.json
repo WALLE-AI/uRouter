@@ -1,0 +1,47 @@
+[
+  {
+    "id": "sf-greeting-nonstream-001",
+    "category": "daily",
+    "semantic_task": "greeting",
+    "quality_millionths": 1000000,
+    "cost_nano_usd": 0,
+    "latency_ms": 1761,
+    "supported": true
+  },
+  {
+    "id": "sf-greeting-stream-001",
+    "category": "daily",
+    "semantic_task": "greeting",
+    "quality_millionths": 1000000,
+    "cost_nano_usd": 0,
+    "latency_ms": 483,
+    "supported": true
+  },
+  {
+    "id": "sf-equation-001",
+    "category": "math",
+    "semantic_task": "equation",
+    "quality_millionths": 1000000,
+    "cost_nano_usd": 1234608,
+    "latency_ms": 21275,
+    "supported": true
+  },
+  {
+    "id": "sf-weather-tool-call-001",
+    "category": "tool",
+    "semantic_task": "weather",
+    "quality_millionths": 1000000,
+    "cost_nano_usd": 204097,
+    "latency_ms": 3227,
+    "supported": true
+  },
+  {
+    "id": "sf-weather-continuation-001",
+    "category": "tool",
+    "semantic_task": "weather_continuation",
+    "quality_millionths": 1000000,
+    "cost_nano_usd": 415862,
+    "latency_ms": 6361,
+    "supported": true
+  }
+]

@@ -1,0 +1,47 @@
+[
+  {
+    "id": "daily-greeting-run-1",
+    "category": "daily",
+    "semantic_task": "greeting",
+    "quality_millionths": 1000000,
+    "cost_nano_usd": 0,
+    "latency_ms": 1812,
+    "supported": true
+  },
+  {
+    "id": "tool-weather-run-1",
+    "category": "tool",
+    "semantic_task": "weather",
+    "quality_millionths": 1000000,
+    "cost_nano_usd": 301427,
+    "latency_ms": 5697,
+    "supported": true
+  },
+  {
+    "id": "math-equation-run-1",
+    "category": "math",
+    "semantic_task": "equation",
+    "quality_millionths": 1000000,
+    "cost_nano_usd": 1180340,
+    "latency_ms": 21821,
+    "supported": true
+  },
+  {
+    "id": "code-rust-gcd-run-1",
+    "category": "code",
+    "semantic_task": "code",
+    "quality_millionths": 1000000,
+    "cost_nano_usd": 0,
+    "latency_ms": 1250,
+    "supported": true
+  },
+  {
+    "id": "long-context-recall-run-1",
+    "category": "long_context",
+    "semantic_task": "long_context",
+    "quality_millionths": 0,
+    "cost_nano_usd": 0,
+    "latency_ms": 663,
+    "supported": true
+  }
+]

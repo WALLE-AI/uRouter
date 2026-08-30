@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "started_at_unix_s": 1788094590,
+  "base_url": "http://127.0.0.1:8792/v1",
+  "requested_budget_nano_usd": 10000000,
+  "observed_cost_nano_usd": 2242115,
+  "planned_requests": 1,
+  "completed_requests": 1,
+  "budget_exceeded": false,
+  "passed": 1,
+  "failed": 0,
+  "runs": [
+    {
+      "id": "long-context-recall-run-1",
+      "category": "long_context",
+      "status": 200,
+      "passed": true,
+      "latency_ms": 14318,
+      "cost_nano_usd": 2242115,
+      "tier": "capable",
+      "model": "siliconflow/deepseek-r1-pro",
+      "reason": "quality_guard",
+      "checks": [
+        {
+          "name": "http_status",
+          "passed": true,
+          "expected": "200",
+          "actual": "200"
+        },
+        {
+          "name": "tier",
+          "passed": true,
+          "expected": "capable",
+          "actual": "capable"
+        },
+        {
+          "name": "model",
+          "passed": true,
+          "expected": "siliconflow/deepseek-r1-pro",
+          "actual": "siliconflow/deepseek-r1-pro"
+        },
+        {
+          "name": "content_contains",
+          "passed": true,
+          "expected": "7391",
+          "actual": "content_length=5"
+        }
+      ]
+    }
+  ]
+}

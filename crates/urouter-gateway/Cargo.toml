@@ -19,8 +19,14 @@ subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 urouter-ai = { path = "../urouter-ai" }
+urouter-artifact = { path = "../urouter-artifact" }
+urouter-contracts = { path = "../urouter-contracts" }
+urouter-protocol = { path = "../urouter-protocol" }
 urouter-types = { path = "../urouter-types" }
 url.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
 
 [lints]
 workspace = true

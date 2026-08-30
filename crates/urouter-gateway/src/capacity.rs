@@ -9,6 +9,11 @@ use std::{
 
 use serde::Serialize;
 use thiserror::Error;
+use urouter_contracts::{
+    CapacityCandidateSnapshot, CapacityLeasePlanError, CooldownDirective, DeploymentEvaluation,
+    DeploymentPicker, FailureWindow, LocalCircuitAvailability, cooldown_directive,
+    plan_capacity_lease_with_picker,
+};
 
 use crate::{RouteDeployment, UpstreamErrorKind};
 
@@ -52,7 +57,7 @@ pub enum CapacityError {
     #[error("tier has no configured deployments")]
     EmptyTier,
     #[error("all deployments are cooling or excluded")]
-    Exhausted,
+    Exhausted(Vec<DeploymentEvaluation>),
 }
 
 #[derive(Debug, Default)]
@@ -61,6 +66,7 @@ struct DeploymentHealth {
     cooldown_until: Option<Instant>,
     half_open_probe: bool,
     in_flight: u64,
+    latency_ewma_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -68,6 +74,7 @@ pub struct CapacityManager {
     health: Mutex<BTreeMap<String, DeploymentHealth>>,
     ticket: AtomicU64,
     policy: CooldownPolicy,
+    picker: DeploymentPicker,
 }
 
 impl CapacityManager {
@@ -77,6 +84,17 @@ impl CapacityManager {
             health: Mutex::new(BTreeMap::new()),
             ticket: AtomicU64::new(0),
             policy,
+            picker: DeploymentPicker::Weighted,
+        })
+    }
+
+    #[must_use]
+    pub fn with_picker(policy: CooldownPolicy, picker: DeploymentPicker) -> Arc<Self> {
+        Arc::new(Self {
+            health: Mutex::new(BTreeMap::new()),
+            ticket: AtomicU64::new(0),
+            policy,
+            picker,
         })
     }
 
@@ -90,62 +108,59 @@ impl CapacityManager {
         }
         let now = Instant::now();
         let mut health = self.health.lock().expect("capacity lock poisoned");
-        let mut eligible = Vec::new();
+        let mut snapshots = Vec::with_capacity(candidates.len());
         for deployment in candidates {
             let state = health.entry(deployment.id.clone()).or_default();
             prune_events(state, now, self.policy.window);
-            if excluded.contains(&deployment.id) {
-                continue;
-            }
-            let unavailable = state
-                .cooldown_until
-                .is_some_and(|until| until > now || state.half_open_probe);
-            if !unavailable {
-                eligible.push(deployment);
-            }
+            snapshots.push(CapacityCandidateSnapshot {
+                id: deployment.id.clone(),
+                order: deployment.order,
+                weight: deployment.weight,
+                retry_excluded: excluded.contains(&deployment.id),
+                circuit: local_circuit_availability(state, now),
+                in_flight: state.in_flight,
+                latency_ewma_ms: state.latency_ewma_ms,
+                quota_usage_millis: deployment.quota_usage_millis,
+            });
         }
-        let minimum_order = eligible
+        let plan = plan_capacity_lease_with_picker(
+            &snapshots,
+            self.ticket.fetch_add(1, Ordering::Relaxed),
+            self.picker,
+        )
+        .map_err(|error| match error {
+            CapacityLeasePlanError::Empty => CapacityError::EmptyTier,
+            CapacityLeasePlanError::Exhausted(evaluations) => CapacityError::Exhausted(evaluations),
+            CapacityLeasePlanError::ZeroWeight => CapacityError::Exhausted(Vec::new()),
+        })?;
+        let selection = plan.selection;
+        let selected = candidates
             .iter()
-            .map(|deployment| deployment.order)
-            .min()
-            .ok_or(CapacityError::Exhausted)?;
-        eligible.retain(|deployment| deployment.order == minimum_order);
-        eligible.sort_by(|left, right| left.id.cmp(&right.id));
-        let total_weight = eligible.iter().fold(0_u64, |sum, deployment| {
-            sum.saturating_add(u64::from(deployment.weight))
-        });
-        let mut position = self.ticket.fetch_add(1, Ordering::Relaxed) % total_weight;
-        let selected = eligible
-            .iter()
-            .find(|deployment| {
-                let weight = u64::from(deployment.weight);
-                if position < weight {
-                    true
-                } else {
-                    position -= weight;
-                    false
-                }
-            })
-            .expect("validated positive weights always select a deployment");
+            .find(|deployment| deployment.id == selection.selected)
+            .expect("policy selection references an input deployment");
         let selected_health = health
             .get_mut(&selected.id)
             .expect("eligible deployment health exists");
-        let half_open = selected_health
-            .cooldown_until
-            .is_some_and(|until| until <= now);
-        if half_open {
+        if plan.reserve_half_open_probe {
             selected_health.half_open_probe = true;
         }
         selected_health.in_flight = selected_health.in_flight.saturating_add(1);
-        let runners_up = eligible
+        let runners_up = selection
+            .runners_up
             .iter()
-            .filter(|deployment| deployment.id != selected.id)
-            .map(|deployment| (*deployment).clone())
+            .map(|id| {
+                candidates
+                    .iter()
+                    .find(|deployment| deployment.id == *id)
+                    .expect("policy runner-up references an input deployment")
+                    .clone()
+            })
             .collect();
         Ok(CapacityLease {
             manager: Arc::clone(self),
             deployment: (*selected).clone(),
             runners_up,
+            evaluations: selection.evaluations,
             tier_size: candidates.len(),
             completed: false,
         })
@@ -156,6 +171,19 @@ impl CapacityManager {
         for deployment in deployments {
             health.entry(deployment.id.clone()).or_default();
         }
+    }
+
+    #[must_use]
+    pub const fn picker(&self) -> DeploymentPicker {
+        self.picker
+    }
+
+    pub fn observe_latency(&self, deployment: &str, latency_ms: u64) {
+        let mut health = self.health.lock().expect("capacity lock poisoned");
+        let state = health.entry(deployment.to_owned()).or_default();
+        state.latency_ewma_ms = Some(state.latency_ewma_ms.map_or(latency_ms, |previous| {
+            previous.saturating_mul(4).saturating_add(latency_ms) / 5
+        }));
     }
 
     #[must_use]
@@ -199,22 +227,25 @@ impl CapacityManager {
                 state.cooldown_until = None;
             }
             Err(kind) => {
-                if !cooldown_worthy(kind) {
-                    return;
-                }
-                state.events.push_back((now, false));
                 prune_events(state, now, self.policy.window);
                 let (successes, failures) = event_counts(state);
-                let total = successes.saturating_add(failures);
-                let failure_millis = failures
-                    .saturating_mul(1_000)
-                    .checked_div(total)
-                    .unwrap_or(0);
-                if tier_size > 1
-                    && (kind == UpstreamErrorKind::RateLimited
-                        || failure_millis >= u64::from(self.policy.failure_threshold_millis))
-                {
-                    state.cooldown_until = now.checked_add(self.policy.cooldown);
+                match cooldown_directive(
+                    kind,
+                    FailureWindow {
+                        successes,
+                        failures,
+                    },
+                    tier_size,
+                    self.policy.failure_threshold_millis,
+                ) {
+                    CooldownDirective::Ignore => {}
+                    CooldownDirective::RecordFailure => {
+                        state.events.push_back((now, false));
+                    }
+                    CooldownDirective::OpenCircuit => {
+                        state.events.push_back((now, false));
+                        state.cooldown_until = now.checked_add(self.policy.cooldown);
+                    }
                 }
             }
         }
@@ -229,10 +260,20 @@ impl CapacityManager {
     }
 }
 
+fn local_circuit_availability(state: &DeploymentHealth, now: Instant) -> LocalCircuitAvailability {
+    match state.cooldown_until {
+        None => LocalCircuitAvailability::Closed,
+        Some(until) if until > now => LocalCircuitAvailability::Open,
+        Some(_) if state.half_open_probe => LocalCircuitAvailability::HalfOpenProbeInFlight,
+        Some(_) => LocalCircuitAvailability::HalfOpen,
+    }
+}
+
 pub struct CapacityLease {
     manager: Arc<CapacityManager>,
     pub deployment: RouteDeployment,
     pub runners_up: Vec<RouteDeployment>,
+    pub evaluations: Vec<DeploymentEvaluation>,
     tier_size: usize,
     completed: bool,
 }
@@ -276,19 +317,6 @@ fn event_counts(state: &DeploymentHealth) -> (u64, u64) {
         })
 }
 
-const fn cooldown_worthy(kind: UpstreamErrorKind) -> bool {
-    matches!(
-        kind,
-        UpstreamErrorKind::Transport
-            | UpstreamErrorKind::Timeout
-            | UpstreamErrorKind::RateLimited
-            | UpstreamErrorKind::ServerError
-            | UpstreamErrorKind::ProviderUnavailable
-            | UpstreamErrorKind::Unauthorized
-            | UpstreamErrorKind::NotFound
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +331,14 @@ mod tests {
             order,
             provider_scope: None,
             credential_scope: None,
+            enabled: true,
+            credential_available: true,
+            region: None,
+            residency: Vec::new(),
+            tenant_allowlist: Vec::new(),
+            quota_usage_millis: None,
+            accept_new_requests: true,
+            binding_grace_until_unix: None,
         }
     }
 
@@ -374,6 +410,51 @@ mod tests {
                 .unwrap()
                 .state,
             CircuitState::Closed
+        );
+    }
+
+    #[test]
+    fn least_loaded_picker_moves_concurrent_work_to_idle_deployment() {
+        let manager =
+            CapacityManager::with_picker(CooldownPolicy::default(), DeploymentPicker::LeastLoaded);
+        let deployments = vec![deployment("a", 0), deployment("b", 0)];
+        let first = manager.select(&deployments, &BTreeSet::new()).unwrap();
+        let second = manager.select(&deployments, &BTreeSet::new()).unwrap();
+        assert_ne!(first.deployment.id, second.deployment.id);
+    }
+
+    #[test]
+    fn latency_and_quota_pickers_consume_their_signals() {
+        let deployments = vec![deployment("a", 0), deployment("b", 0)];
+        let latency = CapacityManager::with_picker(
+            CooldownPolicy::default(),
+            DeploymentPicker::LowestLatency,
+        );
+        latency.observe_latency("a", 50);
+        latency.observe_latency("b", 10);
+        assert_eq!(
+            latency
+                .select(&deployments, &BTreeSet::new())
+                .unwrap()
+                .deployment
+                .id,
+            "b"
+        );
+
+        let mut quota_deployments = deployments;
+        quota_deployments[0].quota_usage_millis = Some(800);
+        quota_deployments[1].quota_usage_millis = Some(200);
+        let quota = CapacityManager::with_picker(
+            CooldownPolicy::default(),
+            DeploymentPicker::LowestQuotaUsage,
+        );
+        assert_eq!(
+            quota
+                .select(&quota_deployments, &BTreeSet::new())
+                .unwrap()
+                .deployment
+                .id,
+            "b"
         );
     }
 }

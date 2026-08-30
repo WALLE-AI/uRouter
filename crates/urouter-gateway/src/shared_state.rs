@@ -10,7 +10,7 @@ use redis::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{DecisionRecord, FeedbackSignal};
+use crate::{DecisionRecord, FeedbackSignal, idempotency::IdempotencyClaim};
 
 #[derive(Debug, Error)]
 pub(crate) enum SharedStateError {
@@ -36,6 +36,14 @@ impl RedisSharedState {
                 .await?,
             prefix,
         })
+    }
+
+    pub(crate) async fn ping(&self) -> Result<(), SharedStateError> {
+        let mut connection = self.connection.clone();
+        redis::cmd("PING")
+            .query_async::<String>(&mut connection)
+            .await?;
+        Ok(())
     }
 
     pub(crate) async fn put_record(
@@ -85,6 +93,40 @@ return 1
         Ok(())
     }
 
+    pub(crate) async fn claim_idempotency(
+        &self,
+        tenant_key: &str,
+        key_hash: &str,
+        request_hash: &str,
+        candidate_request_id: &str,
+        ttl_seconds: u64,
+    ) -> Result<IdempotencyClaim, SharedStateError> {
+        const CLAIM: &str = r"
+local existing_hash = redis.call('HGET', KEYS[1], 'request_hash')
+if existing_hash then
+  if existing_hash ~= ARGV[1] then return {'conflict', ''} end
+  redis.call('EXPIRE', KEYS[1], ARGV[3])
+  return {'reused', redis.call('HGET', KEYS[1], 'request_id')}
+end
+redis.call('HSET', KEYS[1], 'request_hash', ARGV[1], 'request_id', ARGV[2])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+return {'created', ARGV[2]}
+";
+        let mut connection = self.connection.clone();
+        let (status, request_id): (String, String) = Script::new(CLAIM)
+            .key(self.idempotency_key(tenant_key, key_hash))
+            .arg(request_hash)
+            .arg(candidate_request_id)
+            .arg(ttl_seconds.max(1))
+            .invoke_async(&mut connection)
+            .await?;
+        match status.as_str() {
+            "created" => Ok(IdempotencyClaim::Created(request_id)),
+            "reused" => Ok(IdempotencyClaim::Reused(request_id)),
+            _ => Ok(IdempotencyClaim::Conflict),
+        }
+    }
+
     pub(crate) async fn records(
         &self,
         tenant_key: &str,
@@ -103,7 +145,8 @@ return 1
         let mut records = Vec::new();
         for (key, value) in keys.into_iter().zip(values) {
             match value {
-                Some(value) => records.push(serde_json::from_str(&value)?),
+                Some(value) => records
+                    .push(serde_json::from_str(&value).map(DecisionRecord::normalize_after_load)?),
                 None => stale.push(key),
             }
         }
@@ -127,7 +170,7 @@ return 1
             .get(self.record_key(tenant_key, decision_id))
             .await?;
         value
-            .map(|value| serde_json::from_str(&value))
+            .map(|value| serde_json::from_str(&value).map(DecisionRecord::normalize_after_load))
             .transpose()
             .map_err(SharedStateError::from)
     }
@@ -301,6 +344,14 @@ return deleted
 
     fn task_generation_key(&self, task_key: &str) -> String {
         format!("{}:task-generation:{task_key}", self.prefix)
+    }
+
+    fn idempotency_key(&self, tenant_key: &str, key_hash: &str) -> String {
+        format!(
+            "{}:idempotency:{:x}",
+            self.prefix,
+            Sha256::digest(format!("{tenant_key}\0{key_hash}").as_bytes())
+        )
     }
 }
 

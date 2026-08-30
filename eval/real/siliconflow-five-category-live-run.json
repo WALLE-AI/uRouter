@@ -1,0 +1,199 @@
+{
+  "schema_version": 1,
+  "started_at_unix_s": 1788094054,
+  "base_url": "http://127.0.0.1:8792/v1",
+  "requested_budget_nano_usd": 10000000,
+  "observed_cost_nano_usd": 1481767,
+  "planned_requests": 5,
+  "completed_requests": 5,
+  "budget_exceeded": false,
+  "passed": 4,
+  "failed": 1,
+  "runs": [
+    {
+      "id": "daily-greeting-run-1",
+      "category": "daily",
+      "status": 200,
+      "passed": true,
+      "latency_ms": 1812,
+      "cost_nano_usd": 0,
+      "tier": "efficient",
+      "model": "siliconflow/qwen2.5-7b-instruct",
+      "reason": "default_efficient",
+      "checks": [
+        {
+          "name": "http_status",
+          "passed": true,
+          "expected": "200",
+          "actual": "200"
+        },
+        {
+          "name": "tier",
+          "passed": true,
+          "expected": "efficient",
+          "actual": "efficient"
+        },
+        {
+          "name": "model",
+          "passed": true,
+          "expected": "siliconflow/qwen2.5-7b-instruct",
+          "actual": "siliconflow/qwen2.5-7b-instruct"
+        }
+      ]
+    },
+    {
+      "id": "tool-weather-run-1",
+      "category": "tool",
+      "status": 200,
+      "passed": true,
+      "latency_ms": 5697,
+      "cost_nano_usd": 301427,
+      "tier": "capable",
+      "model": "siliconflow/deepseek-r1-pro",
+      "reason": "capability_required",
+      "checks": [
+        {
+          "name": "http_status",
+          "passed": true,
+          "expected": "200",
+          "actual": "200"
+        },
+        {
+          "name": "tier",
+          "passed": true,
+          "expected": "capable",
+          "actual": "capable"
+        },
+        {
+          "name": "model",
+          "passed": true,
+          "expected": "siliconflow/deepseek-r1-pro",
+          "actual": "siliconflow/deepseek-r1-pro"
+        },
+        {
+          "name": "tool_name",
+          "passed": true,
+          "expected": "get_weather",
+          "actual": "get_weather"
+        }
+      ]
+    },
+    {
+      "id": "math-equation-run-1",
+      "category": "math",
+      "status": 200,
+      "passed": true,
+      "latency_ms": 21821,
+      "cost_nano_usd": 1180340,
+      "tier": "capable",
+      "model": "siliconflow/deepseek-r1-pro",
+      "reason": "capability_required",
+      "checks": [
+        {
+          "name": "http_status",
+          "passed": true,
+          "expected": "200",
+          "actual": "200"
+        },
+        {
+          "name": "tier",
+          "passed": true,
+          "expected": "capable",
+          "actual": "capable"
+        },
+        {
+          "name": "model",
+          "passed": true,
+          "expected": "siliconflow/deepseek-r1-pro",
+          "actual": "siliconflow/deepseek-r1-pro"
+        },
+        {
+          "name": "content_contains",
+          "passed": true,
+          "expected": "6",
+          "actual": "content_length=433"
+        },
+        {
+          "name": "content_contains",
+          "passed": true,
+          "expected": "4",
+          "actual": "content_length=433"
+        }
+      ]
+    },
+    {
+      "id": "code-rust-gcd-run-1",
+      "category": "code",
+      "status": 200,
+      "passed": true,
+      "latency_ms": 1250,
+      "cost_nano_usd": 0,
+      "tier": "efficient",
+      "model": "siliconflow/qwen2.5-7b-instruct",
+      "reason": "default_efficient",
+      "checks": [
+        {
+          "name": "http_status",
+          "passed": true,
+          "expected": "200",
+          "actual": "200"
+        },
+        {
+          "name": "tier",
+          "passed": true,
+          "expected": "efficient",
+          "actual": "efficient"
+        },
+        {
+          "name": "model",
+          "passed": true,
+          "expected": "siliconflow/qwen2.5-7b-instruct",
+          "actual": "siliconflow/qwen2.5-7b-instruct"
+        },
+        {
+          "name": "content_contains",
+          "passed": true,
+          "expected": "fn gcd",
+          "actual": "content_length=169"
+        }
+      ]
+    },
+    {
+      "id": "long-context-recall-run-1",
+      "category": "long_context",
+      "status": 200,
+      "passed": false,
+      "latency_ms": 663,
+      "cost_nano_usd": 0,
+      "tier": "efficient",
+      "model": "siliconflow/qwen2.5-7b-instruct",
+      "reason": "default_efficient",
+      "checks": [
+        {
+          "name": "http_status",
+          "passed": true,
+          "expected": "200",
+          "actual": "200"
+        },
+        {
+          "name": "tier",
+          "passed": true,
+          "expected": "efficient",
+          "actual": "efficient"
+        },
+        {
+          "name": "model",
+          "passed": true,
+          "expected": "siliconflow/qwen2.5-7b-instruct",
+          "actual": "siliconflow/qwen2.5-7b-instruct"
+        },
+        {
+          "name": "content_contains",
+          "passed": false,
+          "expected": "UROUTER_LONG_CONTEXT_OK",
+          "actual": "content_length=31"
+        }
+      ]
+    }
+  ]
+}

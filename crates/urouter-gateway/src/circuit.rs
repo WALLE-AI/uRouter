@@ -414,6 +414,14 @@ mod tests {
             order: 0,
             provider_scope: Some(provider.to_owned()),
             credential_scope: Some(credential.to_owned()),
+            enabled: true,
+            credential_available: true,
+            region: None,
+            residency: Vec::new(),
+            tenant_allowlist: Vec::new(),
+            quota_usage_millis: None,
+            accept_new_requests: true,
+            binding_grace_until_unix: None,
         }
     }
 

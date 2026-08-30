@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://urouter.local/schema/provider-candidate-v1.json",
+  "title": "uRouter quarantined provider catalog candidate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "instance_id", "inventory_hash", "candidate_hash",
+    "complete", "provider", "models"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "instance_id": { "type": "string", "minLength": 1 },
+    "inventory_hash": { "$ref": "#/$defs/sha256" },
+    "candidate_hash": { "$ref": "#/$defs/sha256" },
+    "complete": { "type": "boolean" },
+    "provider": {
+      "anyOf": [
+        { "$ref": "catalog.schema.json#/$defs/provider" },
+        { "type": "null" }
+      ]
+    },
+    "models": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/candidate_model" }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "candidate_model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "upstream_id", "raw_hash", "reviewed", "unresolved_fields",
+        "quarantine_reasons"
+      ],
+      "properties": {
+        "upstream_id": { "type": "string", "minLength": 1 },
+        "raw_hash": { "$ref": "#/$defs/sha256" },
+        "reviewed": {
+          "anyOf": [
+            { "$ref": "provider-review.schema.json#/$defs/reviewed_model" },
+            { "type": "null" }
+          ]
+        },
+        "unresolved_fields": {
+          "type": "array",
+          "items": {
+            "enum": ["pricing", "capabilities", "compat", "lifecycle", "source"]
+          },
+          "uniqueItems": true
+        },
+        "quarantine_reasons": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "cases": 5,
+  "supported_cases": 5,
+  "mean_quality_millionths": 1000000.0,
+  "total_cost_nano_usd": 1854567,
+  "mean_latency_ms": 6621.4,
+  "p50_latency_ms": 3227,
+  "p95_latency_ms": 21275,
+  "by_category": {
+    "daily": 2,
+    "tool": 2,
+    "math": 1
+  },
+  "category_summaries": {
+    "daily": {
+      "cases": 2,
+      "supported_cases": 2,
+      "mean_quality_millionths": 1000000.0,
+      "total_cost_nano_usd": 0,
+      "mean_latency_ms": 1122.0,
+      "p50_latency_ms": 483,
+      "p95_latency_ms": 1761
+    },
+    "tool": {
+      "cases": 2,
+      "supported_cases": 2,
+      "mean_quality_millionths": 1000000.0,
+      "total_cost_nano_usd": 619959,
+      "mean_latency_ms": 4794.0,
+      "p50_latency_ms": 3227,
+      "p95_latency_ms": 6361
+    },
+    "math": {
+      "cases": 1,
+      "supported_cases": 1,
+      "mean_quality_millionths": 1000000.0,
+      "total_cost_nano_usd": 1234608,
+      "mean_latency_ms": 21275.0,
+      "p50_latency_ms": 21275,
+      "p95_latency_ms": 21275
+    }
+  }
+}

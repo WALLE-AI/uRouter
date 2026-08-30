@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "instance_id": "ark-cn-beijing-main",
+  "content_hash": "sha256:f689b0d73f11f75bc2341595c3ebce357594bf3d33c5296f8ca881ad0e61d5c9",
+  "snapshot": "snapshots/f689b0d73f11f75bc2341595c3ebce357594bf3d33c5296f8ca881ad0e61d5c9.json",
+  "last_fetched_at_unix": 1787997735,
+  "models": 1
+}

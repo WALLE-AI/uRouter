@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "started_at_unix_s": 1788094253,
+  "base_url": "http://127.0.0.1:8792/v1",
+  "requested_budget_nano_usd": 2000000,
+  "observed_cost_nano_usd": 0,
+  "planned_requests": 1,
+  "completed_requests": 1,
+  "budget_exceeded": false,
+  "passed": 0,
+  "failed": 1,
+  "runs": [
+    {
+      "id": "long-context-recall-run-1",
+      "category": "long_context",
+      "status": 200,
+      "passed": false,
+      "latency_ms": 725,
+      "cost_nano_usd": 0,
+      "tier": "efficient",
+      "model": "siliconflow/qwen2.5-7b-instruct",
+      "reason": "default_efficient",
+      "checks": [
+        {
+          "name": "http_status",
+          "passed": true,
+          "expected": "200",
+          "actual": "200"
+        },
+        {
+          "name": "tier",
+          "passed": true,
+          "expected": "efficient",
+          "actual": "efficient"
+        },
+        {
+          "name": "model",
+          "passed": true,
+          "expected": "siliconflow/qwen2.5-7b-instruct",
+          "actual": "siliconflow/qwen2.5-7b-instruct"
+        },
+        {
+          "name": "content_contains",
+          "passed": false,
+          "expected": "7391",
+          "actual": "content_length=1"
+        }
+      ]
+    }
+  ]
+}

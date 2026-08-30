@@ -226,6 +226,10 @@ request_id
 
 退出门禁：本地 mock、双实例 Redis 和受控真实 provider 三层测试均通过；指标可以回答“为什么选它、为什么排除其他模型、花费多少、是否发生降级”。
 
+> 2026-08-30 执行更新：P2-01～P2-11 仓库内实现与自动化门禁均为
+> `code_complete`。Docker 不可用，因此本机未执行 Redis restart chaos；真实
+> provider 账单对账、Redis HA/ACL/TLS 和多 Gateway 分发故障仍是外部验收项。
+
 ## 9. 阶段 P3：Catalog 全生命周期与语义路由
 
 **目标**：把现有 discovery 扩展成 provider 无关、可审计、可回滚的 Catalog 发布链，并在稳定记录契约上启用语义需求识别。预计 3-4 周。
@@ -253,6 +257,11 @@ discover -> normalize -> enrich -> probe -> candidate -> review -> publish
 工具职责固定为：uRouter 只输出 `requires_tools` 和能力要求，Agent Host 提供并执行具体工具，模型生成 tool call。选择更大模型不能替代天气、搜索等实时工具。
 
 退出门禁：三个 provider discovery contract tests 通过；至少一个非 SiliconFlow provider 完成受控真实发现；Catalog 发布/回滚/热加载故障注入通过；“你好、武汉天气、二元一次方程、无工具天气请求”四类路由和 Host 联调测试通过。
+
+> 2026-08-30 执行更新：P3-01～P3-12 仓库内实现与自动化门禁均为
+> `code_complete`，详见 `docs/p2-p3-execution-status.md`。当前仍不能标记
+> `accepted`：非 SiliconFlow 云端真实发现、付费能力 probe、进程中断发布
+> 故障注入和真实 Agent Host 天气工具需要外部凭据、费用授权或运行环境。
 
 ## 10. 阶段 P4：数据集、基准与离线评估
 

@@ -1,18 +1,21 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
+    future::{Future, IntoFuture},
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Json, Router,
-    body::{Body, Bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
@@ -25,30 +28,49 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::AsyncWriteExt,
-    sync::{RwLock, mpsc, oneshot},
+    sync::{RwLock, broadcast, mpsc, oneshot},
     time::sleep,
 };
 use urouter_ai::{
     auth::AuthPlan,
-    catalog::{CatalogSnapshot, ModelSpec},
+    catalog::{CatalogManifest, CatalogSnapshot, ModelSpec},
     compat::MaxTokensField,
     endpoint::EndpointPlan,
     evidence::CatalogEvidence,
     pricing::{CostBreakdown, PriceSource, calculate_actual_cost},
 };
+use urouter_artifact::{
+    ArtifactController, ArtifactDecision, CanaryObservation, DecisionSource, RollbackThresholds,
+    RolloutPolicy, RouterArtifact,
+};
+use urouter_contracts::{
+    DecisionRecordContext, DeploymentDisposition, DeploymentEvaluation, DeploymentPicker,
+    FEATURE_SCHEMA_VERSION, FallbackTierSpec, FeatureFrame, RetryDirective, RevisionSet,
+    RoutingTrace, RuleEvaluation, RuleOutcome, plan_fallback_tiers,
+};
 use urouter_gateway::{
-    CallRole, DataPolicyContract, MigrationBoundary, RecordingMode, RetryPolicy, RouteConfig,
-    RouteDecision, RouteDeployment, RouteError, SignalContract, UpstreamErrorKind,
+    CallRole, DataPolicyContract, FallbackCause, MigrationBoundary, RecordingMode, RetryPolicy,
+    RouteConfig, RouteDecision, RouteDeployment, RouteError, SignalContract, TierConfig,
+    UpstreamErrorKind,
     capacity::{CapacityError, CapacityLease, CapacityManager, CooldownPolicy},
     circuit::{
         CircuitPermit, LocalCircuitRepository, RedisCircuitRepository, SharedCircuitRepository,
     },
 };
+use urouter_protocol::{
+    LossPolicy, TransportCapabilities, from_anthropic_messages, from_openai_chat,
+    from_openai_responses, to_anthropic_messages, to_openai_chat, to_openai_responses,
+};
 use urouter_types::{ModelId, Usage, WireApi};
 
 mod adapter;
 mod binding;
+mod budget;
+mod control;
+mod idempotency;
 mod management_auth;
+mod quota;
+mod record;
 mod shared_state;
 
 use adapter::adapt_agent_request;
@@ -56,13 +78,31 @@ use binding::{
     BindingWrite, MemoryTaskBindingRepository, RedisTaskBindingRepository, TaskBinding,
     TaskBindingRepository,
 };
+use budget::{
+    BudgetAdmission, BudgetError, BudgetLease, BudgetRepository, MemoryBudgetRepository,
+    RedisBudgetRepository,
+};
+use control::{ControlFailurePolicy, ControlPlane, ControlSnapshot};
+use idempotency::{
+    IdempotencyClaim, IdempotencyRepository, MemoryIdempotencyRepository,
+    RedisIdempotencyRepository,
+};
 use management_auth::{ManagementAuth, ManagementAuthError, ManagementRole};
+use quota::{
+    MemoryQuotaRepository, QuotaAdmission, QuotaError, QuotaLease, QuotaRejection, QuotaRepository,
+    RedisQuotaRepository,
+};
+use record::{
+    DecisionRecordRepository, MemoryDecisionRecordRepository, RecordDelete, RecordRepositoryError,
+    RedisDecisionRecordRepository,
+};
 use shared_state::RedisSharedState;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Parser)]
 #[command(about = "uRouter M0 Auto gateway")]
+#[allow(clippy::struct_excessive_bools)]
 struct Args {
     #[arg(long, default_value = "catalog/catalog.json")]
     catalog: PathBuf,
@@ -70,6 +110,8 @@ struct Args {
     route: PathBuf,
     #[arg(long, default_value = "127.0.0.1:8787")]
     bind: SocketAddr,
+    #[arg(long)]
+    dry_run: bool,
     #[arg(long)]
     records: Option<PathBuf>,
     #[arg(long)]
@@ -98,8 +140,28 @@ struct Args {
     cooldown_failure_threshold_millis: u16,
     #[arg(long, default_value_t = 5)]
     max_fallback_depth: u8,
+    #[arg(long, default_value = "weighted")]
+    deployment_picker: String,
     #[arg(long, default_value_t = 10_000)]
     task_binding_capacity: usize,
+    #[arg(long, default_value_t = 10_000)]
+    idempotency_capacity: usize,
+    #[arg(long, default_value_t = 86_400)]
+    idempotency_ttl_seconds: u64,
+    #[arg(long, default_value_t = 0)]
+    tenant_max_in_flight: usize,
+    #[arg(long, default_value_t = 0)]
+    tenant_requests_per_minute: usize,
+    #[arg(long, default_value_t = 0)]
+    tenant_tokens_per_minute: u64,
+    #[arg(long, default_value_t = 4_096)]
+    quota_default_max_output_tokens: u64,
+    #[arg(long, default_value_t = 86_400)]
+    quota_lease_ttl_seconds: u64,
+    #[arg(long, default_value_t = 0)]
+    tenant_budget_nano_usd: u64,
+    #[arg(long, default_value_t = 2_592_000)]
+    budget_period_seconds: u64,
     #[arg(long)]
     redis_url: Option<String>,
     #[arg(long, default_value = "urouter")]
@@ -116,6 +178,38 @@ struct Args {
     management_audit_queue_capacity: usize,
     #[arg(long, default_value_t = 5)]
     management_keyring_reload_seconds: u64,
+    #[arg(long, default_value_t = 30)]
+    shutdown_grace_seconds: u64,
+    #[arg(long)]
+    control_manifest: Option<PathBuf>,
+    #[arg(long)]
+    control_signing_key_env: Option<String>,
+    #[arg(long, default_value_t = 5)]
+    control_reload_seconds: u64,
+    #[arg(long, default_value = "last_good")]
+    control_failure_policy: String,
+    #[arg(long)]
+    control_required_revision: Option<String>,
+    #[arg(long)]
+    artifact_active: Option<PathBuf>,
+    #[arg(long)]
+    artifact_candidate: Option<PathBuf>,
+    #[arg(long)]
+    artifact_signing_key_env: Option<String>,
+    #[arg(long, default_value_t = false)]
+    artifact_shadow: bool,
+    #[arg(long, default_value_t = 0)]
+    artifact_canary_basis_points: u16,
+    #[arg(long, default_value_t = 100)]
+    artifact_minimum_samples: u64,
+    #[arg(long, default_value_t = 6)]
+    artifact_operation_limit: u32,
+    #[arg(long, default_value_t = false)]
+    artifact_kill_switch: bool,
+    #[arg(long, default_value_t = 0)]
+    exploration_epsilon_millionths: u32,
+    #[arg(long, default_value_t = 0)]
+    exploration_max_budget_nano_usd: u64,
 }
 
 #[derive(Clone)]
@@ -124,6 +218,7 @@ struct AppState {
     route: Arc<RouteConfig>,
     client: reqwest::Client,
     records: RecordStore,
+    record_repository: Arc<dyn DecisionRecordRepository>,
     feedback: FeedbackStore,
     metrics: GatewayMetrics,
     request_timeout: Duration,
@@ -132,9 +227,107 @@ struct AppState {
     shared_circuits: Arc<dyn SharedCircuitRepository>,
     max_fallback_depth: u8,
     bindings: Arc<dyn TaskBindingRepository>,
+    idempotency: Arc<dyn IdempotencyRepository>,
+    idempotency_ttl_seconds: u64,
+    quota: Arc<dyn QuotaRepository>,
+    quota_default_max_output_tokens: u64,
+    budget: Arc<dyn BudgetRepository>,
     shared_state: Option<RedisSharedState>,
     require_tenant_header: bool,
     management_auth: ManagementAuth,
+    accepting: Arc<AtomicBool>,
+    control: ControlPlane,
+    control_source: Option<ControlSource>,
+    artifact: Option<ArtifactRuntime>,
+    exploration: ExplorationPolicy,
+    cache_affinity: CacheAffinityStore,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExplorationPolicy {
+    epsilon_millionths: u32,
+    maximum_budget_nano_usd: u64,
+}
+
+#[derive(Clone)]
+struct CacheAffinityStore {
+    inner: Arc<StdMutex<CacheAffinityState>>,
+    capacity: usize,
+}
+
+#[derive(Default)]
+struct CacheAffinityState {
+    deployments: BTreeMap<String, String>,
+    order: VecDeque<String>,
+}
+
+impl CacheAffinityStore {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(StdMutex::new(CacheAffinityState::default())),
+            capacity,
+        }
+    }
+
+    fn preferred(&self, profile_hash: Option<&str>) -> Option<String> {
+        let profile_hash = profile_hash?;
+        self.inner
+            .lock()
+            .expect("cache affinity lock poisoned")
+            .deployments
+            .get(profile_hash)
+            .cloned()
+    }
+
+    fn remember(&self, profile_hash: Option<&str>, deployment: &str) {
+        let Some(profile_hash) = profile_hash else {
+            return;
+        };
+        let mut state = self.inner.lock().expect("cache affinity lock poisoned");
+        if !state.deployments.contains_key(profile_hash) {
+            state.order.push_back(profile_hash.to_owned());
+        }
+        state
+            .deployments
+            .insert(profile_hash.to_owned(), deployment.to_owned());
+        while state.deployments.len() > self.capacity {
+            if let Some(oldest) = state.order.pop_front() {
+                state.deployments.remove(&oldest);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ArtifactRuntime {
+    controller: ArtifactController,
+    catalog_revision: String,
+    route_revision: String,
+}
+
+#[derive(Clone)]
+struct ControlSource {
+    catalog: PathBuf,
+    route: PathBuf,
+    manifest: PathBuf,
+    signing_key: Option<Vec<u8>>,
+}
+
+struct LoadedControl {
+    catalog: Arc<CatalogSnapshot>,
+    route: Arc<RouteConfig>,
+    plane: ControlPlane,
+    source: Option<ControlSource>,
+    signing_key: Option<Vec<u8>>,
+}
+
+impl AppState {
+    fn with_active_control(mut self) -> Self {
+        let snapshot = self.control.snapshot();
+        self.catalog = snapshot.catalog;
+        self.route = snapshot.route;
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -148,6 +341,8 @@ struct RequestGovernance {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DecisionRecord {
+    #[serde(default)]
+    context: Option<DecisionRecordContext>,
     decision_id: String,
     trace_turn: Option<String>,
     #[serde(default)]
@@ -178,6 +373,14 @@ struct DecisionRecord {
     expires_at_unix_s: u64,
     #[serde(default)]
     messages_hash: String,
+    #[serde(default)]
+    created_at_unix_s: u64,
+    #[serde(default)]
+    redaction_profile: String,
+    #[serde(default)]
+    semantic_task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exploration: Option<ExplorationRecord>,
     route_id: String,
     tier: String,
     reason: String,
@@ -186,6 +389,8 @@ struct DecisionRecord {
     requirement: urouter_ai::capabilities::CapabilityRequirement,
     admission: urouter_ai::admission::AdmissionResult,
     execution: ExecutionRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact: Option<ArtifactDecision>,
     #[serde(default)]
     override_record: Option<OverrideRecord>,
     #[serde(default)]
@@ -194,6 +399,19 @@ struct DecisionRecord {
     tenant_generation: u64,
     #[serde(skip)]
     task_generation: u64,
+}
+
+impl DecisionRecord {
+    fn normalize_after_load(mut self) -> Self {
+        if !self
+            .context
+            .as_ref()
+            .is_some_and(DecisionRecordContext::training_complete)
+        {
+            self.training_eligible = false;
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +429,16 @@ struct OverrideRecord {
 struct FeedbackSignal {
     kind: String,
     strength: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExplorationRecord {
+    epsilon_millionths: u32,
+    propensity_millionths: u32,
+    eligible_set: Vec<String>,
+    selected_by_exploration: bool,
+    authorized_budget_nano_usd: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,7 +479,7 @@ enum FeedbackCommand {
     },
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct GatewayMetrics {
     requests: Arc<AtomicU64>,
     successes: Arc<AtomicU64>,
@@ -261,12 +489,125 @@ struct GatewayMetrics {
     paired: Arc<AtomicU64>,
     paired_rejected: Arc<AtomicU64>,
     streams_completed: Arc<AtomicU64>,
+    stream_failures: Arc<AtomicU64>,
     fallbacks: Arc<AtomicU64>,
     bindings_created: Arc<AtomicU64>,
     bindings_applied: Arc<AtomicU64>,
     binding_migrations: Arc<AtomicU64>,
     compatibility_requests: Arc<AtomicU64>,
     binding_conflicts: Arc<AtomicU64>,
+    quota_rejections: Arc<AtomicU64>,
+    budget_rejections: Arc<AtomicU64>,
+    filter_rejections: Arc<StdMutex<BTreeMap<String, u64>>>,
+    request_duration_ms: Histogram,
+    upstream_duration_ms: Histogram,
+    ttft_ms: Histogram,
+    cost_nano_usd: Histogram,
+    fallback_depth: Histogram,
+}
+
+impl Default for GatewayMetrics {
+    fn default() -> Self {
+        Self {
+            requests: Arc::default(),
+            successes: Arc::default(),
+            errors: Arc::default(),
+            retries: Arc::default(),
+            feedback_signals: Arc::default(),
+            paired: Arc::default(),
+            paired_rejected: Arc::default(),
+            streams_completed: Arc::default(),
+            stream_failures: Arc::default(),
+            fallbacks: Arc::default(),
+            bindings_created: Arc::default(),
+            bindings_applied: Arc::default(),
+            binding_migrations: Arc::default(),
+            compatibility_requests: Arc::default(),
+            binding_conflicts: Arc::default(),
+            quota_rejections: Arc::default(),
+            budget_rejections: Arc::default(),
+            filter_rejections: Arc::default(),
+            request_duration_ms: Histogram::new(&[
+                5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000,
+            ]),
+            upstream_duration_ms: Histogram::new(&[
+                5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000,
+            ]),
+            ttft_ms: Histogram::new(&[
+                10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000,
+            ]),
+            cost_nano_usd: Histogram::new(&[
+                1_000,
+                10_000,
+                100_000,
+                1_000_000,
+                10_000_000,
+                100_000_000,
+                1_000_000_000,
+            ]),
+            fallback_depth: Histogram::new(&[0, 1, 2, 3, 5, 8]),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Histogram {
+    bounds: &'static [u64],
+    state: Arc<StdMutex<HistogramState>>,
+}
+
+#[derive(Default)]
+struct HistogramState {
+    buckets: Vec<u64>,
+    count: u64,
+    sum: u128,
+    exemplar: Option<(String, u64)>,
+}
+
+impl Histogram {
+    fn new(bounds: &'static [u64]) -> Self {
+        Self {
+            bounds,
+            state: Arc::new(StdMutex::new(HistogramState {
+                buckets: vec![0; bounds.len()],
+                ..HistogramState::default()
+            })),
+        }
+    }
+
+    fn observe(&self, value: u64) {
+        self.observe_with_exemplar(value, None);
+    }
+
+    fn observe_with_exemplar(&self, value: u64, trace_id: Option<&str>) {
+        let mut state = self.state.lock().expect("histogram metric lock poisoned");
+        for (index, bound) in self.bounds.iter().enumerate() {
+            if value <= *bound {
+                state.buckets[index] = state.buckets[index].saturating_add(1);
+            }
+        }
+        state.count = state.count.saturating_add(1);
+        state.sum = state.sum.saturating_add(u128::from(value));
+        if let Some(trace_id) = trace_id {
+            state.exemplar = Some((trace_id.to_owned(), value));
+        }
+    }
+
+    fn render(&self, body: &mut String, name: &str, help: &str) {
+        let state = self.state.lock().expect("histogram metric lock poisoned");
+        let _ = writeln!(body, "# HELP {name} {help}");
+        let _ = writeln!(body, "# TYPE {name} histogram");
+        for (bound, count) in self.bounds.iter().zip(&state.buckets) {
+            let _ = writeln!(body, "{name}_bucket{{le=\"{bound}\"}} {count}");
+        }
+        let _ = write!(body, "{name}_bucket{{le=\"+Inf\"}} {}", state.count);
+        if let Some((trace_id, value)) = &state.exemplar {
+            let _ = write!(body, " # {{trace_id=\"{trace_id}\"}} {value}");
+        }
+        body.push('\n');
+        let _ = writeln!(body, "{name}_sum {}", state.sum);
+        let _ = writeln!(body, "{name}_count {}", state.count);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +628,39 @@ struct ExecutionRecord {
     deployment: String,
     #[serde(default)]
     fallback_depth: u8,
+    #[serde(default)]
+    runtime_filter_trace: Vec<DeploymentEvaluation>,
+}
+
+impl ExecutionRecord {
+    fn success(
+        stream: bool,
+        upstream_latency_ms: u128,
+        usage: Option<Usage>,
+        cost: Option<CostBreakdown>,
+        attempts: Vec<AttemptRecord>,
+        deployment: String,
+        fallback_depth: u8,
+    ) -> Self {
+        let runtime_filter_trace = attempts
+            .iter()
+            .flat_map(|attempt| attempt.selection_trace.iter().cloned())
+            .collect();
+        Self {
+            ok: true,
+            stream,
+            upstream_status: 200,
+            upstream_latency_ms,
+            usage,
+            cost,
+            usage_unavailable: usage.is_none(),
+            attempts,
+            error_kind: None,
+            deployment,
+            fallback_depth,
+            runtime_filter_trace,
+        }
+    }
 }
 
 const fn bool_true() -> bool {
@@ -295,6 +669,8 @@ const fn bool_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AttemptRecord {
+    #[serde(default)]
+    attempt_id: Option<String>,
     attempt: u8,
     #[serde(default)]
     tier: String,
@@ -306,6 +682,125 @@ struct AttemptRecord {
     latency_ms: u128,
     error_kind: Option<UpstreamErrorKind>,
     retry: bool,
+    #[serde(default)]
+    selection_trace: Vec<DeploymentEvaluation>,
+}
+
+#[derive(Clone, Copy)]
+struct AttemptOutcome {
+    status: Option<u16>,
+    latency_ms: u128,
+    error_kind: Option<UpstreamErrorKind>,
+    retry: bool,
+}
+
+impl AttemptOutcome {
+    fn success(status: u16, latency_ms: u128) -> Self {
+        Self {
+            status: Some(status),
+            latency_ms,
+            error_kind: None,
+            retry: false,
+        }
+    }
+
+    fn failure(failure: &AttemptFailure, retry: bool) -> Self {
+        Self {
+            status: failure.status.map(|status| status.as_u16()),
+            latency_ms: failure.latency_ms,
+            error_kind: Some(failure.kind),
+            retry,
+        }
+    }
+}
+
+impl AttemptRecord {
+    fn new(
+        request_id: &str,
+        attempt: u8,
+        tier: &str,
+        deployment: &RouteDeployment,
+        model: &ModelSpec,
+        selection_trace: Vec<DeploymentEvaluation>,
+        outcome: AttemptOutcome,
+    ) -> Self {
+        Self {
+            attempt_id: Some(attempt_id(request_id, attempt)),
+            attempt,
+            tier: tier.to_owned(),
+            deployment: deployment.id.clone(),
+            model: Some(model.id.clone()),
+            status: outcome.status,
+            latency_ms: outcome.latency_ms,
+            error_kind: outcome.error_kind,
+            retry: outcome.retry,
+            selection_trace,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RecordSeed {
+    request_id: String,
+    messages_hash: String,
+    features: FeatureFrame,
+    route_revision: String,
+    artifact: Option<ArtifactDecision>,
+    exploration: Option<ExplorationRecord>,
+}
+
+struct ResponseContext {
+    decision_id: String,
+    decision: RouteDecision,
+    governance: RequestGovernance,
+    record: RecordSeed,
+    headers: HeaderMap,
+    quota: QuotaLease,
+    quota_input_tokens: u64,
+    budget: BudgetAccounting,
+}
+
+struct BudgetAccounting {
+    lease: BudgetLease,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+impl BudgetAccounting {
+    async fn settle(
+        &self,
+        state: &AppState,
+        cost: Option<&CostBreakdown>,
+        attempts: &[AttemptRecord],
+    ) {
+        settle_budget_usage(
+            state,
+            &self.lease,
+            cost,
+            attempts,
+            self.input_tokens,
+            self.output_tokens,
+        )
+        .await;
+    }
+}
+
+struct RequestAdmission {
+    governance: RequestGovernance,
+    quota: QuotaLease,
+    quota_input_tokens: u64,
+    budget: BudgetLease,
+    budget_input_tokens: u64,
+    budget_output_tokens: u64,
+}
+
+struct FailedRequestContext {
+    decision: RouteDecision,
+    governance: RequestGovernance,
+    record: RecordSeed,
+    budget: BudgetLease,
+    stream: bool,
+    started: Instant,
 }
 
 struct UpstreamExecution {
@@ -325,6 +820,7 @@ struct RoutedFailure {
     tier: String,
     model: ModelSpec,
     fallback_depth: u8,
+    runtime_filter_trace: Vec<DeploymentEvaluation>,
 }
 
 #[derive(Clone)]
@@ -333,10 +829,22 @@ struct ExecutionTier {
     deployments: Vec<RouteDeployment>,
 }
 
+struct RequestExecutionIdentity<'a> {
+    request_id: &'a str,
+    tenant_key: &'a str,
+}
+
 struct TierSuccess {
     response: reqwest::Response,
     lease: ExecutionLease,
     model: ModelSpec,
+}
+
+struct PreparedDeployment {
+    model: ModelSpec,
+    url: String,
+    headers: BTreeMap<String, String>,
+    request: Value,
 }
 
 struct ExecutionLease {
@@ -345,6 +853,7 @@ struct ExecutionLease {
     shared: Arc<dyn SharedCircuitRepository>,
     permit: Option<CircuitPermit>,
     tier_size: usize,
+    selection_trace: Vec<DeploymentEvaluation>,
 }
 
 impl ExecutionLease {
@@ -416,6 +925,8 @@ struct DecisionQuery {
 struct StreamCapture {
     complete: Vec<u8>,
     tail: Vec<u8>,
+    failed: bool,
+    first_chunk_observed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -438,6 +949,7 @@ struct GatewayError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    request_id: Option<String>,
     decision_id: Option<String>,
 }
 
@@ -447,6 +959,7 @@ impl GatewayError {
             status: StatusCode::BAD_REQUEST,
             code,
             message: error.to_string(),
+            request_id: None,
             decision_id: None,
         }
     }
@@ -456,8 +969,14 @@ impl GatewayError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal_error",
             message: error.to_string(),
+            request_id: None,
             decision_id: None,
         }
+    }
+
+    fn with_request_id(mut self, request_id: &str) -> Self {
+        self.request_id = Some(request_id.to_owned());
+        self
     }
 }
 
@@ -474,6 +993,13 @@ impl IntoResponse for GatewayError {
             })),
         )
             .into_response();
+        if let Some(request_id) = self.request_id
+            && let Ok(value) = HeaderValue::from_str(&request_id)
+        {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("x-urouter-request-id"), value);
+        }
         if let Some(decision_id) = self.decision_id
             && let Ok(value) = HeaderValue::from_str(&decision_id)
         {
@@ -487,7 +1013,13 @@ impl IntoResponse for GatewayError {
 
 impl From<RouteError> for GatewayError {
     fn from(error: RouteError) -> Self {
-        Self::bad_request("route_rejected", error)
+        match error {
+            RouteError::RequiredToolUnavailable(tool) => Self::bad_request(
+                "missing_required_tool",
+                format!("the Agent Host must provide the required {tool} tool"),
+            ),
+            error => Self::bad_request("route_rejected", error),
+        }
     }
 }
 
@@ -519,6 +1051,7 @@ impl From<ManagementAuthError> for GatewayError {
             status,
             code,
             message: message.to_owned(),
+            request_id: None,
             decision_id: None,
         }
     }
@@ -529,23 +1062,59 @@ fn state_backend_unavailable(_error: impl std::fmt::Display) -> GatewayError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         code: "state_backend_unavailable",
         message: "the shared state backend is temporarily unavailable".to_owned(),
+        request_id: None,
         decision_id: None,
     }
 }
 
+fn record_repository_error(error: RecordRepositoryError) -> GatewayError {
+    match error {
+        RecordRepositoryError::Local(message) => GatewayError::internal(message),
+        RecordRepositoryError::Shared(error) => state_backend_unavailable(error),
+    }
+}
+
+fn quota_repository_error(error: QuotaError) -> GatewayError {
+    match error {
+        QuotaError::Backend(error) => state_backend_unavailable(error),
+        QuotaError::LockPoisoned | QuotaError::InvalidRejection(_) => {
+            GatewayError::internal("quota state is invalid")
+        }
+    }
+}
+
+fn budget_repository_error(error: BudgetError) -> GatewayError {
+    match error {
+        BudgetError::Backend(error) => state_backend_unavailable(error),
+        BudgetError::LockPoisoned => GatewayError::internal("budget state is invalid"),
+    }
+}
+
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<(), BoxError> {
     let args = Args::parse();
+    if args.dry_run {
+        let report = configuration_dry_run(&args);
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if !report.valid {
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
     validate_args(&args)?;
-    let catalog = Arc::new(CatalogSnapshot::from_json_str(&fs::read_to_string(
-        &args.catalog,
-    )?)?);
-    let route: RouteConfig = serde_json::from_str(&fs::read_to_string(&args.route)?)?;
-    route.validate(&catalog)?;
+    let deployment_picker = configured_picker(&args)?;
+    let loaded_control = load_control(&args)?;
+    let catalog = Arc::clone(&loaded_control.catalog);
+    let route = Arc::clone(&loaded_control.route);
+    let artifact = load_artifact_runtime(&args, &catalog, &route)?;
     let bindings = build_binding_repository(&args).await?;
     let cooldown_policy = configured_cooldown_policy(&args);
     let shared_circuits = build_circuit_repository(&args, cooldown_policy).await?;
     let shared_state = build_shared_state(&args).await?;
+    let idempotency = build_idempotency_repository(&args, shared_state.as_ref());
+    let quota = build_quota_repository(&args).await?;
+    let budget = build_budget_repository(&args).await?;
     let management_auth = ManagementAuth::open(
         args.management_keyring.clone(),
         args.management_audit.clone(),
@@ -553,18 +1122,20 @@ async fn main() -> Result<(), BoxError> {
         Duration::from_secs(args.management_keyring_reload_seconds),
     )
     .await?;
-    let feedback_path = args.feedback_records.or_else(|| {
+    let feedback_path = args.feedback_records.clone().or_else(|| {
         args.records
             .as_ref()
             .map(|path| PathBuf::from(format!("{}.feedback", path.display())))
     });
     let records = RecordStore::open(
-        args.records,
+        args.records.clone(),
         args.record_capacity,
         args.record_queue_capacity,
         args.record_max_bytes,
     )
     .await?;
+    let record_repository =
+        build_record_repository(shared_state.as_ref(), records.clone(), args.record_capacity);
     let feedback_store = FeedbackStore::open(
         feedback_path,
         args.record_queue_capacity,
@@ -572,18 +1143,19 @@ async fn main() -> Result<(), BoxError> {
     )
     .await?;
     reconcile_feedback(&records, &feedback_store).await;
-    let capacity = CapacityManager::new(cooldown_policy);
+    let capacity = CapacityManager::with_picker(cooldown_policy, deployment_picker);
     for tier in &route.tiers {
         capacity.register(&tier.effective_deployments());
     }
     let state = AppState {
         catalog,
-        route: Arc::new(route),
+        route,
         client: reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
             .build()?,
         records,
+        record_repository,
         feedback: feedback_store,
         metrics: GatewayMetrics::default(),
         request_timeout: Duration::from_millis(args.request_timeout_ms),
@@ -596,24 +1168,601 @@ async fn main() -> Result<(), BoxError> {
         shared_circuits,
         max_fallback_depth: args.max_fallback_depth,
         bindings,
+        idempotency,
+        idempotency_ttl_seconds: args.idempotency_ttl_seconds,
+        quota,
+        quota_default_max_output_tokens: args.quota_default_max_output_tokens,
+        budget,
         shared_state,
         require_tenant_header: args.require_tenant_header,
         management_auth,
+        accepting: Arc::new(AtomicBool::new(true)),
+        control: loaded_control.plane,
+        control_source: loaded_control.source,
+        artifact,
+        exploration: ExplorationPolicy {
+            epsilon_millionths: args.exploration_epsilon_millionths,
+            maximum_budget_nano_usd: args.exploration_max_budget_nano_usd,
+        },
+        cache_affinity: CacheAffinityStore::new(args.task_binding_capacity),
     };
     spawn_retention_sweeper(state.records.clone());
-    let app = app_router(state);
+    spawn_control_reloader(&args, &state, loaded_control.signing_key);
+    let app = app_router(state.clone());
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     println!("urouter-gateway listening on http://{}", args.bind);
-    axum::serve(listener, app).await?;
+    serve_with_drain(
+        listener,
+        app,
+        Arc::clone(&state.accepting),
+        args.shutdown_grace_seconds,
+    )
+    .await?;
     Ok(())
+}
+
+fn load_control(args: &Args) -> Result<LoadedControl, BoxError> {
+    let signing_key = control_signing_key(args)?;
+    let initial = if let Some(manifest) = &args.control_manifest {
+        ControlSnapshot::load(&args.catalog, &args.route, manifest, signing_key.as_deref())?
+    } else {
+        let catalog = Arc::new(CatalogSnapshot::from_json_str(&fs::read_to_string(
+            &args.catalog,
+        )?)?);
+        let route: RouteConfig = serde_json::from_str(&fs::read_to_string(&args.route)?)?;
+        route.validate(&catalog)?;
+        ControlSnapshot::from_validated(catalog, Arc::new(route))
+    };
+    let source = args
+        .control_manifest
+        .as_ref()
+        .map(|manifest| ControlSource {
+            catalog: args.catalog.clone(),
+            route: args.route.clone(),
+            manifest: manifest.clone(),
+            signing_key: signing_key.clone(),
+        });
+    Ok(LoadedControl {
+        catalog: Arc::clone(&initial.catalog),
+        route: Arc::clone(&initial.route),
+        plane: ControlPlane::new(
+            initial,
+            configured_control_failure_policy(args)?,
+            args.control_required_revision.clone(),
+        ),
+        source,
+        signing_key,
+    })
+}
+
+fn load_artifact_runtime(
+    args: &Args,
+    catalog: &CatalogSnapshot,
+    route: &RouteConfig,
+) -> Result<Option<ArtifactRuntime>, BoxError> {
+    if args.artifact_active.is_none() && args.artifact_candidate.is_none() {
+        return Ok(None);
+    }
+    let key_env = args
+        .artifact_signing_key_env
+        .as_deref()
+        .ok_or("artifact files require --artifact-signing-key-env")?;
+    let signing_key =
+        env::var(key_env).map_err(|_| "artifact signing key environment variable is not set")?;
+    if signing_key.is_empty() {
+        return Err("artifact signing key must not be empty".into());
+    }
+    let catalog_revision = catalog.hashes().content.to_string();
+    let route_revision = route.revision();
+    let load = |path: &FsPath| -> Result<RouterArtifact, BoxError> {
+        let artifact: RouterArtifact = serde_json::from_str(&fs::read_to_string(path)?)?;
+        artifact.verify(
+            FEATURE_SCHEMA_VERSION,
+            &catalog_revision,
+            &route_revision,
+            Some(signing_key.as_bytes()),
+        )?;
+        for tier in [&artifact.model.baseline_tier, &artifact.model.promoted_tier] {
+            if !route.tiers.iter().any(|candidate| &candidate.tier == tier) {
+                return Err(format!("artifact references unknown tier: {tier}").into());
+            }
+        }
+        Ok(artifact)
+    };
+    let active = args.artifact_active.as_deref().map(load).transpose()?;
+    let controller = ArtifactController::new(
+        active,
+        RolloutPolicy {
+            shadow: args.artifact_shadow,
+            canary_basis_points: args.artifact_canary_basis_points,
+            minimum_samples: args.artifact_minimum_samples,
+            operation_limit: args.artifact_operation_limit,
+        },
+    );
+    if let Some(candidate) = args.artifact_candidate.as_deref().map(load).transpose()? {
+        controller.load_candidate(candidate);
+    }
+    if args.artifact_kill_switch {
+        controller.set_kill_switch(true, "startup configuration");
+    }
+    Ok(Some(ArtifactRuntime {
+        controller,
+        catalog_revision,
+        route_revision,
+    }))
+}
+
+async fn serve_with_drain(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    accepting: Arc<AtomicBool>,
+    grace_seconds: u64,
+) -> Result<(), std::io::Error> {
+    serve_with_shutdown(listener, app, accepting, grace_seconds, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
+}
+
+async fn serve_with_shutdown<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    accepting: Arc<AtomicBool>,
+    grace_seconds: u64,
+    shutdown: F,
+) -> Result<(), std::io::Error>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (drain_tx, _) = broadcast::channel::<()>(1);
+    let mut graceful_rx = drain_tx.subscribe();
+    let mut deadline_rx = drain_tx.subscribe();
+    tokio::spawn(async move {
+        shutdown.await;
+        accepting.store(false, Ordering::SeqCst);
+        let _ = drain_tx.send(());
+    });
+
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = graceful_rx.recv().await;
+        })
+        .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        () = async move {
+            let _ = deadline_rx.recv().await;
+            sleep(Duration::from_secs(grace_seconds)).await;
+        } => Ok(()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DryRunStatus {
+    Pass,
+    Fail,
+    Warning,
+    NotApplicable,
+    Blocked,
+}
+
+#[derive(Debug, Serialize)]
+struct DryRunCheck {
+    number: u8,
+    id: &'static str,
+    status: DryRunStatus,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DryRunError {
+    code: &'static str,
+    path: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DryRunReport {
+    schema_version: u16,
+    valid: bool,
+    catalog: Option<Value>,
+    route: Option<Value>,
+    checks: Vec<DryRunCheck>,
+    errors: Vec<DryRunError>,
+}
+
+const DRY_RUN_CHECK_IDS: [&str; 16] = [
+    "cascade_cost_class_order",
+    "filter_cost_class_order",
+    "artifact_feature_schema",
+    "artifact_tier_subset",
+    "target_catalog_and_cost",
+    "referenced_provider_auth",
+    "exploration_requires_recording",
+    "tier_targets_and_fallbacks",
+    "budget_soft_below_hard",
+    "multi_instance_state_policy",
+    "tool_route_model_decider",
+    "tier_capability_equivalence",
+    "catalog_manifest",
+    "custom_provider_compat",
+    "endpoint_placeholders",
+    "cost_override_reason",
+];
+
+fn check(
+    number: u8,
+    id: &'static str,
+    status: DryRunStatus,
+    message: impl Into<String>,
+) -> DryRunCheck {
+    DryRunCheck {
+        number,
+        id,
+        status,
+        message: message.into(),
+    }
+}
+
+fn blocked_checks(message: &str) -> Vec<DryRunCheck> {
+    (1_u8..)
+        .zip(DRY_RUN_CHECK_IDS.iter())
+        .map(|(number, id)| check(number, id, DryRunStatus::Blocked, message))
+        .collect()
+}
+
+fn configuration_dry_run(args: &Args) -> DryRunReport {
+    if let Err(error) = validate_args(args) {
+        return failed_dry_run(
+            "invalid_arguments",
+            "arguments",
+            error.to_string(),
+            "configuration arguments are invalid",
+        );
+    }
+    let catalog_source = match fs::read(&args.catalog) {
+        Ok(source) => source,
+        Err(error) => {
+            return failed_dry_run(
+                "catalog_read_failed",
+                args.catalog.display().to_string(),
+                error.to_string(),
+                "catalog could not be loaded",
+            );
+        }
+    };
+    let catalog_text = match std::str::from_utf8(&catalog_source) {
+        Ok(text) => text,
+        Err(error) => {
+            return failed_dry_run(
+                "catalog_encoding_invalid",
+                args.catalog.display().to_string(),
+                error.to_string(),
+                "catalog is not UTF-8",
+            );
+        }
+    };
+    let catalog = match CatalogSnapshot::from_json_str(catalog_text) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            return failed_dry_run(
+                "catalog_invalid",
+                args.catalog.display().to_string(),
+                error.to_string(),
+                "catalog parsing or validation failed",
+            );
+        }
+    };
+    let route_source = match fs::read_to_string(&args.route) {
+        Ok(source) => source,
+        Err(error) => {
+            return failed_dry_run(
+                "route_read_failed",
+                args.route.display().to_string(),
+                error.to_string(),
+                "route configuration could not be loaded",
+            );
+        }
+    };
+    let route: RouteConfig = match serde_json::from_str(&route_source) {
+        Ok(route) => route,
+        Err(error) => {
+            return failed_dry_run(
+                "route_parse_failed",
+                args.route.display().to_string(),
+                error.to_string(),
+                "route configuration is invalid JSON",
+            );
+        }
+    };
+    dry_run_report(args, &catalog_source, &catalog, &route)
+}
+
+fn failed_dry_run(
+    code: &'static str,
+    path: impl Into<String>,
+    message: String,
+    blocked_message: &str,
+) -> DryRunReport {
+    DryRunReport {
+        schema_version: 1,
+        valid: false,
+        catalog: None,
+        route: None,
+        checks: blocked_checks(blocked_message),
+        errors: vec![DryRunError {
+            code,
+            path: path.into(),
+            message,
+        }],
+    }
+}
+
+fn dry_run_report(
+    args: &Args,
+    catalog_source: &[u8],
+    catalog: &CatalogSnapshot,
+    route: &RouteConfig,
+) -> DryRunReport {
+    let deployment_count = route
+        .tiers
+        .iter()
+        .map(|tier| tier.effective_deployments().len())
+        .sum::<usize>();
+    let route_validation = route.validate(catalog);
+    let route_status = if route_validation.is_ok() {
+        DryRunStatus::Pass
+    } else {
+        DryRunStatus::Fail
+    };
+    let route_message = route_validation
+        .as_ref()
+        .map_or_else(std::string::ToString::to_string, |()| {
+            "route validation passed".to_owned()
+        });
+    let (auth_status, auth_message) = referenced_auth_check(catalog, route);
+    let (manifest_status, manifest_message) = catalog_manifest_check(args, catalog_source, catalog);
+    let mut checks = schema_dry_run_checks(args, catalog, route);
+    checks.extend(route_dry_run_checks(
+        args,
+        route_status,
+        &route_message,
+        auth_status,
+        auth_message,
+    ));
+    checks.extend(catalog_dry_run_checks(manifest_status, manifest_message));
+    let valid = checks.iter().all(|item| item.status != DryRunStatus::Fail);
+    DryRunReport {
+        schema_version: 1,
+        valid,
+        catalog: Some(json!({
+            "schema_version": catalog.schema_version(),
+            "content_revision": catalog.hashes().content,
+            "models": catalog.models().count()
+        })),
+        route: Some(json!({
+            "id": route.id,
+            "revision": route.revision(),
+            "tiers": route.tiers.len(),
+            "deployments": deployment_count
+        })),
+        checks,
+        errors: Vec::new(),
+    }
+}
+
+fn referenced_auth_check(catalog: &CatalogSnapshot, route: &RouteConfig) -> (DryRunStatus, String) {
+    let missing_auth = route
+        .tiers
+        .iter()
+        .flat_map(TierConfig::effective_deployments)
+        .filter_map(|deployment| catalog.model(&deployment.model))
+        .filter_map(|model| catalog.provider(&model.provider))
+        .filter_map(|provider| match &provider.auth {
+            urouter_ai::auth::AuthSpec::ApiKeyEnv { env, .. }
+                if std::env::var_os(env).is_none() =>
+            {
+                Some(env.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if missing_auth.is_empty() {
+        (
+            DryRunStatus::Pass,
+            "all referenced provider credentials are resolvable or explicitly disabled".to_owned(),
+        )
+    } else {
+        (
+            DryRunStatus::Fail,
+            format!(
+                "missing credential environment variables: {}",
+                missing_auth.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        )
+    }
+}
+
+fn catalog_manifest_check(
+    args: &Args,
+    catalog_source: &[u8],
+    catalog: &CatalogSnapshot,
+) -> (DryRunStatus, String) {
+    let manifest_path = args.catalog.with_file_name("manifest.json");
+    match fs::read_to_string(&manifest_path)
+        .map_err(|error| error.to_string())
+        .and_then(|source| {
+            serde_json::from_str::<CatalogManifest>(&source).map_err(|error| error.to_string())
+        }) {
+        Ok(manifest) if manifest.matches(catalog_source, catalog) => (
+            DryRunStatus::Pass,
+            format!("manifest matches {}", args.catalog.display()),
+        ),
+        Ok(_) => (
+            DryRunStatus::Fail,
+            "manifest hashes do not match the catalog".to_owned(),
+        ),
+        Err(error) => (
+            DryRunStatus::Fail,
+            format!(
+                "manifest {} is unavailable or invalid: {error}",
+                manifest_path.display()
+            ),
+        ),
+    }
+}
+
+fn schema_dry_run_checks(
+    args: &Args,
+    catalog: &CatalogSnapshot,
+    route: &RouteConfig,
+) -> Vec<DryRunCheck> {
+    let artifact_configured = args.artifact_active.is_some() || args.artifact_candidate.is_some();
+    let (artifact_status, artifact_message) = if artifact_configured {
+        match load_artifact_runtime(args, catalog, route) {
+            Ok(Some(_)) => (
+                DryRunStatus::Pass,
+                "artifact schema, signature, revisions, gates, and tiers passed".to_owned(),
+            ),
+            Ok(None) => (
+                DryRunStatus::Fail,
+                "artifact configuration did not produce a runtime".to_owned(),
+            ),
+            Err(error) => (DryRunStatus::Fail, error.to_string()),
+        }
+    } else {
+        (
+            DryRunStatus::NotApplicable,
+            "no router artifact is configured".to_owned(),
+        )
+    };
+    vec![
+        check(
+            1,
+            DRY_RUN_CHECK_IDS[0],
+            DryRunStatus::NotApplicable,
+            "cascade CostClass is not represented by the current route schema",
+        ),
+        check(
+            2,
+            DRY_RUN_CHECK_IDS[1],
+            DryRunStatus::NotApplicable,
+            "filter CostClass is not represented by the current route schema",
+        ),
+        check(
+            3,
+            DRY_RUN_CHECK_IDS[2],
+            artifact_status,
+            artifact_message.clone(),
+        ),
+        check(4, DRY_RUN_CHECK_IDS[3], artifact_status, artifact_message),
+    ]
+}
+
+fn route_dry_run_checks(
+    args: &Args,
+    route_status: DryRunStatus,
+    route_message: &str,
+    auth_status: DryRunStatus,
+    auth_message: String,
+) -> Vec<DryRunCheck> {
+    vec![
+        check(5, DRY_RUN_CHECK_IDS[4], route_status, route_message),
+        check(6, DRY_RUN_CHECK_IDS[5], auth_status, auth_message),
+        check(
+            7,
+            DRY_RUN_CHECK_IDS[6],
+            if args.exploration_epsilon_millionths == 0 {
+                DryRunStatus::NotApplicable
+            } else {
+                DryRunStatus::Pass
+            },
+            if args.exploration_epsilon_millionths == 0 {
+                "controlled exploration is disabled"
+            } else {
+                "controlled exploration requires per-request recording, training consent, explicit authorization, and a bounded budget"
+            },
+        ),
+        check(8, DRY_RUN_CHECK_IDS[7], route_status, route_message),
+        check(
+            9,
+            DRY_RUN_CHECK_IDS[8],
+            DryRunStatus::NotApplicable,
+            "budget limits are not represented by the current route schema",
+        ),
+        check(
+            10,
+            DRY_RUN_CHECK_IDS[9],
+            if args.redis_url.is_some() {
+                DryRunStatus::Fail
+            } else {
+                DryRunStatus::NotApplicable
+            },
+            if args.redis_url.is_some() {
+                "Redis enables multi-instance state, but on_state_unavailable is not represented by the current configuration"
+            } else {
+                "single-instance configuration"
+            },
+        ),
+        check(
+            11,
+            DRY_RUN_CHECK_IDS[10],
+            DryRunStatus::Warning,
+            "tool-call expectation and model decider are not represented by the current route schema",
+        ),
+        check(12, DRY_RUN_CHECK_IDS[11], route_status, route_message),
+    ]
+}
+
+fn catalog_dry_run_checks(
+    manifest_status: DryRunStatus,
+    manifest_message: String,
+) -> Vec<DryRunCheck> {
+    vec![
+        check(13, DRY_RUN_CHECK_IDS[12], manifest_status, manifest_message),
+        check(
+            14,
+            DRY_RUN_CHECK_IDS[13],
+            DryRunStatus::Pass,
+            "catalog validation requires explicit compatibility for custom providers",
+        ),
+        check(
+            15,
+            DRY_RUN_CHECK_IDS[14],
+            DryRunStatus::Pass,
+            "catalog validation resolved every endpoint placeholder from provider env",
+        ),
+        check(
+            16,
+            DRY_RUN_CHECK_IDS[15],
+            DryRunStatus::NotApplicable,
+            "route deployments do not support cost overrides",
+        ),
+    ]
 }
 
 fn app_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/health/live", get(health))
+        .route("/health/ready", get(readiness))
+        .route("/openapi.json", get(openapi))
         .route("/v1/models", get(models))
+        .route("/v1/catalog", get(catalog_status))
+        .route("/v1/catalog/refresh", post(refresh_catalog))
+        .route("/v1/catalog/rollback", post(rollback_catalog))
         .route("/v1/explain", post(explain))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(openai_responses))
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/artifacts", get(artifact_status))
+        .route("/v1/artifacts/promote", post(promote_artifact))
+        .route("/v1/artifacts/rollback", post(rollback_artifact))
+        .route("/v1/artifacts/kill", post(kill_artifact))
+        .route("/v1/artifacts/rollout", post(update_artifact_rollout))
+        .route("/v1/artifacts/observe", post(observe_artifact))
         .route(
             "/v1/adapters/{harness}/chat/completions",
             post(adapter_chat_completions),
@@ -650,10 +1799,12 @@ fn validate_args(args: &Args) -> Result<(), BoxError> {
     if args.record_capacity == 0
         || args.record_queue_capacity == 0
         || args.task_binding_capacity == 0
+        || args.idempotency_capacity == 0
         || args.management_audit_queue_capacity == 0
     {
         return Err(
-            "record, queue, task binding, and audit capacities must be greater than zero".into(),
+            "record, queue, task binding, idempotency, and audit capacities must be greater than zero"
+                .into(),
         );
     }
     if args.cooldown_failure_threshold_millis > 1_000 {
@@ -662,15 +1813,118 @@ fn validate_args(args: &Args) -> Result<(), BoxError> {
     if args.task_binding_ttl_seconds == 0 {
         return Err("task binding TTL must be greater than zero".into());
     }
+    if args.idempotency_ttl_seconds == 0 {
+        return Err("idempotency TTL must be greater than zero".into());
+    }
+    if args.quota_lease_ttl_seconds == 0 {
+        return Err("quota lease TTL must be greater than zero".into());
+    }
+    if args.quota_default_max_output_tokens == 0 {
+        return Err("quota default max output tokens must be greater than zero".into());
+    }
+    if args.budget_period_seconds == 0 {
+        return Err("budget period must be greater than zero".into());
+    }
     if args.management_keyring_reload_seconds == 0 {
         return Err("management keyring reload interval must be greater than zero".into());
     }
+    if args.shutdown_grace_seconds == 0 {
+        return Err("shutdown grace period must be greater than zero".into());
+    }
+    if args.control_manifest.is_some() && args.control_reload_seconds == 0 {
+        return Err("control reload interval must be greater than zero".into());
+    }
+    if args.control_manifest.is_none() && args.control_signing_key_env.is_some() {
+        return Err("control signing key requires --control-manifest".into());
+    }
+    if args.artifact_canary_basis_points > 10_000 {
+        return Err("artifact canary basis points must be <= 10000".into());
+    }
+    if args.artifact_operation_limit < 6 {
+        return Err("artifact operation limit must be at least 6".into());
+    }
+    if args.exploration_epsilon_millionths > 1_000_000 {
+        return Err("exploration epsilon millionths must be <= 1000000".into());
+    }
+    if args.exploration_epsilon_millionths > 0 && args.exploration_max_budget_nano_usd == 0 {
+        return Err("enabled exploration requires a non-zero maximum budget".into());
+    }
+    if (args.artifact_active.is_some() || args.artifact_candidate.is_some())
+        && args.artifact_signing_key_env.is_none()
+    {
+        return Err("artifact files require --artifact-signing-key-env".into());
+    }
+    if args.artifact_active.is_none()
+        && args.artifact_candidate.is_none()
+        && args.artifact_signing_key_env.is_some()
+    {
+        return Err("artifact signing key requires an artifact file".into());
+    }
+    configured_control_failure_policy(args)?;
+    configured_picker(args)?;
     if args.redis_url.is_some() && (args.records.is_some() || args.feedback_records.is_some()) {
         return Err(
             "--records/--feedback-records cannot be combined with Redis authoritative state".into(),
         );
     }
     Ok(())
+}
+
+fn configured_control_failure_policy(args: &Args) -> Result<ControlFailurePolicy, BoxError> {
+    match args.control_failure_policy.as_str() {
+        "last_good" => Ok(ControlFailurePolicy::LastGood),
+        "fail_closed" => Ok(ControlFailurePolicy::FailClosed),
+        _ => Err("control failure policy must be last_good or fail_closed".into()),
+    }
+}
+
+fn control_signing_key(args: &Args) -> Result<Option<Vec<u8>>, BoxError> {
+    args.control_signing_key_env
+        .as_ref()
+        .map(|variable| {
+            let value = env::var(variable)
+                .map_err(|_| "control signing key environment variable is not set")?;
+            if value.is_empty() {
+                return Err("control signing key must not be empty".into());
+            }
+            Ok(value.into_bytes())
+        })
+        .transpose()
+}
+
+fn spawn_control_reloader(args: &Args, state: &AppState, signing_key: Option<Vec<u8>>) {
+    let Some(manifest_path) = args.control_manifest.clone() else {
+        return;
+    };
+    let catalog_path = args.catalog.clone();
+    let route_path = args.route.clone();
+    let interval = Duration::from_secs(args.control_reload_seconds);
+    let control = state.control.clone();
+    let capacity = Arc::clone(&state.capacity);
+    tokio::spawn(async move {
+        loop {
+            sleep(interval).await;
+            match ControlSnapshot::load(
+                &catalog_path,
+                &route_path,
+                &manifest_path,
+                signing_key.as_deref(),
+            ) {
+                Ok(candidate) => {
+                    for tier in &candidate.route.tiers {
+                        capacity.register(&tier.effective_deployments());
+                    }
+                    control.publish(candidate);
+                }
+                Err(error) => control.reject(error),
+            }
+        }
+    });
+}
+
+fn configured_picker(args: &Args) -> Result<DeploymentPicker, BoxError> {
+    serde_json::from_value(Value::String(args.deployment_picker.clone()))
+        .map_err(|_| "deployment picker must be weighted, least_loaded, lowest_latency, or lowest_quota_usage".into())
 }
 
 async fn build_binding_repository(args: &Args) -> Result<Arc<dyn TaskBindingRepository>, BoxError> {
@@ -718,6 +1972,62 @@ async fn build_shared_state(args: &Args) -> Result<Option<RedisSharedState>, Box
     }
 }
 
+fn build_idempotency_repository(
+    args: &Args,
+    shared_state: Option<&RedisSharedState>,
+) -> Arc<dyn IdempotencyRepository> {
+    match shared_state {
+        Some(state) => RedisIdempotencyRepository::new(state.clone()),
+        None => MemoryIdempotencyRepository::new(args.idempotency_capacity),
+    }
+}
+
+fn build_record_repository(
+    shared_state: Option<&RedisSharedState>,
+    local: RecordStore,
+    capacity: usize,
+) -> Arc<dyn DecisionRecordRepository> {
+    match shared_state {
+        Some(state) => RedisDecisionRecordRepository::new(state.clone(), local, capacity),
+        None => MemoryDecisionRecordRepository::new(local),
+    }
+}
+
+async fn build_quota_repository(args: &Args) -> Result<Arc<dyn QuotaRepository>, BoxError> {
+    if let Some(url) = &args.redis_url {
+        return Ok(RedisQuotaRepository::connect(
+            url,
+            args.redis_prefix.clone(),
+            args.tenant_max_in_flight,
+            args.tenant_requests_per_minute,
+            args.tenant_tokens_per_minute,
+            Duration::from_secs(args.quota_lease_ttl_seconds),
+        )
+        .await?);
+    }
+    Ok(MemoryQuotaRepository::new(
+        args.tenant_max_in_flight,
+        args.tenant_requests_per_minute,
+        args.tenant_tokens_per_minute,
+    ))
+}
+
+async fn build_budget_repository(args: &Args) -> Result<Arc<dyn BudgetRepository>, BoxError> {
+    if let Some(url) = &args.redis_url {
+        return Ok(RedisBudgetRepository::connect(
+            url,
+            args.redis_prefix.clone(),
+            args.tenant_budget_nano_usd,
+            args.budget_period_seconds,
+        )
+        .await?);
+    }
+    Ok(MemoryBudgetRepository::new(
+        args.tenant_budget_nano_usd,
+        args.budget_period_seconds,
+    ))
+}
+
 async fn reconcile_feedback(records: &RecordStore, feedback: &FeedbackStore) {
     let feedback = feedback.values.read().await;
     let mut records = records.records.write().await;
@@ -736,10 +2046,51 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 
+async fn readiness(State(state): State<AppState>) -> Response {
+    if !state.accepting.load(Ordering::Relaxed) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "draining"})),
+        )
+            .into_response();
+    }
+    let control = state.control.status();
+    if !control.ready {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "not_ready", "reason": "control_revision_unavailable", "control": control})),
+        )
+            .into_response();
+    }
+    if let Some(shared) = &state.shared_state
+        && shared.ping().await.is_err()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "not_ready", "reason": "state_backend_unavailable"})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({"status": "ready", "control": control})),
+    )
+        .into_response()
+}
+
+async fn openapi() -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        include_str!("../../../gateway/openapi.json"),
+    )
+        .into_response()
+}
+
 async fn tiers(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, GatewayError> {
+    let state = state.with_active_control();
     let tenant_key = resolve_tenant_key(&state, &headers)?;
     authorize_management(
         &state,
@@ -810,6 +2161,7 @@ async fn task_binding(
             status: StatusCode::NOT_FOUND,
             code: "task_binding_not_found",
             message: "task binding was not found".to_owned(),
+            request_id: None,
             decision_id: None,
         })
 }
@@ -871,6 +2223,7 @@ async fn session_binding(
             status: StatusCode::NOT_FOUND,
             code: "session_binding_not_found",
             message: "session binding was not found".to_owned(),
+            request_id: None,
             decision_id: None,
         })
 }
@@ -909,19 +2262,10 @@ async fn metrics(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
-    let tenant_key = resolve_tenant_key(&state, &headers)?;
-    authorize_management(
-        &state,
-        &headers,
-        &tenant_key,
-        ManagementRole::Admin,
-        "metrics.read",
-        None,
-    )
-    .await?;
+    authorize_metrics(&state, &headers).await?;
     let metric = &state.metrics;
     let resident_memory_bytes = process_resident_memory_bytes().await.unwrap_or(0);
-    let body = format!(
+    let mut body = format!(
         concat!(
             "# TYPE urouter_requests_total counter\n",
             "urouter_requests_total {}\n",
@@ -939,6 +2283,8 @@ async fn metrics(
             "urouter_paired_rejected_total {}\n",
             "# TYPE urouter_streams_completed_total counter\n",
             "urouter_streams_completed_total {}\n",
+            "# TYPE urouter_stream_failures_total counter\n",
+            "urouter_stream_failures_total {}\n",
             "# TYPE urouter_fallback_total counter\n",
             "urouter_fallback_total {}\n",
             "# TYPE urouter_task_binding_created_total counter\n",
@@ -951,6 +2297,11 @@ async fn metrics(
             "urouter_compatibility_request_total {}\n",
             "# TYPE urouter_task_binding_conflict_total counter\n",
             "urouter_task_binding_conflict_total {}\n",
+            "# TYPE urouter_quota_rejection_total counter\n",
+            "urouter_quota_rejection_total {}\n",
+            "# TYPE urouter_budget_rejection_total counter\n",
+            "urouter_budget_rejection_total {}\n",
+            "# TYPE urouter_deployment_filter_rejection_total counter\n",
             "# TYPE urouter_record_dropped_total counter\n",
             "urouter_record_dropped_total {}\n",
             "# TYPE urouter_record_write_errors_total counter\n",
@@ -970,24 +2321,81 @@ async fn metrics(
         metric.paired.load(Ordering::Relaxed),
         metric.paired_rejected.load(Ordering::Relaxed),
         metric.streams_completed.load(Ordering::Relaxed),
+        metric.stream_failures.load(Ordering::Relaxed),
         metric.fallbacks.load(Ordering::Relaxed),
         metric.bindings_created.load(Ordering::Relaxed),
         metric.bindings_applied.load(Ordering::Relaxed),
         metric.binding_migrations.load(Ordering::Relaxed),
         metric.compatibility_requests.load(Ordering::Relaxed),
         metric.binding_conflicts.load(Ordering::Relaxed),
+        metric.quota_rejections.load(Ordering::Relaxed),
+        metric.budget_rejections.load(Ordering::Relaxed),
         state.records.dropped.load(Ordering::Relaxed),
         state.records.write_errors.load(Ordering::Relaxed),
         state.feedback.dropped.load(Ordering::Relaxed),
         state.feedback.write_errors.load(Ordering::Relaxed),
         resident_memory_bytes,
     );
+    for (reason, count) in metric
+        .filter_rejections
+        .lock()
+        .expect("filter metric lock poisoned")
+        .iter()
+    {
+        let _ = writeln!(
+            body,
+            "urouter_deployment_filter_rejection_total{{reason=\"{reason}\"}} {count}"
+        );
+    }
+    render_histogram_metrics(metric, &mut body);
+    body.push_str("# EOF\n");
     let mut response = body.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; version=0.0.4"),
+        HeaderValue::from_static("application/openmetrics-text; version=1.0.0; charset=utf-8"),
     );
     Ok(response)
+}
+
+fn render_histogram_metrics(metric: &GatewayMetrics, body: &mut String) {
+    metric.request_duration_ms.render(
+        body,
+        "urouter_request_duration_milliseconds",
+        "End-to-end Gateway request duration in milliseconds",
+    );
+    metric.upstream_duration_ms.render(
+        body,
+        "urouter_upstream_duration_milliseconds",
+        "Upstream execution duration in milliseconds",
+    );
+    metric.ttft_ms.render(
+        body,
+        "urouter_time_to_first_token_milliseconds",
+        "Streaming time to first upstream data chunk in milliseconds",
+    );
+    metric.cost_nano_usd.render(
+        body,
+        "urouter_request_cost_nano_usd",
+        "Settled request cost in integer nano-USD",
+    );
+    metric.fallback_depth.render(
+        body,
+        "urouter_fallback_depth",
+        "Fallback depth reached by a routed request",
+    );
+}
+
+async fn authorize_metrics(state: &AppState, headers: &HeaderMap) -> Result<(), GatewayError> {
+    let tenant_key = resolve_tenant_key(state, headers)?;
+    authorize_management(
+        state,
+        headers,
+        &tenant_key,
+        ManagementRole::Admin,
+        "metrics.read",
+        None,
+    )
+    .await
 }
 
 async fn process_resident_memory_bytes() -> Option<u64> {
@@ -1001,6 +2409,8 @@ async fn process_resident_memory_bytes() -> Option<u64> {
 }
 
 async fn models(State(state): State<AppState>) -> Result<Json<Value>, GatewayError> {
+    let state = state.with_active_control();
+    let control_status = state.control.status();
     let capabilities = state
         .route
         .capabilities(&state.catalog)
@@ -1021,6 +2431,7 @@ async fn models(State(state): State<AppState>) -> Result<Json<Value>, GatewayErr
         "owned_by": "urouter",
         "urouter": {
             "kind": "auto",
+            "control_revision": control_status.revision,
             "contract_version": 2,
             "contract_versions": [1, 2],
             "tiers": tiers,
@@ -1032,6 +2443,15 @@ async fn models(State(state): State<AppState>) -> Result<Json<Value>, GatewayErr
                 "supported": true,
                 "backend": state.bindings.backend_name(),
                 "circuit_backend": state.shared_circuits.backend_name(),
+                "idempotency_backend": state.idempotency.backend_name(),
+                "record_backend": state.record_repository.backend_name(),
+                "quota_backend": state.quota.backend_name(),
+                "tenant_max_in_flight": state.quota.max_in_flight(),
+                "tenant_requests_per_minute": state.quota.requests_per_minute(),
+                "tenant_tokens_per_minute": state.quota.tokens_per_minute(),
+                "budget_backend": state.budget.backend_name(),
+                "tenant_budget_nano_usd": state.budget.limit_nano_usd(),
+                "deployment_picker": state.capacity.picker(),
                 "record_feedback_backend": if state.shared_state.is_some() { "redis" } else { "local" },
                 "call_roles": ["primary", "auxiliary"],
                 "migration_boundaries": [
@@ -1064,23 +2484,152 @@ async fn models(State(state): State<AppState>) -> Result<Json<Value>, GatewayErr
     Ok(Json(json!({"object": "list", "data": data})))
 }
 
+async fn catalog_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, Json<Value>), GatewayError> {
+    let tenant_key = resolve_tenant_key(&state, &headers)?;
+    authorize_management(
+        &state,
+        &headers,
+        &tenant_key,
+        ManagementRole::Reader,
+        "catalog.read",
+        None,
+    )
+    .await?;
+    let snapshot = state.control.snapshot();
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{}\"", snapshot.revision))
+            .map_err(|_| GatewayError::internal("control revision is not a valid ETag"))?,
+    );
+    Ok((
+        response_headers,
+        Json(json!({
+            "schema_version": 1,
+            "control": state.control.status(),
+            "catalog_hash": snapshot.catalog.hashes().content,
+            "route_revision": snapshot.route.revision(),
+            "providers": snapshot.catalog.providers().count(),
+            "models": snapshot.catalog.models().count(),
+            "hot_reload": state.control_source.is_some()
+        })),
+    ))
+}
+
+async fn refresh_catalog(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, GatewayError> {
+    let tenant_key = resolve_tenant_key(&state, &headers)?;
+    authorize_management(
+        &state,
+        &headers,
+        &tenant_key,
+        ManagementRole::Admin,
+        "catalog.refresh",
+        None,
+    )
+    .await?;
+    let source = state.control_source.as_ref().ok_or_else(|| GatewayError {
+        status: StatusCode::CONFLICT,
+        code: "control_reload_not_configured",
+        message: "Gateway was not started with --control-manifest".to_owned(),
+        request_id: None,
+        decision_id: None,
+    })?;
+    let candidate = ControlSnapshot::load(
+        &source.catalog,
+        &source.route,
+        &source.manifest,
+        source.signing_key.as_deref(),
+    )
+    .map_err(|error| {
+        state.control.reject(&error);
+        GatewayError {
+            status: StatusCode::CONFLICT,
+            code: "control_candidate_rejected",
+            message: error.to_string(),
+            request_id: None,
+            decision_id: None,
+        }
+    })?;
+    for tier in &candidate.route.tiers {
+        state.capacity.register(&tier.effective_deployments());
+    }
+    let changed = state.control.publish(candidate);
+    Ok(Json(
+        json!({"changed": changed, "control": state.control.status()}),
+    ))
+}
+
+async fn rollback_catalog(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, GatewayError> {
+    let tenant_key = resolve_tenant_key(&state, &headers)?;
+    authorize_management(
+        &state,
+        &headers,
+        &tenant_key,
+        ManagementRole::Admin,
+        "catalog.rollback",
+        None,
+    )
+    .await?;
+    if !state.control.rollback() {
+        return Err(GatewayError {
+            status: StatusCode::CONFLICT,
+            code: "control_rollback_unavailable",
+            message: "no previous control revision is available".to_owned(),
+            request_id: None,
+            decision_id: None,
+        });
+    }
+    Ok(Json(
+        json!({"rolled_back": true, "control": state.control.status()}),
+    ))
+}
+
 async fn explain(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<Value>,
 ) -> Result<Json<Value>, GatewayError> {
+    let state = state.with_active_control();
     let (tenant_key, tenant_compatibility) = resolve_tenant(&state, &headers)?;
+    let feature_frame = FeatureFrame::from_openai_chat(&request);
     let mut decision = state.route.decide(&state.catalog, &request)?;
+    let task_key = artifact_task_key(&decision, "explain");
+    let artifact = apply_artifact_policy(&state, &request, &tenant_key, &task_key, &mut decision)?;
     decision.compatibility_mode |= tenant_compatibility;
     validate_decision_scope(&decision)?;
     let governance = request_governance(&state, tenant_key, &decision).await?;
     apply_task_binding_inner(&state, &governance, &mut decision, false).await?;
     let retained = governance.policy.recording != RecordingMode::None;
+    let routing_trace = RoutingTrace::current_admission_summary(
+        decision.model.to_string(),
+        decision.alternatives.iter().map(ToString::to_string),
+        decision
+            .admission
+            .excluded
+            .iter()
+            .map(|excluded| (excluded.model.to_string(), excluded.reasons.clone())),
+        decision.reason.clone(),
+    )
+    .with_decisions(decision.cascade_trace.clone());
     Ok(Json(json!({
+        "schema_version": 1,
+        "feature_frame": feature_frame,
+        "routing_trace": routing_trace,
         "route_id": decision.route_id,
         "tier": decision.tier,
         "model": decision.model,
         "reason": decision.reason,
+        "artifact": artifact,
+        "semantic": decision.semantic,
         "alternatives": decision.alternatives,
         "requirement": decision.requirement,
         "admission": decision.admission,
@@ -1093,6 +2642,356 @@ async fn explain(
             "remote_judge_eligible": retained && governance.policy.allow_remote_judge && !governance.compatibility_mode
         }
     })))
+}
+
+async fn artifact_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, GatewayError> {
+    let tenant_key = resolve_tenant_key(&state, &headers)?;
+    authorize_management(
+        &state,
+        &headers,
+        &tenant_key,
+        ManagementRole::Reader,
+        "artifacts.status",
+        None,
+    )
+    .await?;
+    let runtime = state.artifact.as_ref().ok_or_else(|| GatewayError {
+        status: StatusCode::NOT_FOUND,
+        code: "artifact_runtime_not_configured",
+        message: "gateway was not started with an artifact".to_owned(),
+        request_id: None,
+        decision_id: None,
+    })?;
+    let current_catalog = state
+        .control
+        .snapshot()
+        .catalog
+        .hashes()
+        .content
+        .to_string();
+    let current_route = state.control.snapshot().route.revision();
+    Ok(Json(json!({
+        "status": runtime.controller.status(),
+        "bound_revisions": {
+            "catalog": runtime.catalog_revision,
+            "route": runtime.route_revision
+        },
+        "stale": current_catalog != runtime.catalog_revision || current_route != runtime.route_revision,
+        "audit": runtime.controller.audit_events()
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactAction {
+    #[serde(default = "default_artifact_action_reason")]
+    reason: String,
+}
+
+fn default_artifact_action_reason() -> String {
+    "operator action".to_owned()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactKillAction {
+    killed: bool,
+    #[serde(default = "default_artifact_action_reason")]
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactRolloutAction {
+    rollout: RolloutPolicy,
+    #[serde(default = "default_artifact_action_reason")]
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactObservationAction {
+    observation: CanaryObservation,
+    thresholds: RollbackThresholds,
+}
+
+async fn promote_artifact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(action): Json<ArtifactAction>,
+) -> Result<Json<Value>, GatewayError> {
+    authorize_artifact_action(&state, &headers, "artifacts.promote").await?;
+    let runtime = configured_artifact(&state)?;
+    if !runtime.controller.promote(&action.reason) {
+        return Err(GatewayError {
+            status: StatusCode::CONFLICT,
+            code: "artifact_candidate_unavailable",
+            message: "no candidate artifact is available for promotion".to_owned(),
+            request_id: None,
+            decision_id: None,
+        });
+    }
+    Ok(Json(
+        json!({"promoted": true, "status": runtime.controller.status()}),
+    ))
+}
+
+async fn rollback_artifact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(action): Json<ArtifactAction>,
+) -> Result<Json<Value>, GatewayError> {
+    authorize_artifact_action(&state, &headers, "artifacts.rollback").await?;
+    let runtime = configured_artifact(&state)?;
+    if !runtime.controller.rollback(&action.reason) {
+        return Err(GatewayError {
+            status: StatusCode::CONFLICT,
+            code: "artifact_rollback_unavailable",
+            message: "no last-good artifact is available".to_owned(),
+            request_id: None,
+            decision_id: None,
+        });
+    }
+    Ok(Json(
+        json!({"rolled_back": true, "status": runtime.controller.status()}),
+    ))
+}
+
+async fn kill_artifact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(action): Json<ArtifactKillAction>,
+) -> Result<Json<Value>, GatewayError> {
+    authorize_artifact_action(&state, &headers, "artifacts.kill").await?;
+    let runtime = configured_artifact(&state)?;
+    runtime
+        .controller
+        .set_kill_switch(action.killed, &action.reason);
+    Ok(Json(
+        json!({"killed": action.killed, "status": runtime.controller.status()}),
+    ))
+}
+
+async fn update_artifact_rollout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(action): Json<ArtifactRolloutAction>,
+) -> Result<Json<Value>, GatewayError> {
+    authorize_artifact_action(&state, &headers, "artifacts.rollout").await?;
+    let runtime = configured_artifact(&state)?;
+    runtime
+        .controller
+        .update_rollout(action.rollout, &action.reason)
+        .map_err(|error| GatewayError::bad_request("invalid_artifact_rollout", error))?;
+    Ok(Json(
+        json!({"updated": true, "status": runtime.controller.status()}),
+    ))
+}
+
+async fn observe_artifact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(action): Json<ArtifactObservationAction>,
+) -> Result<Json<Value>, GatewayError> {
+    authorize_artifact_action(&state, &headers, "artifacts.observe").await?;
+    let runtime = configured_artifact(&state)?;
+    let rolled_back = runtime
+        .controller
+        .observe_and_maybe_rollback(action.observation, action.thresholds);
+    Ok(Json(json!({
+        "rolled_back": rolled_back,
+        "status": runtime.controller.status(),
+        "audit": runtime.controller.audit_events()
+    })))
+}
+
+fn configured_artifact(state: &AppState) -> Result<&ArtifactRuntime, GatewayError> {
+    state.artifact.as_ref().ok_or_else(|| GatewayError {
+        status: StatusCode::NOT_FOUND,
+        code: "artifact_runtime_not_configured",
+        message: "gateway was not started with an artifact".to_owned(),
+        request_id: None,
+        decision_id: None,
+    })
+}
+
+async fn authorize_artifact_action(
+    state: &AppState,
+    headers: &HeaderMap,
+    action: &str,
+) -> Result<(), GatewayError> {
+    let tenant_key = resolve_tenant_key(state, headers)?;
+    authorize_management(
+        state,
+        headers,
+        &tenant_key,
+        ManagementRole::Admin,
+        action,
+        None,
+    )
+    .await
+}
+
+fn artifact_task_key(decision: &RouteDecision, fallback: &str) -> String {
+    decision
+        .task_id
+        .as_deref()
+        .or(decision.conversation_id.as_deref())
+        .or(decision.trace_id.as_deref())
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
+fn semantic_task_name(decision: &RouteDecision) -> &'static str {
+    use urouter_gateway::SemanticTask;
+    match decision.semantic.task {
+        SemanticTask::Greeting => "greeting",
+        SemanticTask::RealtimeWeather => "realtime_weather",
+        SemanticTask::EquationSolving => "equation_solving",
+        SemanticTask::General => "general",
+    }
+}
+
+fn apply_artifact_policy(
+    state: &AppState,
+    request: &Value,
+    tenant_key: &str,
+    task_key: &str,
+    decision: &mut RouteDecision,
+) -> Result<Option<ArtifactDecision>, GatewayError> {
+    let Some(runtime) = &state.artifact else {
+        return Ok(None);
+    };
+    if decision.reason == "explicit_model" {
+        return Ok(None);
+    }
+    if runtime.catalog_revision != state.catalog.hashes().content.to_string()
+        || runtime.route_revision != state.route.revision()
+    {
+        return Ok(Some(ArtifactDecision {
+            applied_tier: decision.tier.clone(),
+            source: DecisionSource::Rule,
+            active_revision: runtime.controller.status().active_revision,
+            candidate_revision: runtime.controller.status().candidate_revision,
+            shadow_tier: None,
+            fallback_reason: Some("control_revision_changed".to_owned()),
+            canary_bucket: None,
+        }));
+    }
+    let artifact = runtime.controller.decide(
+        &FeatureFrame::from_openai_chat(request),
+        semantic_task_name(decision),
+        tenant_key,
+        task_key,
+        &decision.tier,
+    );
+    if artifact.source != DecisionSource::Rule && artifact.applied_tier != decision.tier {
+        *decision = route_pinned_tier(state, request, &artifact.applied_tier)?;
+        match artifact.source {
+            DecisionSource::ActiveArtifact => "artifact_active",
+            DecisionSource::CandidateCanary => "artifact_candidate_canary",
+            DecisionSource::Rule => "artifact_rule_fallback",
+        }
+        .clone_into(&mut decision.reason);
+    }
+    Ok(Some(artifact))
+}
+
+fn route_pinned_tier(
+    state: &AppState,
+    request: &Value,
+    tier: &str,
+) -> Result<RouteDecision, GatewayError> {
+    let mut pinned = request.clone();
+    let root = pinned.as_object_mut().ok_or_else(|| {
+        GatewayError::bad_request("invalid_request", "request must be a JSON object")
+    })?;
+    let urouter = root
+        .entry("urouter")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| GatewayError::bad_request("invalid_request", "urouter must be an object"))?;
+    let preference = urouter
+        .entry("preference")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            GatewayError::bad_request("invalid_request", "urouter.preference must be an object")
+        })?;
+    preference.insert("pin_tier".to_owned(), tier.into());
+    Ok(state.route.decide(&state.catalog, &pinned)?)
+}
+
+fn apply_controlled_exploration(
+    state: &AppState,
+    request: &Value,
+    tenant_key: &str,
+    task_key: &str,
+    compatibility_mode: bool,
+    decision: &mut RouteDecision,
+) -> Result<Option<ExplorationRecord>, GatewayError> {
+    let policy = state.exploration;
+    let Some(data_policy) = decision.data_policy.as_ref() else {
+        return Ok(None);
+    };
+    if policy.epsilon_millionths == 0
+        || compatibility_mode
+        || decision.reason == "explicit_model"
+        || data_policy.recording == RecordingMode::None
+        || !data_policy.allow_training
+        || !data_policy.allow_exploration
+        || data_policy.exploration_budget_nano_usd == 0
+        || data_policy.exploration_budget_nano_usd > policy.maximum_budget_nano_usd
+    {
+        return Ok(None);
+    }
+    let authorized_budget_nano_usd = data_policy.exploration_budget_nano_usd;
+    let baseline_tier = decision.tier.clone();
+    let mut eligible = Vec::new();
+    for tier in &state.route.tiers {
+        if route_pinned_tier(state, request, &tier.tier).is_ok() {
+            eligible.push(tier.tier.clone());
+        }
+    }
+    eligible.sort();
+    eligible.dedup();
+    if eligible.len() < 2 || !eligible.contains(&baseline_tier) {
+        return Ok(None);
+    }
+    let digest = Sha256::digest(format!("{tenant_key}\0{task_key}\0exploration-v1").as_bytes());
+    let draw = u32::from_be_bytes(digest[..4].try_into().expect("SHA-256 prefix")) % 1_000_000;
+    let selected_by_exploration = draw < policy.epsilon_millionths;
+    let selected_tier = if selected_by_exploration {
+        let bucket = u32::from_be_bytes(digest[4..8].try_into().expect("SHA-256 bucket"));
+        let index = usize::try_from(bucket).unwrap_or(usize::MAX) % eligible.len();
+        eligible[index].clone()
+    } else {
+        baseline_tier.clone()
+    };
+    let random_probability =
+        policy.epsilon_millionths / u32::try_from(eligible.len()).unwrap_or(u32::MAX);
+    let propensity_millionths = if selected_tier == baseline_tier {
+        1_000_000_u32
+            .saturating_sub(policy.epsilon_millionths)
+            .saturating_add(random_probability)
+    } else {
+        random_probability
+    }
+    .max(1);
+    if selected_tier != decision.tier {
+        *decision = route_pinned_tier(state, request, &selected_tier)?;
+        "controlled_exploration".clone_into(&mut decision.reason);
+    }
+    Ok(Some(ExplorationRecord {
+        epsilon_millionths: policy.epsilon_millionths,
+        propensity_millionths,
+        eligible_set: eligible,
+        selected_by_exploration,
+        authorized_budget_nano_usd,
+    }))
 }
 
 async fn decisions(
@@ -1163,6 +3062,7 @@ async fn decision_by_id(
             status: StatusCode::NOT_FOUND,
             code: "decision_not_found",
             message: format!("decision {id} was not found in retained records"),
+            request_id: None,
             decision_id: None,
         })
 }
@@ -1185,19 +3085,11 @@ async fn delete_decision(
     let turn = record_for_id(&state, &tenant_key, &id)
         .await?
         .and_then(|record| record.trace_turn);
-    let shared_deleted = if let Some(shared) = &state.shared_state {
-        shared
-            .delete_records(&tenant_key, std::slice::from_ref(&id))
-            .await
-            .map_err(state_backend_unavailable)?
-    } else {
-        0
-    };
-    let local_deleted = state
-        .records
-        .delete_matching(|record| record.tenant_key == tenant_key && record.decision_id == id)
-        .await?;
-    let deleted = shared_deleted.max(local_deleted);
+    let deleted = state
+        .record_repository
+        .delete(&tenant_key, RecordDelete::Decisions(vec![id.clone()]))
+        .await
+        .map_err(record_repository_error)?;
     if let Some(turn) = turn
         && !records_for_tenant(&state, &tenant_key)
             .await?
@@ -1255,23 +3147,18 @@ async fn delete_task_records(
         .scope_generation(&tenant_key, Some(&task_key))
         .await
         .map_err(state_backend_unavailable)?;
-    let shared_deleted = if let Some(shared) = &state.shared_state {
-        shared
-            .delete_records(&tenant_key, &decision_ids)
-            .await
-            .map_err(state_backend_unavailable)?
-    } else {
-        0
-    };
-    let local_deleted = state
-        .records
-        .delete_matching(|record| {
-            record.tenant_key == tenant_key
-                && record.task_key.as_ref() == Some(&task_key)
-                && record.task_generation < current_task_generation
-        })
-        .await?;
-    let deleted = shared_deleted.max(local_deleted);
+    let deleted = state
+        .record_repository
+        .delete(
+            &tenant_key,
+            RecordDelete::Task {
+                decision_ids,
+                task_key,
+                before_generation: current_task_generation,
+            },
+        )
+        .await
+        .map_err(record_repository_error)?;
     let retained_turns = records_for_tenant(&state, &tenant_key)
         .await?
         .into_iter()
@@ -1320,21 +3207,17 @@ async fn delete_tenant_records(
         .scope_generation(&tenant_key, None)
         .await
         .map_err(state_backend_unavailable)?;
-    let shared_deleted = if let Some(shared) = &state.shared_state {
-        shared
-            .delete_records(&tenant_key, &decision_ids)
-            .await
-            .map_err(state_backend_unavailable)?
-    } else {
-        0
-    };
-    let local_deleted = state
-        .records
-        .delete_matching(|record| {
-            record.tenant_key == tenant_key && record.tenant_generation < current_tenant_generation
-        })
-        .await?;
-    let deleted = shared_deleted.max(local_deleted);
+    let deleted = state
+        .record_repository
+        .delete(
+            &tenant_key,
+            RecordDelete::Tenant {
+                decision_ids,
+                before_generation: current_tenant_generation,
+            },
+        )
+        .await
+        .map_err(record_repository_error)?;
     let local_feedback_deleted = state
         .feedback
         .delete_matching(|tenant, turn| {
@@ -1428,6 +3311,7 @@ async fn feedback_by_turn(
             status: StatusCode::NOT_FOUND,
             code: "feedback_not_found",
             message: format!("feedback for turn {turn} was not found"),
+            request_id: None,
             decision_id: None,
         })?;
     Ok(Json(json!({
@@ -1663,10 +3547,29 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(request): Json<Value>,
 ) -> Result<Response, GatewayError> {
+    let state = state.with_active_control();
     state.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    let (tenant_key, tenant_compatibility) = resolve_tenant(&state, &headers)?;
-    let result =
-        chat_completions_inner(state.clone(), request, tenant_key, tenant_compatibility).await;
+    let candidate_request_id = next_request_id();
+    let (tenant_key, tenant_compatibility) = resolve_tenant(&state, &headers)
+        .map_err(|error| error.with_request_id(&candidate_request_id))?;
+    let request_id = resolve_request_id(
+        &state,
+        &headers,
+        &tenant_key,
+        &request,
+        candidate_request_id.clone(),
+    )
+    .await
+    .map_err(|error| error.with_request_id(&candidate_request_id))?;
+    let result = Box::pin(chat_completions_inner(
+        state.clone(),
+        request,
+        tenant_key,
+        tenant_compatibility,
+        request_id.clone(),
+    ))
+    .await
+    .map_err(|error| error.with_request_id(&request_id));
     if result.is_ok() {
         state.metrics.successes.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -1675,15 +3578,261 @@ async fn chat_completions(
     result
 }
 
+async fn resolve_request_id(
+    state: &AppState,
+    headers: &HeaderMap,
+    tenant_key: &str,
+    request: &Value,
+    candidate_request_id: String,
+) -> Result<String, GatewayError> {
+    let Some(key) = headers.get(HeaderName::from_static("idempotency-key")) else {
+        return Ok(candidate_request_id);
+    };
+    let key = key.to_str().map_err(|_| {
+        GatewayError::bad_request(
+            "invalid_idempotency_key",
+            "Idempotency-Key must be visible ASCII",
+        )
+    })?;
+    if key.is_empty() || key.len() > 256 || !key.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err(GatewayError::bad_request(
+            "invalid_idempotency_key",
+            "Idempotency-Key must contain 1..=256 visible ASCII bytes",
+        ));
+    }
+    let request_hash = canonical_request_hash(request)?;
+    let key_hash = idempotency_key_hash(tenant_key, key);
+    let claim = state
+        .idempotency
+        .claim(
+            tenant_key,
+            &key_hash,
+            &request_hash,
+            &candidate_request_id,
+            state.idempotency_ttl_seconds,
+        )
+        .await
+        .map_err(state_backend_unavailable)?;
+    match claim {
+        IdempotencyClaim::Created(request_id) | IdempotencyClaim::Reused(request_id) => {
+            Ok(request_id)
+        }
+        IdempotencyClaim::Conflict => Err(GatewayError {
+            status: StatusCode::CONFLICT,
+            code: "idempotency_conflict",
+            message: "Idempotency-Key was already used with a different request".to_owned(),
+            request_id: None,
+            decision_id: None,
+        }),
+    }
+}
+
+fn idempotency_key_hash(tenant_key: &str, key: &str) -> String {
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(format!("{tenant_key}\0{key}").as_bytes())
+    )
+}
+
+fn canonical_request_hash(request: &Value) -> Result<String, GatewayError> {
+    let encoded = serde_json::to_vec(request).map_err(GatewayError::internal)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
+}
+
 async fn adapter_chat_completions(
     State(state): State<AppState>,
     Path(harness): Path<String>,
     headers: HeaderMap,
     Json(mut request): Json<Value>,
 ) -> Result<Response, GatewayError> {
-    adapt_agent_request(&harness, &headers, &mut request)
-        .map_err(|error| GatewayError::bad_request("invalid_agent_adapter", error))?;
-    chat_completions(State(state), headers, Json(request)).await
+    adapt_agent_request(&harness, &headers, &mut request).map_err(|error| {
+        GatewayError::bad_request("invalid_agent_adapter", error)
+            .with_request_id(&next_request_id())
+    })?;
+    Box::pin(chat_completions(State(state), headers, Json(request))).await
+}
+
+fn internal_chat_capabilities() -> TransportCapabilities {
+    TransportCapabilities {
+        api: WireApi::OpenAiChat,
+        developer_role: true,
+        tools: true,
+        images: true,
+        structured_output: true,
+        reasoning: true,
+    }
+}
+
+async fn openai_responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Result<Response, GatewayError> {
+    let normalized = from_openai_responses(&request)
+        .map_err(|error| GatewayError::bad_request("invalid_responses_request", error))?;
+    if normalized.stream {
+        return Err(GatewayError::bad_request(
+            "unsupported_protocol_streaming",
+            "Responses streaming is not available; use /v1/chat/completions for streaming",
+        ));
+    }
+    let (chat, loss) = to_openai_chat(
+        &normalized,
+        &internal_chat_capabilities(),
+        LossPolicy::Reject,
+    )
+    .map_err(|error| GatewayError::bad_request("protocol_semantic_loss", error))?;
+    debug_assert!(loss.losses.is_empty());
+    let response = Box::pin(chat_completions(State(state), headers, Json(chat))).await?;
+    translate_chat_response(response, ProtocolResponse::Responses).await
+}
+
+async fn anthropic_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Result<Response, GatewayError> {
+    let normalized = from_anthropic_messages(&request)
+        .map_err(|error| GatewayError::bad_request("invalid_anthropic_request", error))?;
+    if normalized.stream {
+        return Err(GatewayError::bad_request(
+            "unsupported_protocol_streaming",
+            "Anthropic streaming is not available; use /v1/chat/completions for streaming",
+        ));
+    }
+    let (chat, loss) = to_openai_chat(
+        &normalized,
+        &internal_chat_capabilities(),
+        LossPolicy::Reject,
+    )
+    .map_err(|error| GatewayError::bad_request("protocol_semantic_loss", error))?;
+    debug_assert!(loss.losses.is_empty());
+    let response = Box::pin(chat_completions(State(state), headers, Json(chat))).await?;
+    translate_chat_response(response, ProtocolResponse::Anthropic).await
+}
+
+#[derive(Clone, Copy)]
+enum ProtocolResponse {
+    Responses,
+    Anthropic,
+}
+
+async fn translate_chat_response(
+    response: Response,
+    protocol: ProtocolResponse,
+) -> Result<Response, GatewayError> {
+    if !response.status().is_success() {
+        return Ok(response);
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = to_bytes(body, 16 * 1_024 * 1_024)
+        .await
+        .map_err(GatewayError::internal)?;
+    let chat: Value = serde_json::from_slice(&bytes).map_err(GatewayError::internal)?;
+    let translated = match protocol {
+        ProtocolResponse::Responses => chat_to_responses(&chat),
+        ProtocolResponse::Anthropic => chat_to_anthropic(&chat),
+    };
+    let body = serde_json::to_vec(&translated).map_err(GatewayError::internal)?;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(Response::from_parts(parts, Body::from(body)))
+}
+
+fn chat_to_responses(chat: &Value) -> Value {
+    let message = chat
+        .pointer("/choices/0/message")
+        .cloned()
+        .unwrap_or_default();
+    let mut content = Vec::new();
+    if let Some(text) = message.get("content").and_then(Value::as_str) {
+        content.push(json!({"type": "output_text", "text": text, "annotations": []}));
+    }
+    if let Some(reasoning) = message
+        .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(Value::as_str)
+    {
+        content.push(
+            json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": reasoning}]}),
+        );
+    }
+    let mut output = vec![json!({
+        "type": "message",
+        "id": chat.get("id").cloned().unwrap_or(Value::Null),
+        "status": "completed",
+        "role": "assistant",
+        "content": content
+    })];
+    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+        output.extend(calls.iter().map(|call| {
+            json!({
+                "type": "function_call",
+                "call_id": call.get("id").cloned().unwrap_or(Value::Null),
+                "name": call.pointer("/function/name").cloned().unwrap_or(Value::Null),
+                "arguments": call.pointer("/function/arguments").cloned().unwrap_or(Value::Null)
+            })
+        }));
+    }
+    json!({
+        "id": chat.get("id").cloned().unwrap_or(Value::Null),
+        "object": "response",
+        "status": "completed",
+        "model": chat.get("model").cloned().unwrap_or(Value::Null),
+        "output": output,
+        "usage": {
+            "input_tokens": chat.pointer("/usage/prompt_tokens").cloned().unwrap_or(json!(0)),
+            "output_tokens": chat.pointer("/usage/completion_tokens").cloned().unwrap_or(json!(0)),
+            "total_tokens": chat.pointer("/usage/total_tokens").cloned().unwrap_or(json!(0))
+        },
+        "urouter": chat.get("urouter").cloned().unwrap_or(Value::Null)
+    })
+}
+
+fn chat_to_anthropic(chat: &Value) -> Value {
+    let message = chat
+        .pointer("/choices/0/message")
+        .cloned()
+        .unwrap_or_default();
+    let mut content = Vec::new();
+    if let Some(text) = message.get("content").and_then(Value::as_str) {
+        content.push(json!({"type": "text", "text": text}));
+    }
+    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+        content.extend(calls.iter().map(|call| {
+            let input = call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                .unwrap_or_else(|| json!({}));
+            json!({
+                "type": "tool_use",
+                "id": call.get("id").cloned().unwrap_or(Value::Null),
+                "name": call.pointer("/function/name").cloned().unwrap_or(Value::Null),
+                "input": input
+            })
+        }));
+    }
+    let finish = chat
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("stop");
+    json!({
+        "id": chat.get("id").cloned().unwrap_or(Value::Null),
+        "type": "message",
+        "role": "assistant",
+        "model": chat.get("model").cloned().unwrap_or(Value::Null),
+        "content": content,
+        "stop_reason": if finish == "tool_calls" { "tool_use" } else { "end_turn" },
+        "usage": {
+            "input_tokens": chat.pointer("/usage/prompt_tokens").cloned().unwrap_or(json!(0)),
+            "output_tokens": chat.pointer("/usage/completion_tokens").cloned().unwrap_or(json!(0))
+        },
+        "urouter": chat.get("urouter").cloned().unwrap_or(Value::Null)
+    })
 }
 
 async fn chat_completions_inner(
@@ -1691,67 +3840,76 @@ async fn chat_completions_inner(
     request: Value,
     tenant_key: String,
     tenant_compatibility: bool,
+    request_id: String,
 ) -> Result<Response, GatewayError> {
+    let feature_frame = FeatureFrame::from_openai_chat(&request);
+    let route_revision = state.route.revision();
     let mut decision = state.route.decide(&state.catalog, &request)?;
+    let artifact = apply_artifact_policy(
+        &state,
+        &request,
+        &tenant_key,
+        &artifact_task_key(&decision, &request_id),
+        &mut decision,
+    )?;
+    let exploration = apply_controlled_exploration(
+        &state,
+        &request,
+        &tenant_key,
+        &artifact_task_key(&decision, &request_id),
+        tenant_compatibility,
+        &mut decision,
+    )?;
     decision.compatibility_mode |= tenant_compatibility;
     validate_decision_scope(&decision)?;
-    let governance = request_governance(&state, tenant_key, &decision).await?;
+    let admission = admit_request(&state, tenant_key, &request_id, &decision, &request).await?;
+    let governance = admission.governance;
+    let quota = admission.quota;
+    let quota_input_tokens = admission.quota_input_tokens;
+    let budget = admission.budget;
+    let budget_input_tokens = admission.budget_input_tokens;
+    let budget_output_tokens = admission.budget_output_tokens;
     observe_compatibility(&state, decision.compatibility_mode);
     apply_task_binding(&state, &governance, &mut decision).await?;
     ingest_piggyback(&state, &governance, &decision.signals).await?;
     let messages_hash = messages_hash(&request)?;
+    let record_seed = RecordSeed {
+        request_id,
+        messages_hash,
+        features: feature_frame,
+        route_revision,
+        artifact,
+        exploration,
+    };
     let stream = request
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let started = Instant::now();
-    let execution = match execute_routed_upstream(&state, &decision, &request).await {
+    let execution = match execute_routed_upstream(
+        &state,
+        &decision,
+        &request,
+        &record_seed.request_id,
+        &governance.tenant_key,
+    )
+    .await
+    {
         Ok(execution) => execution,
-        Err(mut failure) => {
-            let decision_id = next_decision_id();
-            let error_kind = failure
-                .attempts
-                .last()
-                .and_then(|attempt| attempt.error_kind);
-            let upstream_status = failure
-                .attempts
-                .last()
-                .and_then(|attempt| attempt.status)
-                .unwrap_or(0);
-            decision.tier.clone_from(&failure.tier);
-            decision.model = failure.model.id.clone();
-            if failure.fallback_depth > 0 {
-                "fallback_degraded".clone_into(&mut decision.reason);
-            }
-            let deployment = failure
-                .attempts
-                .last()
-                .map(|attempt| attempt.deployment.clone())
-                .unwrap_or_default();
-            let record = build_record(
-                &state.catalog,
-                decision_id.clone(),
-                decision,
-                &failure.model,
-                messages_hash,
-                &governance,
-                ExecutionRecord {
-                    ok: false,
+        Err(failure) => {
+            return Err(record_routed_failure(
+                &state,
+                failure,
+                FailedRequestContext {
+                    decision,
+                    governance,
+                    record: record_seed,
+                    budget,
                     stream,
-                    upstream_status,
-                    upstream_latency_ms: started.elapsed().as_millis(),
-                    usage: None,
-                    cost: None,
-                    usage_unavailable: true,
-                    attempts: failure.attempts,
-                    error_kind,
-                    deployment,
-                    fallback_depth: failure.fallback_depth,
+                    started,
                 },
-            )?;
-            store_record(&state, record).await?;
-            failure.error.decision_id = Some(decision_id);
-            return Err(failure.error);
+            )
+            .await?);
         }
     };
     if execution.tier != decision.tier {
@@ -1760,29 +3918,123 @@ async fn chat_completions_inner(
         "fallback_degraded".clone_into(&mut decision.reason);
     }
     let decision_id = next_decision_id();
-    let headers = decision_headers(&decision_id, &decision)?;
+    let headers = decision_headers(&record_seed.request_id, &decision_id, &decision)?;
+    let response_context = ResponseContext {
+        decision_id,
+        decision,
+        governance,
+        record: record_seed,
+        headers,
+        quota,
+        quota_input_tokens,
+        budget: BudgetAccounting {
+            lease: budget,
+            input_tokens: budget_input_tokens,
+            output_tokens: budget_output_tokens,
+        },
+    };
     if stream {
-        Ok(stream_response(
-            state,
-            execution,
-            decision_id,
-            decision,
-            messages_hash,
-            governance,
-            headers,
-        ))
+        Ok(stream_response(state, execution, response_context))
     } else {
-        non_stream_response(
-            state,
-            execution,
-            decision_id,
-            decision,
-            messages_hash,
-            governance,
-            headers,
-        )
-        .await
+        non_stream_response(state, execution, response_context).await
     }
+}
+
+async fn record_routed_failure(
+    state: &AppState,
+    mut failure: RoutedFailure,
+    mut context: FailedRequestContext,
+) -> Result<GatewayError, GatewayError> {
+    let elapsed_ms = context.started.elapsed().as_millis();
+    state
+        .metrics
+        .request_duration_ms
+        .observe(duration_metric_value(elapsed_ms));
+    state
+        .metrics
+        .upstream_duration_ms
+        .observe(duration_metric_value(elapsed_ms));
+    state
+        .metrics
+        .fallback_depth
+        .observe(u64::from(failure.fallback_depth));
+    if failure.attempts.is_empty() {
+        let _ = context.budget.release().await;
+    }
+    let decision_id = next_decision_id();
+    let error_kind = failure
+        .attempts
+        .last()
+        .and_then(|attempt| attempt.error_kind);
+    let upstream_status = failure
+        .attempts
+        .last()
+        .and_then(|attempt| attempt.status)
+        .unwrap_or(0);
+    context.decision.tier.clone_from(&failure.tier);
+    context.decision.model = failure.model.id.clone();
+    if failure.fallback_depth > 0 {
+        "fallback_degraded".clone_into(&mut context.decision.reason);
+    }
+    let deployment = failure
+        .attempts
+        .last()
+        .map(|attempt| attempt.deployment.clone())
+        .unwrap_or_default();
+    let record = build_record(
+        &state.catalog,
+        decision_id.clone(),
+        context.decision,
+        &failure.model,
+        &context.governance,
+        &context.record,
+        ExecutionRecord {
+            ok: false,
+            stream: context.stream,
+            upstream_status,
+            upstream_latency_ms: elapsed_ms,
+            usage: None,
+            cost: None,
+            usage_unavailable: true,
+            attempts: failure.attempts,
+            error_kind,
+            deployment,
+            fallback_depth: failure.fallback_depth,
+            runtime_filter_trace: failure.runtime_filter_trace,
+        },
+    )?;
+    store_record(state, record).await?;
+    failure.error.decision_id = Some(decision_id);
+    Ok(failure.error)
+}
+
+async fn admit_request(
+    state: &AppState,
+    tenant_key: String,
+    request_id: &str,
+    decision: &RouteDecision,
+    request: &Value,
+) -> Result<RequestAdmission, GatewayError> {
+    let governance = request_governance(state, tenant_key, decision).await?;
+    let (budget, budget_input_tokens, budget_output_tokens) =
+        acquire_request_budget(state, &governance.tenant_key, request_id, decision, request)
+            .await?;
+    let (quota, quota_input_tokens) =
+        match acquire_request_quota(state, &governance.tenant_key, request).await {
+            Ok(quota) => quota,
+            Err(error) => {
+                let _ = budget.release().await;
+                return Err(error);
+            }
+        };
+    Ok(RequestAdmission {
+        governance,
+        quota,
+        quota_input_tokens,
+        budget,
+        budget_input_tokens,
+        budget_output_tokens,
+    })
 }
 
 fn observe_compatibility(state: &AppState, compatibility_mode: bool) {
@@ -1792,6 +4044,242 @@ fn observe_compatibility(state: &AppState, compatibility_mode: bool) {
             .compatibility_requests
             .fetch_add(1, Ordering::Relaxed);
     }
+}
+
+async fn acquire_tenant_quota(
+    state: &AppState,
+    tenant_key: &str,
+    estimated_tokens: u64,
+) -> Result<QuotaLease, GatewayError> {
+    match QuotaLease::acquire(Arc::clone(&state.quota), tenant_key, estimated_tokens)
+        .await
+        .map_err(quota_repository_error)?
+    {
+        QuotaAdmission::Granted(lease) => Ok(lease),
+        QuotaAdmission::Rejected(reason) => {
+            state
+                .metrics
+                .quota_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            let (code, message) = match reason {
+                QuotaRejection::InFlight => (
+                    "tenant_concurrency_exhausted",
+                    "the tenant has reached its maximum in-flight request limit",
+                ),
+                QuotaRejection::RequestsPerMinute => (
+                    "tenant_rate_limit_exhausted",
+                    "the tenant has reached its requests-per-minute limit",
+                ),
+                QuotaRejection::TokensPerMinute => (
+                    "tenant_token_limit_exhausted",
+                    "the tenant has reached its tokens-per-minute limit",
+                ),
+            };
+            Err(GatewayError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                code,
+                message: message.to_owned(),
+                request_id: None,
+                decision_id: None,
+            })
+        }
+    }
+}
+
+async fn acquire_request_quota(
+    state: &AppState,
+    tenant_key: &str,
+    request: &Value,
+) -> Result<(QuotaLease, u64), GatewayError> {
+    let (input_tokens, reserved_tokens) = estimate_quota_tokens(
+        request,
+        state.quota_default_max_output_tokens,
+        state.retry_policy.max_retries,
+    );
+    let lease = acquire_tenant_quota(state, tenant_key, reserved_tokens).await?;
+    Ok((lease, input_tokens))
+}
+
+fn estimate_quota_tokens(
+    request: &Value,
+    default_max_output_tokens: u64,
+    max_retries: u8,
+) -> (u64, u64) {
+    let (input_tokens, output_tokens) = estimate_request_tokens(request, default_max_output_tokens);
+    let attempts = u64::from(max_retries).saturating_add(1);
+    (
+        input_tokens,
+        input_tokens
+            .saturating_mul(attempts)
+            .saturating_add(output_tokens),
+    )
+}
+
+fn estimate_request_tokens(request: &Value, default_max_output_tokens: u64) -> (u64, u64) {
+    let serialized_bytes = serde_json::to_vec(request)
+        .ok()
+        .and_then(|bytes| u64::try_from(bytes.len()).ok())
+        .unwrap_or(1);
+    let input_tokens = serialized_bytes.div_ceil(4).max(1);
+    let output_tokens = request
+        .get("max_tokens")
+        .or_else(|| request.get("max_completion_tokens"))
+        .or_else(|| request.get("max_output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(default_max_output_tokens);
+    (input_tokens, output_tokens)
+}
+
+async fn acquire_request_budget(
+    state: &AppState,
+    tenant_key: &str,
+    request_id: &str,
+    decision: &RouteDecision,
+    request: &Value,
+) -> Result<(BudgetLease, u64, u64), GatewayError> {
+    let (input_tokens, output_tokens) =
+        estimate_request_tokens(request, state.quota_default_max_output_tokens);
+    let estimate = estimate_request_cost(state, decision, tenant_key, input_tokens, output_tokens)?;
+    match BudgetLease::acquire(Arc::clone(&state.budget), tenant_key, request_id, estimate)
+        .await
+        .map_err(budget_repository_error)?
+    {
+        BudgetAdmission::Granted(lease) => Ok((lease, input_tokens, output_tokens)),
+        BudgetAdmission::Rejected => {
+            state
+                .metrics
+                .budget_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            Err(GatewayError {
+                status: StatusCode::PAYMENT_REQUIRED,
+                code: "tenant_budget_exhausted",
+                message: "the tenant has reached its hard budget limit".to_owned(),
+                request_id: None,
+                decision_id: None,
+            })
+        }
+    }
+}
+
+fn estimate_request_cost(
+    state: &AppState,
+    decision: &RouteDecision,
+    tenant_key_value: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Result<u64, GatewayError> {
+    let tiers = execution_tiers(state, decision)?;
+    let attempts_per_tier = u64::from(state.retry_policy.max_retries).saturating_add(1);
+    let attempts = u64::try_from(tiers.len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(attempts_per_tier);
+    let usage = Usage {
+        input: input_tokens.saturating_mul(attempts),
+        output: output_tokens.saturating_mul(attempts),
+        ..Usage::default()
+    };
+    let mut maximum = 0_u64;
+    for model in tiers
+        .iter()
+        .flat_map(|tier| tier.deployments.iter())
+        .filter(|deployment| {
+            deployment_filter_reasons(state, deployment, decision, tenant_key_value)
+                .iter()
+                .all(|reason| {
+                    matches!(
+                        reason.as_str(),
+                        "credential_unavailable" | "endpoint_unavailable"
+                    )
+                })
+        })
+        .filter_map(|deployment| state.catalog.model(&deployment.model))
+    {
+        let cost = calculate_actual_cost(&model.cost, usage)
+            .map_err(|error| GatewayError::internal(error.to_string()))?;
+        maximum = maximum.max(money_to_u64(cost.total));
+    }
+    Ok(maximum)
+}
+
+fn money_to_u64(value: urouter_types::MoneyNanoUsd) -> u64 {
+    u64::try_from(value.as_nano_usd()).unwrap_or(u64::MAX)
+}
+
+fn duration_metric_value(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn observe_execution_metrics(
+    metrics: &GatewayMetrics,
+    request_duration_ms: u128,
+    upstream_duration_ms: u128,
+    fallback_depth: u8,
+    cost: Option<&CostBreakdown>,
+    trace_id: Option<&str>,
+) {
+    metrics
+        .request_duration_ms
+        .observe_with_exemplar(duration_metric_value(request_duration_ms), trace_id);
+    metrics
+        .upstream_duration_ms
+        .observe(duration_metric_value(upstream_duration_ms));
+    metrics.fallback_depth.observe(u64::from(fallback_depth));
+    if let Some(cost) = cost {
+        metrics.cost_nano_usd.observe(money_to_u64(cost.total));
+    }
+}
+
+fn usage_token_count(usage: Usage, estimated_input_tokens: u64, attempts: usize) -> u64 {
+    let actual = usage
+        .total_input()
+        .unwrap_or(u64::MAX)
+        .saturating_add(usage.output);
+    let failed_attempts = u64::try_from(attempts.saturating_sub(1)).unwrap_or(u64::MAX);
+    actual.saturating_add(estimated_input_tokens.saturating_mul(failed_attempts))
+}
+
+async fn settle_quota_usage(
+    quota: &QuotaLease,
+    usage: Option<Usage>,
+    estimated_input_tokens: u64,
+    attempts: usize,
+) {
+    if let Some(actual_usage) = usage {
+        let actual_tokens = usage_token_count(actual_usage, estimated_input_tokens, attempts);
+        let _ = quota.settle(actual_tokens).await;
+    }
+}
+
+async fn settle_budget_usage(
+    state: &AppState,
+    budget: &BudgetLease,
+    final_cost: Option<&CostBreakdown>,
+    attempts: &[AttemptRecord],
+    input_tokens: u64,
+    output_tokens: u64,
+) {
+    let Some(final_cost) = final_cost else {
+        return;
+    };
+    let mut actual = money_to_u64(final_cost.total);
+    let failed_usage = Usage {
+        input: input_tokens,
+        output: output_tokens,
+        ..Usage::default()
+    };
+    for model in attempts
+        .iter()
+        .filter(|attempt| attempt.error_kind.is_some())
+        .filter_map(|attempt| attempt.model.as_ref())
+        .filter_map(|model| state.catalog.model(model))
+    {
+        if let Ok(cost) = calculate_actual_cost(&model.cost, failed_usage) {
+            actual = actual.saturating_add(money_to_u64(cost.total));
+        } else {
+            return;
+        }
+    }
+    let _ = budget.settle(actual).await;
 }
 
 fn validate_scope_value(field: &str, value: &str) -> Result<(), GatewayError> {
@@ -1815,6 +4303,7 @@ fn resolve_tenant(state: &AppState, headers: &HeaderMap) -> Result<(String, bool
             status: StatusCode::UNAUTHORIZED,
             code: "tenant_required",
             message: "x-urouter-tenant-id must be injected by the authentication layer".to_owned(),
+            request_id: None,
             decision_id: None,
         });
     }
@@ -1857,11 +4346,12 @@ async fn records_for_tenant(
     state: &AppState,
     tenant_key: &str,
 ) -> Result<Vec<DecisionRecord>, GatewayError> {
+    let mut records = state
+        .record_repository
+        .list(tenant_key)
+        .await
+        .map_err(record_repository_error)?;
     if let Some(shared) = &state.shared_state {
-        let mut records = shared
-            .records(tenant_key)
-            .await
-            .map_err(state_backend_unavailable)?;
         let turns = records
             .iter()
             .filter_map(|record| record.trace_turn.clone())
@@ -1879,18 +4369,8 @@ async fn records_for_tenant(
                 record.outcome_signals.clone_from(signals);
             }
         }
-        return Ok(records);
     }
-    state.records.prune_expired().await?;
-    Ok(state
-        .records
-        .records
-        .read()
-        .await
-        .iter()
-        .filter(|record| record.tenant_key == tenant_key)
-        .cloned()
-        .collect())
+    Ok(records)
 }
 
 async fn record_for_id(
@@ -1898,33 +4378,24 @@ async fn record_for_id(
     tenant_key: &str,
     decision_id: &str,
 ) -> Result<Option<DecisionRecord>, GatewayError> {
-    if let Some(shared) = &state.shared_state {
-        let Some(mut record) = shared
-            .record(tenant_key, decision_id)
+    let Some(mut record) = state
+        .record_repository
+        .get(tenant_key, decision_id)
+        .await
+        .map_err(record_repository_error)?
+    else {
+        return Ok(None);
+    };
+    if let Some(shared) = &state.shared_state
+        && let Some(turn) = &record.trace_turn
+        && let Some(signals) = shared
+            .feedback(tenant_key, turn)
             .await
             .map_err(state_backend_unavailable)?
-        else {
-            return Ok(None);
-        };
-        if let Some(turn) = &record.trace_turn
-            && let Some(signals) = shared
-                .feedback(tenant_key, turn)
-                .await
-                .map_err(state_backend_unavailable)?
-        {
-            record.outcome_signals = signals;
-        }
-        return Ok(Some(record));
+    {
+        record.outcome_signals = signals;
     }
-    state.records.prune_expired().await?;
-    Ok(state
-        .records
-        .records
-        .read()
-        .await
-        .iter()
-        .find(|record| record.decision_id == decision_id && record.tenant_key == tenant_key)
-        .cloned())
+    Ok(Some(record))
 }
 
 async fn feedback_for_turn(
@@ -2285,11 +4756,12 @@ async fn execute_routed_upstream(
     state: &AppState,
     decision: &RouteDecision,
     request: &Value,
+    request_id: &str,
+    tenant_key: &str,
 ) -> Result<UpstreamExecution, RoutedFailure> {
-    let tiers = execution_tiers(state, decision)
-        .map_err(|error| routed_setup_failure(state, decision, error))?;
     let started = Instant::now();
     let mut attempts = Vec::new();
+    let mut runtime_filter_trace = Vec::new();
     let mut last_error = None;
     let mut last_model = state
         .catalog
@@ -2298,15 +4770,39 @@ async fn execute_routed_upstream(
         .clone();
     let mut last_tier = decision.tier.clone();
     let mut last_depth = 0_u8;
+    let identity = RequestExecutionIdentity {
+        request_id,
+        tenant_key,
+    };
+    let mut pending = VecDeque::from([decision.tier.clone()]);
+    let mut visited = BTreeSet::new();
 
-    for (depth, tier) in tiers.iter().enumerate() {
-        let depth = u8::try_from(depth).unwrap_or(u8::MAX);
+    while let Some(tier_name) = pending.pop_front() {
+        if !visited.insert(tier_name.clone()) {
+            continue;
+        }
+        let depth = u8::try_from(visited.len().saturating_sub(1)).unwrap_or(u8::MAX);
+        if depth > state.max_fallback_depth {
+            break;
+        }
+        let tier = execution_tier(state, decision, &tier_name)
+            .map_err(|error| routed_setup_failure(state, decision, error))?;
         if depth > 0 {
             state.metrics.fallbacks.fetch_add(1, Ordering::Relaxed);
         }
         last_depth = depth;
         last_tier.clone_from(&tier.tier);
-        match execute_tier(state, tier, decision, request, &mut attempts).await {
+        match execute_tier(
+            state,
+            &tier,
+            decision,
+            request,
+            &identity,
+            &mut attempts,
+            &mut runtime_filter_trace,
+        )
+        .await
+        {
             Ok(success) => {
                 return Ok(UpstreamExecution {
                     response: success.response,
@@ -2331,7 +4827,16 @@ async fn execute_routed_upstream(
                         tier: tier.tier.clone(),
                         model: last_model,
                         fallback_depth: depth,
+                        runtime_filter_trace,
                     });
+                }
+                let cause = fallback_cause(exhausted.error.as_ref());
+                if decision.reason != "explicit_model" {
+                    for fallback in typed_fallbacks(state, &tier.tier, cause) {
+                        if !visited.contains(&fallback) {
+                            pending.push_back(fallback);
+                        }
+                    }
                 }
                 last_error = exhausted.error;
             }
@@ -2343,71 +4848,104 @@ async fn execute_routed_upstream(
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "capacity_exhausted",
             message: "all configured deployments and fallback tiers are unavailable".to_owned(),
+            request_id: None,
             decision_id: None,
         }),
         attempts,
         tier: last_tier,
         model: last_model,
         fallback_depth: last_depth,
+        runtime_filter_trace,
     })
 }
 
+fn fallback_cause(error: Option<&GatewayError>) -> FallbackCause {
+    match error.map(|error| error.code) {
+        Some("upstream_transport") => FallbackCause::Transport,
+        Some("upstream_timeout") => FallbackCause::Timeout,
+        Some("upstream_rate_limited") => FallbackCause::RateLimited,
+        Some("upstream_server_error") => FallbackCause::ServerError,
+        Some("upstream_provider_unavailable") => FallbackCause::ProviderUnavailable,
+        Some("upstream_unauthorized") => FallbackCause::Unauthorized,
+        Some("upstream_not_found") => FallbackCause::NotFound,
+        Some("upstream_bad_request") => FallbackCause::BadRequest,
+        Some("tenant_quota_exhausted") => FallbackCause::Quota,
+        Some("context_window_exhausted") => FallbackCause::ContextWindow,
+        Some("content_policy_rejected") => FallbackCause::ContentPolicy,
+        _ => FallbackCause::Capacity,
+    }
+}
+
+fn typed_fallbacks(state: &AppState, tier_name: &str, cause: FallbackCause) -> Vec<String> {
+    state
+        .route
+        .tiers
+        .iter()
+        .find(|tier| tier.tier == tier_name)
+        .map_or_else(Vec::new, |tier| tier.fallbacks_for(cause).to_vec())
+}
+
+#[allow(clippy::too_many_lines)]
 async fn execute_tier(
     state: &AppState,
     tier: &ExecutionTier,
     decision: &RouteDecision,
     request: &Value,
+    identity: &RequestExecutionIdentity<'_>,
     attempts: &mut Vec<AttemptRecord>,
+    runtime_filter_trace: &mut Vec<DeploymentEvaluation>,
 ) -> Result<TierSuccess, TierExhausted> {
-    let candidates = tier
-        .deployments
-        .iter()
-        .filter(|deployment| decision.admission.eligible.contains(&deployment.model))
-        .cloned()
-        .collect::<Vec<_>>();
-    let fallback_model = candidates
-        .first()
-        .and_then(|deployment| state.catalog.model(&deployment.model))
-        .cloned()
-        .unwrap_or_else(|| state.catalog.model(&decision.model).unwrap().clone());
-    let mut last_model = fallback_model;
+    let candidates = filter_deployments(
+        state,
+        tier,
+        decision,
+        identity.tenant_key,
+        runtime_filter_trace,
+    );
+    let mut last_model = fallback_model(state, &candidates, decision);
     let mut last_error = None;
     let mut excluded = BTreeSet::new();
     let mut retries_used = 0_u8;
 
     loop {
-        let Some(lease) =
-            acquire_tier_lease(state, &candidates, &mut excluded, &last_model).await?
+        let Some(lease) = next_lease(
+            state,
+            &candidates,
+            &mut excluded,
+            &last_model,
+            runtime_filter_trace,
+        )
+        .await?
         else {
             break;
         };
         let deployment = lease.deployment.clone();
-        let model = state.catalog.model(&deployment.model).unwrap().clone();
+        let prepared =
+            prepare_deployment_request(state, &deployment, request).map_err(|error| *error)?;
+        let model = prepared.model;
+        let url = prepared.url;
+        let headers = prepared.headers;
+        let upstream_request = prepared.request;
         last_model.clone_from(&model);
-        let (endpoint, url) =
-            endpoint_for_deployment(state, &deployment, &model).map_err(|error| TierExhausted {
-                error: Some(error),
-                model: model.clone(),
-            })?;
-        let headers = resolve_headers(&endpoint).map_err(|error| TierExhausted {
-            error: Some(error),
-            model: model.clone(),
-        })?;
-        let mut upstream_request = request.clone();
-        rewrite_request(&mut upstream_request, &model);
 
         match send_deployment_request(state, &url, &headers, &upstream_request).await {
             Ok((response, latency_ms)) => {
-                attempts.push(AttemptRecord {
-                    attempt: attempt_number(attempts.len()),
-                    tier: tier.tier.clone(),
-                    deployment: deployment.id,
-                    model: Some(model.id.clone()),
-                    status: Some(response.status().as_u16()),
-                    latency_ms,
-                    error_kind: None,
-                    retry: false,
-                });
+                let attempt = observe_attempt(state, &deployment.id, latency_ms, attempts.len());
+                let selection_trace = record_cache_affinity_success(
+                    state,
+                    decision,
+                    &deployment,
+                    lease.selection_trace.clone(),
+                );
+                attempts.push(AttemptRecord::new(
+                    identity.request_id,
+                    attempt,
+                    &tier.tier,
+                    &deployment,
+                    &model,
+                    selection_trace,
+                    AttemptOutcome::success(response.status().as_u16(), latency_ms),
+                ));
                 return Ok(TierSuccess {
                     response,
                     lease,
@@ -2415,59 +4953,305 @@ async fn execute_tier(
                 });
             }
             Err(failure) => {
+                let attempt =
+                    observe_attempt(state, &deployment.id, failure.latency_ms, attempts.len());
+                let selection_trace = lease.selection_trace.clone();
                 if let Err(error) = lease.complete(Err(failure.kind)).await {
                     return Err(TierExhausted {
                         error: Some(error),
                         model,
                     });
                 }
-                let retry = state.retry_policy.should_retry(failure.kind, retries_used);
-                attempts.push(AttemptRecord {
-                    attempt: attempt_number(attempts.len()),
-                    tier: tier.tier.clone(),
-                    deployment: deployment.id.clone(),
-                    model: Some(model.id.clone()),
-                    status: failure.status.map(|status| status.as_u16()),
-                    latency_ms: failure.latency_ms,
-                    error_kind: Some(failure.kind),
-                    retry,
-                });
+                let directive = state.retry_policy.directive(
+                    failure.kind,
+                    retries_used,
+                    candidates.len(),
+                    failure.retry_after_ms,
+                );
+                let retry = directive != RetryDirective::Stop;
+                attempts.push(AttemptRecord::new(
+                    identity.request_id,
+                    attempt,
+                    &tier.tier,
+                    &deployment,
+                    &model,
+                    selection_trace,
+                    AttemptOutcome::failure(&failure, retry),
+                ));
                 last_error = Some(upstream_error(
                     failure.kind,
                     failure.status,
                     failure.detail,
                     attempts,
                 ));
-                if failure.kind == UpstreamErrorKind::BadRequest || !retry {
+                if !apply_retry_directive(
+                    state,
+                    directive,
+                    &mut retries_used,
+                    &mut excluded,
+                    &deployment.id,
+                )
+                .await
+                {
                     break;
-                }
-                state.metrics.retries.fetch_add(1, Ordering::Relaxed);
-                retries_used = retries_used.saturating_add(1);
-                excluded.insert(deployment.id);
-                if candidates.len() == 1 {
-                    excluded.clear();
-                    sleep(Duration::from_millis(state.retry_policy.backoff_ms(
-                        retries_used.saturating_sub(1),
-                        failure.retry_after_ms,
-                    )))
-                    .await;
                 }
             }
         }
     }
-    Err(TierExhausted {
-        error: last_error,
-        model: last_model,
+    Err(tier_exhausted(last_error, last_model))
+}
+
+fn record_cache_affinity_success(
+    state: &AppState,
+    decision: &RouteDecision,
+    deployment: &RouteDeployment,
+    mut trace: Vec<DeploymentEvaluation>,
+) -> Vec<DeploymentEvaluation> {
+    let hit = state
+        .cache_affinity
+        .preferred(decision.prompt_profile_hash.as_deref())
+        .as_deref()
+        == Some(deployment.id.as_str());
+    state
+        .cache_affinity
+        .remember(decision.prompt_profile_hash.as_deref(), &deployment.id);
+    if !hit {
+        return trace;
+    }
+    if let Some(selected) = trace
+        .iter_mut()
+        .find(|item| item.deployment == deployment.id)
+    {
+        selected.reasons.push("cache_affinity_hit".to_owned());
+    } else {
+        trace.push(DeploymentEvaluation {
+            deployment: deployment.id.clone(),
+            disposition: DeploymentDisposition::Selected,
+            reasons: vec!["cache_affinity_hit".to_owned()],
+        });
+    }
+    trace
+}
+
+const fn tier_exhausted(error: Option<GatewayError>, model: ModelSpec) -> TierExhausted {
+    TierExhausted { error, model }
+}
+
+fn observe_attempt(state: &AppState, deployment: &str, latency_ms: u128, attempts: usize) -> u8 {
+    state
+        .capacity
+        .observe_latency(deployment, u64::try_from(latency_ms).unwrap_or(u64::MAX));
+    attempt_number(attempts)
+}
+
+fn prepare_deployment_request(
+    state: &AppState,
+    deployment: &RouteDeployment,
+    request: &Value,
+) -> Result<PreparedDeployment, Box<TierExhausted>> {
+    let model = state.catalog.model(&deployment.model).unwrap().clone();
+    let (endpoint, url) = endpoint_for_deployment(state, deployment, &model).map_err(|error| {
+        Box::new(TierExhausted {
+            error: Some(error),
+            model: model.clone(),
+        })
+    })?;
+    let headers = resolve_headers(&endpoint).map_err(|error| {
+        Box::new(TierExhausted {
+            error: Some(error),
+            model: model.clone(),
+        })
+    })?;
+    let request = provider_request(request, &model).map_err(|error| {
+        Box::new(TierExhausted {
+            error: Some(error),
+            model: model.clone(),
+        })
+    })?;
+    Ok(PreparedDeployment {
+        model,
+        url,
+        headers,
+        request,
     })
 }
 
-async fn acquire_tier_lease(
+async fn apply_retry_directive(
+    state: &AppState,
+    directive: RetryDirective,
+    retries_used: &mut u8,
+    excluded: &mut BTreeSet<String>,
+    deployment_id: &str,
+) -> bool {
+    if directive == RetryDirective::Stop {
+        return false;
+    }
+    state.metrics.retries.fetch_add(1, Ordering::Relaxed);
+    *retries_used = retries_used.saturating_add(1);
+    match directive {
+        RetryDirective::Stop => unreachable!("stop returned before retry execution"),
+        RetryDirective::ReselectDeployment => {
+            excluded.insert(deployment_id.to_owned());
+        }
+        RetryDirective::RetrySameDeployment { backoff_ms } => {
+            excluded.clear();
+            sleep(Duration::from_millis(backoff_ms)).await;
+        }
+    }
+    true
+}
+
+fn filter_deployments(
+    state: &AppState,
+    tier: &ExecutionTier,
+    decision: &RouteDecision,
+    tenant_key_value: &str,
+    runtime_filter_trace: &mut Vec<DeploymentEvaluation>,
+) -> Vec<RouteDeployment> {
+    let mut candidates = tier
+        .deployments
+        .iter()
+        .filter_map(|deployment| {
+            let reasons = deployment_filter_reasons(state, deployment, decision, tenant_key_value);
+            if reasons.is_empty() {
+                Some(deployment.clone())
+            } else {
+                let mut counters = state
+                    .metrics
+                    .filter_rejections
+                    .lock()
+                    .expect("filter metric lock poisoned");
+                for reason in &reasons {
+                    *counters.entry(reason.clone()).or_default() += 1;
+                }
+                drop(counters);
+                runtime_filter_trace.push(DeploymentEvaluation {
+                    deployment: deployment.id.clone(),
+                    disposition: DeploymentDisposition::Excluded,
+                    reasons,
+                });
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if let Some(preferred) = state
+        .cache_affinity
+        .preferred(decision.prompt_profile_hash.as_deref())
+        && candidates
+            .iter()
+            .any(|deployment| deployment.id == preferred)
+    {
+        for deployment in &mut candidates {
+            deployment.order = if deployment.id == preferred {
+                0
+            } else {
+                deployment.order.saturating_add(1)
+            };
+        }
+    }
+    candidates
+}
+
+fn deployment_filter_reasons(
+    state: &AppState,
+    deployment: &RouteDeployment,
+    decision: &RouteDecision,
+    tenant_key_value: &str,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !deployment.enabled {
+        reasons.push("deployment_disabled".to_owned());
+    }
+    if !deployment.credential_available {
+        reasons.push("credential_unavailable".to_owned());
+    }
+    let bound_request = matches!(decision.reason.as_str(), "task_binding" | "session_binding");
+    let within_binding_grace = bound_request
+        && deployment
+            .binding_grace_until_unix
+            .is_some_and(|deadline| unix_seconds() <= deadline);
+    if !deployment.accept_new_requests && !within_binding_grace {
+        reasons.push("deployment_retired".to_owned());
+    }
+    if !decision.admission.eligible.contains(&deployment.model) {
+        reasons.extend(
+            decision
+                .admission
+                .excluded
+                .iter()
+                .find(|excluded| excluded.model == deployment.model)
+                .map_or_else(
+                    || vec!["model_ineligible".to_owned()],
+                    |excluded| excluded.reasons.clone(),
+                ),
+        );
+    }
+    if decision
+        .policy
+        .region
+        .as_ref()
+        .is_some_and(|required| deployment.region.as_ref() != Some(required))
+    {
+        reasons.push("region_mismatch".to_owned());
+    }
+    if decision.policy.residency.as_ref().is_some_and(|required| {
+        !deployment
+            .residency
+            .iter()
+            .any(|available| available == required)
+    }) {
+        reasons.push("residency_mismatch".to_owned());
+    }
+    if !deployment.tenant_allowlist.is_empty()
+        && !deployment
+            .tenant_allowlist
+            .iter()
+            .any(|allowed| allowed == tenant_key_value || tenant_key(allowed) == tenant_key_value)
+    {
+        reasons.push("tenant_not_allowed".to_owned());
+    }
+    match state.catalog.model(&deployment.model) {
+        Some(model) => match endpoint_for_deployment(state, deployment, model) {
+            Ok((endpoint, _))
+                if deployment.credential_available && resolve_headers(&endpoint).is_err() =>
+            {
+                reasons.push("credential_unavailable".to_owned());
+            }
+            Err(_) => reasons.push("endpoint_unavailable".to_owned()),
+            Ok(_) => {}
+        },
+        None => reasons.push("model_unavailable".to_owned()),
+    }
+    reasons
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn fallback_model(
+    state: &AppState,
+    candidates: &[RouteDeployment],
+    decision: &RouteDecision,
+) -> ModelSpec {
+    candidates
+        .first()
+        .and_then(|deployment| state.catalog.model(&deployment.model))
+        .cloned()
+        .unwrap_or_else(|| state.catalog.model(&decision.model).unwrap().clone())
+}
+
+async fn next_lease(
     state: &AppState,
     candidates: &[RouteDeployment],
     excluded: &mut BTreeSet<String>,
     model: &ModelSpec,
+    runtime_filter_trace: &mut Vec<DeploymentEvaluation>,
 ) -> Result<Option<ExecutionLease>, TierExhausted> {
-    acquire_execution_lease(state, candidates, excluded)
+    acquire_execution_lease(state, candidates, excluded, runtime_filter_trace)
         .await
         .map_err(|error| TierExhausted {
             error: Some(error),
@@ -2479,34 +5263,44 @@ async fn acquire_execution_lease(
     state: &AppState,
     candidates: &[RouteDeployment],
     excluded: &mut BTreeSet<String>,
+    runtime_filter_trace: &mut Vec<DeploymentEvaluation>,
 ) -> Result<Option<ExecutionLease>, GatewayError> {
+    let mut selection_trace = Vec::new();
     loop {
         let local = match state.capacity.select(candidates, excluded) {
             Ok(lease) => lease,
-            Err(CapacityError::Exhausted) => return Ok(None),
+            Err(CapacityError::Exhausted(evaluations)) => {
+                selection_trace.extend(evaluations);
+                runtime_filter_trace.extend(selection_trace);
+                return Ok(None);
+            }
             Err(error) => return Err(GatewayError::internal(error)),
         };
+        selection_trace.extend(local.evaluations.clone());
         let deployment_id = local.deployment.id.clone();
         let deployment = local.deployment.clone();
-        match state
+        if let Some(permit) = state
             .shared_circuits
             .acquire(&local.deployment)
             .await
             .map_err(state_backend_unavailable)?
         {
-            Some(permit) => {
-                return Ok(Some(ExecutionLease {
-                    local: Some(local),
-                    deployment,
-                    shared: Arc::clone(&state.shared_circuits),
-                    permit: Some(permit),
-                    tier_size: candidates.len(),
-                }));
-            }
-            None => {
-                excluded.insert(deployment_id);
-            }
+            runtime_filter_trace.extend(selection_trace.clone());
+            return Ok(Some(ExecutionLease {
+                local: Some(local),
+                deployment,
+                shared: Arc::clone(&state.shared_circuits),
+                permit: Some(permit),
+                tier_size: candidates.len(),
+                selection_trace,
+            }));
         }
+        selection_trace.push(DeploymentEvaluation {
+            deployment: deployment_id.clone(),
+            disposition: DeploymentDisposition::Excluded,
+            reasons: vec!["shared_circuit_unavailable".to_owned()],
+        });
+        excluded.insert(deployment_id);
     }
 }
 
@@ -2574,18 +5368,51 @@ fn execution_tiers(
                 order: 0,
                 provider_scope: None,
                 credential_scope: None,
+                enabled: true,
+                credential_available: true,
+                region: None,
+                residency: Vec::new(),
+                tenant_allowlist: Vec::new(),
+                quota_usage_millis: None,
+                accept_new_requests: true,
+                binding_grace_until_unix: None,
             }],
         }]);
     }
-    let mut result = Vec::new();
-    let mut visited = BTreeSet::new();
-    append_execution_tier(
-        &state.route,
-        &decision.tier,
-        state.max_fallback_depth,
-        &mut visited,
-        &mut result,
-    )?;
+    let tier_specs = state
+        .route
+        .tiers
+        .iter()
+        .map(|tier| FallbackTierSpec {
+            tier: tier.tier.clone(),
+            fallbacks: tier
+                .fallbacks
+                .iter()
+                .chain(tier.fallbacks_by_error.values().flatten())
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let plan = plan_fallback_tiers(&tier_specs, &decision.tier, state.max_fallback_depth)
+        .map_err(|error| GatewayError::internal(format!("invalid routing plan: {error:?}")))?;
+    let mut result = plan
+        .tiers
+        .iter()
+        .map(|tier_name| {
+            let tier = state
+                .route
+                .tiers
+                .iter()
+                .find(|tier| tier.tier == *tier_name)
+                .expect("routing plan only contains configured tiers");
+            ExecutionTier {
+                tier: tier.tier.clone(),
+                deployments: tier.effective_deployments(),
+            }
+        })
+        .collect::<Vec<_>>();
     if decision.conversation_id.is_some()
         && decision.migration_boundary != Some(MigrationBoundary::TerminalProviderFailure)
     {
@@ -2603,32 +5430,40 @@ fn execution_tiers(
     Ok(result)
 }
 
-fn append_execution_tier(
-    route: &RouteConfig,
+fn execution_tier(
+    state: &AppState,
+    decision: &RouteDecision,
     tier_name: &str,
-    remaining: u8,
-    visited: &mut BTreeSet<String>,
-    result: &mut Vec<ExecutionTier>,
-) -> Result<(), GatewayError> {
-    if !visited.insert(tier_name.to_owned()) {
-        return Ok(());
+) -> Result<ExecutionTier, GatewayError> {
+    if decision.reason == "explicit_model" {
+        return execution_tiers(state, decision).and_then(|tiers| {
+            tiers
+                .into_iter()
+                .next()
+                .ok_or_else(|| GatewayError::internal("explicit model has no execution tier"))
+        });
     }
-    let tier = route
+    let configured = state
+        .route
         .tiers
         .iter()
         .find(|tier| tier.tier == tier_name)
-        .ok_or_else(|| GatewayError::internal(format!("selected tier {tier_name} disappeared")))?;
-    result.push(ExecutionTier {
-        tier: tier.tier.clone(),
-        deployments: tier.effective_deployments(),
-    });
-    if remaining == 0 {
-        return Ok(());
+        .ok_or_else(|| GatewayError::internal(format!("unknown fallback tier {tier_name}")))?;
+    let mut deployments = configured.effective_deployments();
+    if decision.conversation_id.is_some()
+        && decision.migration_boundary != Some(MigrationBoundary::TerminalProviderFailure)
+    {
+        deployments.retain(|deployment| deployment.model == decision.model);
     }
-    for fallback in &tier.fallbacks {
-        append_execution_tier(route, fallback, remaining - 1, visited, result)?;
+    if deployments.is_empty() {
+        return Err(GatewayError::internal(
+            "session-bound model has no configured deployment",
+        ));
     }
-    Ok(())
+    Ok(ExecutionTier {
+        tier: configured.tier.clone(),
+        deployments,
+    })
 }
 
 fn endpoint_for_deployment(
@@ -2636,12 +5471,6 @@ fn endpoint_for_deployment(
     deployment: &RouteDeployment,
     model: &ModelSpec,
 ) -> Result<(EndpointPlan, String), GatewayError> {
-    if model.api != WireApi::OpenAiChat {
-        return Err(GatewayError::bad_request(
-            "unsupported_wire_api",
-            "Gateway currently requires open_ai_chat",
-        ));
-    }
     let provider = state
         .catalog
         .provider(&model.provider)
@@ -2664,11 +5493,185 @@ fn endpoint_for_deployment(
         }
         endpoint.url = override_url;
     }
-    let url = format!(
-        "{}/chat/completions",
-        endpoint.url.as_str().trim_end_matches('/')
-    );
+    let path = match model.api {
+        WireApi::OpenAiChat => "chat/completions",
+        WireApi::OpenAiResponses => "responses",
+        WireApi::AnthropicMessages => "messages",
+        _ => {
+            return Err(GatewayError::bad_request(
+                "unsupported_wire_api",
+                "custom provider APIs require an installed transport adapter",
+            ));
+        }
+    };
+    let url = format!("{}/{path}", endpoint.url.as_str().trim_end_matches('/'));
     Ok((endpoint, url))
+}
+
+fn provider_request(request: &Value, model: &ModelSpec) -> Result<Value, GatewayError> {
+    match model.api {
+        WireApi::OpenAiChat => {
+            let mut request = request.clone();
+            rewrite_request(&mut request, model);
+            Ok(request)
+        }
+        WireApi::OpenAiResponses => {
+            reject_non_chat_stream(request, "open_ai_responses")?;
+            let normalized = from_openai_chat(request)
+                .map_err(|error| GatewayError::bad_request("protocol_conversion_failed", error))?;
+            let (mut request, _) = to_openai_responses(&normalized, LossPolicy::Reject)
+                .map_err(|error| GatewayError::bad_request("protocol_semantic_loss", error))?;
+            request["model"] = model.upstream_id.clone().into();
+            Ok(request)
+        }
+        WireApi::AnthropicMessages => {
+            reject_non_chat_stream(request, "anthropic_messages")?;
+            let normalized = from_openai_chat(request)
+                .map_err(|error| GatewayError::bad_request("protocol_conversion_failed", error))?;
+            let (mut request, _) = to_anthropic_messages(&normalized, LossPolicy::Reject)
+                .map_err(|error| GatewayError::bad_request("protocol_semantic_loss", error))?;
+            request["model"] = model.upstream_id.clone().into();
+            Ok(request)
+        }
+        _ => Err(GatewayError::bad_request(
+            "unsupported_wire_api",
+            "custom provider APIs require an installed transport adapter",
+        )),
+    }
+}
+
+fn reject_non_chat_stream(request: &Value, api: &str) -> Result<(), GatewayError> {
+    if request.get("stream").and_then(Value::as_bool) == Some(true) {
+        return Err(GatewayError::bad_request(
+            "unsupported_provider_streaming",
+            format!("{api} transport does not support streaming handoff"),
+        ));
+    }
+    Ok(())
+}
+
+fn provider_response_to_chat(body: Value, api: &WireApi) -> Result<Value, GatewayError> {
+    match api {
+        WireApi::OpenAiChat => Ok(body),
+        WireApi::OpenAiResponses => Ok(responses_provider_to_chat(&body)),
+        WireApi::AnthropicMessages => Ok(anthropic_provider_to_chat(&body)),
+        _ => Err(GatewayError::internal(
+            "custom provider response has no transport adapter",
+        )),
+    }
+}
+
+fn responses_provider_to_chat(body: &Value) -> Value {
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    if let Some(output) = body.get("output").and_then(Value::as_array) {
+        for item in output {
+            match item.get("type").and_then(Value::as_str) {
+                Some("message") => {
+                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                        for part in parts {
+                            if part.get("type").and_then(Value::as_str) == Some("output_text")
+                                && let Some(value) = part.get("text").and_then(Value::as_str)
+                            {
+                                text.push_str(value);
+                            }
+                        }
+                    }
+                }
+                Some("reasoning") => {
+                    if let Some(parts) = item.get("summary").and_then(Value::as_array) {
+                        for part in parts {
+                            if let Some(value) = part.get("text").and_then(Value::as_str) {
+                                reasoning.push_str(value);
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => tool_calls.push(json!({
+                    "id": item.get("call_id").cloned().unwrap_or(Value::Null),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name").cloned().unwrap_or(Value::Null),
+                        "arguments": item.get("arguments").cloned().unwrap_or_else(|| "{}".into())
+                    }
+                })),
+                _ => {}
+            }
+        }
+    }
+    let finish_reason = if tool_calls.is_empty() {
+        "stop"
+    } else {
+        "tool_calls"
+    };
+    let mut message = json!({"role": "assistant", "content": text});
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = reasoning.into();
+    }
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = tool_calls.into();
+    }
+    json!({
+        "id": body.get("id").cloned().unwrap_or(Value::Null),
+        "object": "chat.completion",
+        "model": body.get("model").cloned().unwrap_or(Value::Null),
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": {
+            "prompt_tokens": body.pointer("/usage/input_tokens").cloned().unwrap_or(json!(0)),
+            "completion_tokens": body.pointer("/usage/output_tokens").cloned().unwrap_or(json!(0)),
+            "total_tokens": body.pointer("/usage/total_tokens").cloned().unwrap_or(json!(0))
+        }
+    })
+}
+
+fn anthropic_provider_to_chat(body: &Value) -> Value {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    if let Some(content) = body.get("content").and_then(Value::as_array) {
+        for part in content {
+            match part.get("type").and_then(Value::as_str) {
+                Some("text") => text.push_str(part.get("text").and_then(Value::as_str).unwrap_or("")),
+                Some("tool_use") => tool_calls.push(json!({
+                    "id": part.get("id").cloned().unwrap_or(Value::Null),
+                    "type": "function",
+                    "function": {
+                        "name": part.get("name").cloned().unwrap_or(Value::Null),
+                        "arguments": part.get("input").cloned().unwrap_or_else(|| json!({})).to_string()
+                    }
+                })),
+                _ => {}
+            }
+        }
+    }
+    let finish_reason = if tool_calls.is_empty() {
+        "stop"
+    } else {
+        "tool_calls"
+    };
+    let mut message = json!({"role": "assistant", "content": text});
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = tool_calls.into();
+    }
+    let input = body
+        .pointer("/usage/input_tokens")
+        .cloned()
+        .unwrap_or(json!(0));
+    let output = body
+        .pointer("/usage/output_tokens")
+        .cloned()
+        .unwrap_or(json!(0));
+    let total = input
+        .as_u64()
+        .unwrap_or(0)
+        .saturating_add(output.as_u64().unwrap_or(0));
+    json!({
+        "id": body.get("id").cloned().unwrap_or(Value::Null),
+        "object": "chat.completion",
+        "model": body.get("model").cloned().unwrap_or(Value::Null),
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": {"prompt_tokens": input, "completion_tokens": output, "total_tokens": total}
+    })
 }
 
 fn routed_setup_failure(
@@ -2686,6 +5689,7 @@ fn routed_setup_failure(
             .expect("route decision model exists")
             .clone(),
         fallback_depth: 0,
+        runtime_filter_trace: Vec::new(),
     }
 }
 
@@ -2745,6 +5749,7 @@ fn upstream_error(
             status.map_or_else(|| "unavailable".to_owned(), |value| value.to_string()),
             attempts.len()
         ),
+        request_id: None,
         decision_id: None,
     }
 }
@@ -2785,18 +5790,35 @@ fn normalize_max_tokens(object: &mut serde_json::Map<String, Value>, model: &Mod
 
 fn resolve_headers(endpoint: &EndpointPlan) -> Result<BTreeMap<String, String>, GatewayError> {
     let mut headers = endpoint.public_headers.clone();
-    if let AuthPlan::ApiKeyEnv {
-        env: variable,
-        header,
-        prefix,
-    } = &endpoint.auth
-    {
-        let secret = env::var(variable).map_err(|_| {
-            GatewayError::internal(format!(
-                "credential environment variable {variable} is not set"
-            ))
-        })?;
-        headers.insert(header.clone(), format!("{prefix}{secret}"));
+    match &endpoint.auth {
+        AuthPlan::ApiKeyEnv {
+            env: variable,
+            header,
+            prefix,
+        }
+        | AuthPlan::AmbientEnv {
+            env: variable,
+            header,
+            prefix,
+        } => {
+            let secret = env::var(variable)
+                .map_err(|_| GatewayError::internal("credential environment is unavailable"))?;
+            headers.insert(header.clone(), format!("{prefix}{secret}"));
+        }
+        AuthPlan::OAuthBearerFile {
+            path,
+            header,
+            prefix,
+        } => {
+            let secret = fs::read_to_string(path)
+                .map_err(|_| GatewayError::internal("OAuth credential file is unavailable"))?;
+            let secret = secret.trim();
+            if secret.is_empty() {
+                return Err(GatewayError::internal("OAuth credential file is empty"));
+            }
+            headers.insert(header.clone(), format!("{prefix}{secret}"));
+        }
+        AuthPlan::None => {}
     }
     Ok(headers)
 }
@@ -2804,12 +5826,18 @@ fn resolve_headers(endpoint: &EndpointPlan) -> Result<BTreeMap<String, String>, 
 async fn non_stream_response(
     state: AppState,
     execution: UpstreamExecution,
-    decision_id: String,
-    decision: RouteDecision,
-    messages_hash: String,
-    governance: RequestGovernance,
-    headers: HeaderMap,
+    context: ResponseContext,
 ) -> Result<Response, GatewayError> {
+    let ResponseContext {
+        decision_id,
+        decision,
+        governance,
+        record,
+        headers,
+        quota,
+        quota_input_tokens,
+        budget,
+    } = context;
     let UpstreamExecution {
         response,
         elapsed_ms,
@@ -2817,7 +5845,7 @@ async fn non_stream_response(
         lease,
         model,
         fallback_depth,
-        ..
+        tier: _,
     } = execution;
     let deployment = lease.deployment.id.clone();
     let mut body: Value = match response.json().await {
@@ -2827,9 +5855,26 @@ async fn non_stream_response(
             return Err(GatewayError::internal(error));
         }
     };
+    body = match provider_response_to_chat(body, &model.api) {
+        Ok(body) => body,
+        Err(error) => {
+            lease.complete(Err(UpstreamErrorKind::ServerError)).await?;
+            return Err(error);
+        }
+    };
     lease.complete(Ok(())).await?;
     let usage = parse_usage(&body);
+    settle_quota_usage(&quota, usage, quota_input_tokens, attempts.len()).await;
     let cost = calculate_cost(&model, usage)?;
+    observe_execution_metrics(
+        &state.metrics,
+        elapsed_ms,
+        elapsed_ms,
+        fallback_depth,
+        cost.as_ref(),
+        Some(&decision_id),
+    );
+    budget.settle(&state, cost.as_ref(), &attempts).await;
     commit_task_binding(&state, &governance, &decision, &decision.tier, &model.id).await?;
     let disclosure = disclosure(&decision_id, &decision, &model, cost.clone());
     if let Some(object) = body.as_object_mut() {
@@ -2843,23 +5888,20 @@ async fn non_stream_response(
         decision_id,
         decision,
         &model,
-        messages_hash,
         &governance,
-        ExecutionRecord {
-            ok: true,
-            stream: false,
-            upstream_status: 200,
-            upstream_latency_ms: elapsed_ms,
+        &record,
+        ExecutionRecord::success(
+            false,
+            elapsed_ms,
             usage,
             cost,
-            usage_unavailable: usage.is_none(),
             attempts,
-            error_kind: None,
             deployment,
             fallback_depth,
-        },
+        ),
     )?;
     store_record(&state, record).await?;
+    let _ = quota.release().await;
     let mut response = Json(body).into_response();
     *response.headers_mut() = headers;
     response.headers_mut().insert(
@@ -2869,16 +5911,23 @@ async fn non_stream_response(
     Ok(response)
 }
 
+const STREAM_TAIL_BYTES: usize = 64;
+
 fn stream_response(
     state: AppState,
     execution: UpstreamExecution,
-    decision_id: String,
-    decision: RouteDecision,
-    messages_hash: String,
-    governance: RequestGovernance,
-    headers: HeaderMap,
+    context: ResponseContext,
 ) -> Response {
-    const TAIL_BYTES: usize = 64;
+    let ResponseContext {
+        decision_id,
+        decision,
+        governance,
+        record,
+        headers,
+        quota,
+        quota_input_tokens,
+        budget,
+    } = context;
     let UpstreamExecution {
         response,
         elapsed_ms,
@@ -2886,47 +5935,49 @@ fn stream_response(
         lease,
         model,
         fallback_depth,
-        ..
+        tier: _,
     } = execution;
     let deployment = lease.deployment.id.clone();
     let lease = Arc::new(StdMutex::new(Some(lease)));
-    let stream_lease = Arc::clone(&lease);
     let captured = Arc::new(StdMutex::new(StreamCapture::default()));
-    let capture = Arc::clone(&captured);
-    let upstream_stream = response.bytes_stream().map(move |item| {
-        if item.is_err()
-            && let Some(lease) = stream_lease
-                .lock()
-                .expect("capacity lease lock poisoned")
-                .take()
-        {
-            tokio::spawn(async move {
-                let _ = lease.complete(Err(UpstreamErrorKind::Transport)).await;
-            });
-        }
-        item.map(|bytes| {
-            let mut capture = capture.lock().expect("stream capture lock poisoned");
-            capture.complete.extend_from_slice(bytes.as_ref());
-            capture.tail.extend_from_slice(bytes.as_ref());
-            let emit = capture.tail.len().saturating_sub(TAIL_BYTES);
-            Bytes::from(capture.tail.drain(..emit).collect::<Vec<_>>())
-        })
-        .map_err(|error| Box::new(error) as BoxError)
-    });
+    let stream_started = Instant::now();
+    let upstream_stream = capture_upstream_stream(
+        response,
+        Arc::clone(&lease),
+        Arc::clone(&captured),
+        state.metrics.ttft_ms.clone(),
+        elapsed_ms,
+        stream_started,
+    );
     let final_stream = stream::once(async move {
-        let completed_lease = lease.lock().expect("capacity lease lock poisoned").take();
-        if let Some(lease) = completed_lease {
-            lease
-                .complete(Ok(()))
-                .await
-                .map_err(|error| Box::new(std::io::Error::other(error.message)) as BoxError)?;
+        complete_stream_lease(&lease).await?;
+        let (complete, tail, failed) = captured_stream_parts(&captured);
+        if failed {
+            observe_stream_execution_metrics(
+                &state.metrics,
+                elapsed_ms.saturating_add(stream_started.elapsed().as_millis()),
+                fallback_depth,
+                None,
+                &decision_id,
+            );
+            state
+                .metrics
+                .stream_failures
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = quota.release().await;
+            return Ok::<Bytes, BoxError>(Bytes::new());
         }
-        let (complete, tail) = {
-            let capture = captured.lock().expect("stream capture lock poisoned");
-            (capture.complete.clone(), capture.tail.clone())
-        };
         let usage = parse_stream_usage(&complete);
+        settle_quota_usage(&quota, usage, quota_input_tokens, attempts.len()).await;
         let cost = calculate_cost(&model, usage).ok().flatten();
+        observe_stream_execution_metrics(
+            &state.metrics,
+            elapsed_ms.saturating_add(stream_started.elapsed().as_millis()),
+            fallback_depth,
+            cost.as_ref(),
+            &decision_id,
+        );
+        budget.settle(&state, cost.as_ref(), &attempts).await;
         commit_task_binding(&state, &governance, &decision, &decision.tier, &model.id)
             .await
             .map_err(|error| Box::new(std::io::Error::other(error.message)) as BoxError)?;
@@ -2936,21 +5987,17 @@ fn stream_response(
             decision_id,
             decision,
             &model,
-            messages_hash,
             &governance,
-            ExecutionRecord {
-                ok: true,
-                stream: true,
-                upstream_status: 200,
-                upstream_latency_ms: elapsed_ms,
+            &record,
+            ExecutionRecord::success(
+                true,
+                elapsed_ms,
                 usage,
                 cost,
-                usage_unavailable: usage.is_none(),
                 attempts,
-                error_kind: None,
                 deployment,
                 fallback_depth,
-            },
+            ),
         );
         if let Ok(record) = record {
             store_record(&state, record)
@@ -2961,6 +6008,7 @@ fn stream_response(
             .metrics
             .streams_completed
             .fetch_add(1, Ordering::Relaxed);
+        let _ = quota.release().await;
         let serialized = serde_json::to_string(&disclosure).unwrap_or_else(|_| "{}".to_owned());
         let mut suffix = remove_sse_done(tail);
         suffix.extend_from_slice(
@@ -2968,7 +6016,89 @@ fn stream_response(
         );
         Ok::<Bytes, BoxError>(Bytes::from(suffix))
     });
-    let mut response = Response::new(Body::from_stream(upstream_stream.chain(final_stream)));
+    let body = Body::from_stream(upstream_stream.chain(final_stream));
+    stream_body_response(body, headers)
+}
+
+async fn complete_stream_lease(
+    lease: &Arc<StdMutex<Option<ExecutionLease>>>,
+) -> Result<(), BoxError> {
+    let completed = lease.lock().expect("capacity lease lock poisoned").take();
+    if let Some(lease) = completed {
+        lease
+            .complete(Ok(()))
+            .await
+            .map_err(|error| Box::new(std::io::Error::other(error.message)) as BoxError)?;
+    }
+    Ok(())
+}
+
+fn observe_stream_execution_metrics(
+    metrics: &GatewayMetrics,
+    request_duration_ms: u128,
+    fallback_depth: u8,
+    cost: Option<&CostBreakdown>,
+    trace_id: &str,
+) {
+    observe_execution_metrics(
+        metrics,
+        request_duration_ms,
+        request_duration_ms,
+        fallback_depth,
+        cost,
+        Some(trace_id),
+    );
+}
+
+fn captured_stream_parts(captured: &Arc<StdMutex<StreamCapture>>) -> (Vec<u8>, Vec<u8>, bool) {
+    let capture = captured.lock().expect("stream capture lock poisoned");
+    (
+        capture.complete.clone(),
+        capture.tail.clone(),
+        capture.failed,
+    )
+}
+
+fn capture_upstream_stream(
+    response: reqwest::Response,
+    stream_lease: Arc<StdMutex<Option<ExecutionLease>>>,
+    capture: Arc<StdMutex<StreamCapture>>,
+    ttft: Histogram,
+    upstream_elapsed_ms: u128,
+    stream_started: Instant,
+) -> impl futures_util::Stream<Item = Result<Bytes, BoxError>> {
+    response.bytes_stream().map(move |item| {
+        if item.is_err() {
+            capture.lock().expect("stream capture lock poisoned").failed = true;
+            if let Some(lease) = stream_lease
+                .lock()
+                .expect("capacity lease lock poisoned")
+                .take()
+            {
+                tokio::spawn(async move {
+                    let _ = lease.complete(Err(UpstreamErrorKind::Transport)).await;
+                });
+            }
+        }
+        item.map(|bytes| {
+            let mut capture = capture.lock().expect("stream capture lock poisoned");
+            if !bytes.is_empty() && !capture.first_chunk_observed {
+                capture.first_chunk_observed = true;
+                ttft.observe(duration_metric_value(
+                    upstream_elapsed_ms.saturating_add(stream_started.elapsed().as_millis()),
+                ));
+            }
+            capture.complete.extend_from_slice(bytes.as_ref());
+            capture.tail.extend_from_slice(bytes.as_ref());
+            let emit = capture.tail.len().saturating_sub(STREAM_TAIL_BYTES);
+            Bytes::from(capture.tail.drain(..emit).collect::<Vec<_>>())
+        })
+        .map_err(|error| Box::new(error) as BoxError)
+    })
+}
+
+fn stream_body_response(body: Body, headers: HeaderMap) -> Response {
+    let mut response = Response::new(body);
     *response.headers_mut() = headers;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -3027,8 +6157,8 @@ fn build_record(
     decision_id: String,
     decision: RouteDecision,
     model: &ModelSpec,
-    messages_hash: String,
     governance: &RequestGovernance,
+    record: &RecordSeed,
     execution: ExecutionRecord,
 ) -> Result<DecisionRecord, GatewayError> {
     let evidence = CatalogEvidence::from_catalog(catalog, &model.id, PriceSource::Catalog)
@@ -3048,14 +6178,49 @@ fn build_record(
         )),
         _ => None,
     };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = unix_seconds();
     let expires_at_unix_s = now
         .saturating_add(u64::from(governance.policy.retention_days).saturating_mul(24 * 60 * 60));
     let retained = governance.policy.recording != RecordingMode::None;
+    let semantic_task = semantic_task_name(&decision).to_owned();
+    let policy_filters = full_policy_filters(record);
+    let routing_trace = RoutingTrace::current_admission_summary(
+        decision.model.to_string(),
+        decision.alternatives.iter().map(ToString::to_string),
+        decision
+            .admission
+            .excluded
+            .iter()
+            .map(|excluded| (excluded.model.to_string(), excluded.reasons.clone())),
+        decision.reason.clone(),
+    )
+    .with_decisions(decision.cascade_trace.clone())
+    .with_runtime_filters(execution.runtime_filter_trace.clone())
+    .with_policy_filters(policy_filters);
+    let eligible_candidates = decision
+        .admission
+        .eligible
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut context = DecisionRecordContext::deterministic(
+        &record.request_id,
+        RevisionSet {
+            catalog: evidence.content_hash.to_string(),
+            route: record.route_revision.clone(),
+            feature_schema: FEATURE_SCHEMA_VERSION,
+            policy: "current_gateway:v1".to_owned(),
+        },
+        record.features.clone(),
+        routing_trace,
+        eligible_candidates,
+    );
+    context.propensity_millionths = record
+        .exploration
+        .as_ref()
+        .map(|evidence| evidence.propensity_millionths);
     Ok(DecisionRecord {
+        context: Some(context),
         decision_id,
         trace_turn: decision.trace_turn,
         trace_id: decision.trace_id,
@@ -3075,7 +6240,11 @@ fn build_record(
             && governance.policy.allow_remote_judge
             && !governance.compatibility_mode,
         expires_at_unix_s,
-        messages_hash,
+        messages_hash: record.messages_hash.clone(),
+        created_at_unix_s: now,
+        redaction_profile: "metadata-v1".to_owned(),
+        semantic_task,
+        exploration: record.exploration.clone(),
         route_id: decision.route_id,
         tier: decision.tier,
         reason: decision.reason,
@@ -3084,11 +6253,42 @@ fn build_record(
         requirement: decision.requirement,
         admission: decision.admission,
         execution,
+        artifact: record.artifact.clone(),
         override_record: None,
         outcome_signals: Vec::new(),
         tenant_generation: governance.tenant_generation,
         task_generation: governance.task_generation,
     })
+}
+
+fn full_trace_filter(filter: &str, reason: &str) -> RuleEvaluation {
+    RuleEvaluation {
+        rule: filter.to_owned(),
+        outcome: RuleOutcome::Selected,
+        reason: reason.to_owned(),
+    }
+}
+
+fn full_policy_filters(record: &RecordSeed) -> Vec<RuleEvaluation> {
+    let mut filters = vec![
+        full_trace_filter("tenant_policy", "admitted"),
+        full_trace_filter("quota", "admitted"),
+        full_trace_filter("budget", "admitted"),
+    ];
+    if let Some(artifact) = &record.artifact {
+        filters.push(full_trace_filter(
+            "artifact",
+            match artifact.source {
+                DecisionSource::Rule => "rule_fallback",
+                DecisionSource::ActiveArtifact => "active",
+                DecisionSource::CandidateCanary => "candidate_canary",
+            },
+        ));
+    }
+    if record.exploration.is_some() {
+        filters.push(full_trace_filter("exploration", "authorized"));
+    }
+    filters
 }
 
 fn disclosure(
@@ -3113,11 +6313,13 @@ fn disclosure(
 }
 
 fn decision_headers(
+    request_id: &str,
     decision_id: &str,
     decision: &RouteDecision,
 ) -> Result<HeaderMap, GatewayError> {
     let mut headers = HeaderMap::new();
     for (name, value) in [
+        ("x-urouter-request-id", request_id),
         ("x-urouter-decision-id", decision_id),
         ("x-urouter-tier", decision.tier.as_str()),
         ("x-urouter-model", decision.model.as_str()),
@@ -3164,7 +6366,9 @@ impl RecordStore {
             && let Ok(contents) = tokio::fs::read_to_string(path).await
         {
             for line in contents.lines() {
-                if let Ok(mut record) = serde_json::from_str::<DecisionRecord>(line) {
+                if let Ok(mut record) = serde_json::from_str::<DecisionRecord>(line)
+                    .map(DecisionRecord::normalize_after_load)
+                {
                     normalize_replayed_record(&mut record);
                     if record_expired(&record) {
                         expired_replayed = true;
@@ -3469,14 +6673,11 @@ async fn store_record(state: &AppState, mut record: DecisionRecord) -> Result<()
     {
         record.outcome_signals = signals;
     }
-    if let Some(shared) = &state.shared_state {
-        shared
-            .put_record(&record, state.records.capacity)
-            .await
-            .map_err(state_backend_unavailable)?;
-    }
-    state.records.append(record).await;
-    Ok(())
+    state
+        .record_repository
+        .put(record)
+        .await
+        .map_err(record_repository_error)
 }
 
 fn evaluate_override(
@@ -3528,18 +6729,35 @@ fn override_kind(route: &RouteConfig, parent: &str, chosen: &str) -> Option<Stri
     })
 }
 
+static ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn next_request_id() -> String {
+    next_id("req")
+}
+
 fn next_decision_id() -> String {
+    next_id("dec")
+}
+
+fn next_id(prefix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("dec_{nanos:x}")
+    let sequence = u128::from(ID_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    format!("{prefix}_{:x}", nanos.saturating_add(sequence))
+}
+
+fn attempt_id(request_id: &str, attempt: u8) -> String {
+    format!("{request_id}:attempt:{attempt}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::to_bytes, http::Request};
     use serde_json::json;
+    use tower::ServiceExt;
 
     fn model() -> ModelSpec {
         let catalog =
@@ -3552,6 +6770,27 @@ mod tests {
 
     fn route() -> RouteConfig {
         serde_json::from_str(include_str!("../../../gateway/route.json")).unwrap()
+    }
+
+    fn assert_nonempty_cascade_trace(response: &Value) {
+        assert!(
+            response["routing_trace"]["decisions"]
+                .as_array()
+                .is_some_and(|events| !events.is_empty())
+        );
+    }
+
+    #[test]
+    fn histogram_uses_cumulative_buckets() {
+        let histogram = Histogram::new(&[10, 100]);
+        histogram.observe(5);
+        histogram.observe(50);
+        let mut output = String::new();
+        histogram.render(&mut output, "test_duration", "test histogram");
+        assert!(output.contains("test_duration_bucket{le=\"10\"} 1"));
+        assert!(output.contains("test_duration_bucket{le=\"100\"} 2"));
+        assert!(output.contains("test_duration_bucket{le=\"+Inf\"} 2"));
+        assert!(output.contains("test_duration_sum 55"));
     }
 
     fn successful_execution() -> ExecutionRecord {
@@ -3567,6 +6806,7 @@ mod tests {
             error_kind: None,
             deployment: String::new(),
             fallback_depth: 0,
+            runtime_filter_trace: Vec::new(),
         }
     }
 
@@ -3590,6 +6830,709 @@ mod tests {
     }
 
     #[test]
+    fn request_identity_is_disclosed_on_success_and_error() {
+        let catalog =
+            CatalogSnapshot::from_json_str(include_str!("../../../catalog/catalog.json")).unwrap();
+        let decision = route()
+            .decide(&catalog, &json!({"model": "urouter/auto", "messages": []}))
+            .unwrap();
+        let headers = decision_headers("req_test", "dec_test", &decision).unwrap();
+        assert_eq!(headers["x-urouter-request-id"], "req_test");
+        assert_eq!(headers["x-urouter-decision-id"], "dec_test");
+
+        let response = GatewayError::bad_request("test_error", "invalid")
+            .with_request_id("req_error")
+            .into_response();
+        assert_eq!(response.headers()["x-urouter-request-id"], "req_error");
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_is_tenant_scoped_and_rejects_request_drift() {
+        let state = test_state_with_route(route()).await;
+        let headers = HeaderMap::from_iter([(
+            HeaderName::from_static("idempotency-key"),
+            HeaderValue::from_static("operation-123"),
+        )]);
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let tenant_a = tenant_key("tenant-a");
+        let key_hash = idempotency_key_hash(&tenant_a, "operation-123");
+        assert!(!key_hash.contains("operation-123"));
+        assert_ne!(
+            key_hash,
+            idempotency_key_hash(&tenant_key("tenant-b"), "operation-123")
+        );
+        let first = resolve_request_id(
+            &state,
+            &headers,
+            &tenant_a,
+            &request,
+            "req_first".to_owned(),
+        )
+        .await
+        .unwrap();
+        let reused = resolve_request_id(
+            &state,
+            &headers,
+            &tenant_a,
+            &request,
+            "req_second".to_owned(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, "req_first");
+        assert_eq!(reused, first);
+
+        let conflict = resolve_request_id(
+            &state,
+            &headers,
+            &tenant_a,
+            &json!({"model": "urouter/auto", "messages": []}),
+            "req_conflict".to_owned(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflict.status, StatusCode::CONFLICT);
+        assert_eq!(conflict.code, "idempotency_conflict");
+
+        let other_tenant = resolve_request_id(
+            &state,
+            &headers,
+            &tenant_key("tenant-b"),
+            &request,
+            "req_other_tenant".to_owned(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(other_tenant, "req_other_tenant");
+    }
+
+    #[test]
+    fn configuration_dry_run_report_pins_revisions_without_credentials() {
+        let catalog =
+            CatalogSnapshot::from_json_str(include_str!("../../../catalog/catalog.json")).unwrap();
+        let route = route();
+        route.validate(&catalog).unwrap();
+        let mut args = Args::parse_from(["urouter-gateway", "--dry-run"]);
+        args.catalog = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../catalog/catalog.json");
+        let report = dry_run_report(
+            &args,
+            include_bytes!("../../../catalog/catalog.json"),
+            &catalog,
+            &route,
+        );
+        assert_eq!(report.schema_version, 1);
+        assert!(
+            report.valid,
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap()
+        );
+        assert_eq!(report.route.as_ref().unwrap()["id"], "urouter/auto");
+        assert!(
+            report.route.as_ref().unwrap()["revision"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert_eq!(report.checks.len(), 16);
+        assert_eq!(report.checks[12].status, DryRunStatus::Pass);
+    }
+
+    #[test]
+    fn configuration_dry_run_returns_structured_failure() {
+        let args = Args::parse_from([
+            "urouter-gateway",
+            "--dry-run",
+            "--catalog",
+            "missing-catalog.json",
+        ]);
+        let report = configuration_dry_run(&args);
+        assert!(!report.valid);
+        assert_eq!(report.checks.len(), 16);
+        assert_eq!(report.errors[0].code, "catalog_read_failed");
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| check.status == DryRunStatus::Blocked)
+        );
+    }
+
+    #[test]
+    fn openapi_contract_is_valid_and_covers_registered_paths() {
+        let contract: Value =
+            serde_json::from_str(include_str!("../../../gateway/openapi.json")).unwrap();
+        assert_eq!(contract["openapi"], "3.1.0");
+        let paths = contract["paths"].as_object().unwrap();
+        for path in [
+            "/health",
+            "/health/live",
+            "/health/ready",
+            "/openapi.json",
+            "/v1/models",
+            "/v1/catalog",
+            "/v1/catalog/refresh",
+            "/v1/catalog/rollback",
+            "/v1/explain",
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/messages",
+            "/v1/artifacts",
+            "/v1/artifacts/promote",
+            "/v1/artifacts/rollback",
+            "/v1/artifacts/kill",
+            "/v1/artifacts/rollout",
+            "/v1/artifacts/observe",
+            "/v1/adapters/{harness}/chat/completions",
+            "/v1/decisions",
+            "/v1/decisions/{id}",
+            "/v1/tasks/{id}/records",
+            "/v1/tenant/records",
+            "/v1/feedback",
+            "/v1/feedback/{turn}",
+            "/metrics",
+            "/v1/tiers",
+            "/v1/tasks/{id}/binding",
+            "/v1/sessions/{conversation}/{branch}/binding",
+        ] {
+            assert!(paths.contains_key(path), "OpenAPI is missing {path}");
+        }
+    }
+
+    #[test]
+    fn protocol_response_translation_preserves_text_tools_usage_and_disclosure() {
+        let chat = json!({
+            "id": "chat-1",
+            "model": "model-a",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "working",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "function": {"name": "lookup", "arguments": "{\"city\":\"Wuhan\"}"}
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12},
+            "urouter": {"tier": "capable"}
+        });
+        let responses = chat_to_responses(&chat);
+        assert_eq!(responses["object"], "response");
+        assert_eq!(responses["output"][1]["type"], "function_call");
+        assert_eq!(responses["usage"]["total_tokens"], 12);
+        assert_eq!(responses["urouter"]["tier"], "capable");
+        let anthropic = chat_to_anthropic(&chat);
+        assert_eq!(anthropic["type"], "message");
+        assert_eq!(anthropic["content"][1]["type"], "tool_use");
+        assert_eq!(anthropic["stop_reason"], "tool_use");
+        assert_eq!(anthropic["usage"]["output_tokens"], 7);
+    }
+
+    #[test]
+    fn provider_transports_convert_non_stream_requests_and_responses_without_guessing() {
+        let catalog =
+            CatalogSnapshot::from_json_str(include_str!("../../../catalog/catalog.json")).unwrap();
+        let mut model = catalog.models().next().unwrap().clone();
+        model.upstream_id = "provider-model".to_owned();
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {}}}]
+        });
+
+        model.api = WireApi::OpenAiResponses;
+        let responses_request = provider_request(&request, &model).unwrap();
+        assert_eq!(responses_request["model"], "provider-model");
+        assert!(responses_request["input"].is_array());
+        let responses = responses_provider_to_chat(&json!({
+            "id": "resp-1",
+            "model": "provider-model",
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "done"}]},
+                {"type": "function_call", "call_id": "call-1", "name": "lookup", "arguments": "{}"}
+            ],
+            "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
+        }));
+        assert_eq!(responses["choices"][0]["message"]["content"], "done");
+        assert_eq!(responses["choices"][0]["finish_reason"], "tool_calls");
+
+        model.api = WireApi::AnthropicMessages;
+        let anthropic_request = provider_request(&request, &model).unwrap();
+        assert_eq!(anthropic_request["model"], "provider-model");
+        assert!(anthropic_request["messages"].is_array());
+        let anthropic = anthropic_provider_to_chat(&json!({
+            "id": "msg-1",
+            "model": "provider-model",
+            "content": [{"type": "text", "text": "done"}],
+            "usage": {"input_tokens": 3, "output_tokens": 4}
+        }));
+        assert_eq!(anthropic["choices"][0]["message"]["content"], "done");
+        assert_eq!(anthropic["usage"]["total_tokens"], 7);
+
+        let mut stream = request;
+        stream["stream"] = true.into();
+        assert_eq!(
+            provider_request(&stream, &model).unwrap_err().code,
+            "unsupported_provider_streaming"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_policy_overrides_auto_but_falls_back_when_control_revision_changes() {
+        use urouter_artifact::{ArtifactSupportDomain, ExportGates, FeatureWeights, LinearPolicy};
+
+        let mut state = test_state_with_route(route()).await;
+        let catalog_revision = state.catalog.hashes().content.to_string();
+        let route_revision = state.route.revision();
+        let artifact = RouterArtifact::build(
+            FEATURE_SCHEMA_VERSION,
+            catalog_revision.clone(),
+            route_revision.clone(),
+            "sha256:dataset",
+            42,
+            100,
+            LinearPolicy {
+                baseline_tier: "efficient".to_owned(),
+                promoted_tier: "capable".to_owned(),
+                threshold_millis: 1_000,
+                bias_millis: 2_000,
+                weights: FeatureWeights {
+                    input_kib_millis: 0,
+                    message_millis: 0,
+                    tool_millis: 0,
+                    image_millis: 0,
+                    structured_millis: 0,
+                    reasoning_millis: 0,
+                },
+            },
+            ArtifactSupportDomain {
+                semantic_tasks: BTreeSet::from(["greeting".to_owned()]),
+                maximum_input_text_bytes: 10_000,
+                tools_supported: false,
+            },
+            ExportGates {
+                reproducible: true,
+                privacy_passed: true,
+                support_domain_defined: true,
+                counterfactual_passed: true,
+                quality_lower_bound_millionths: 1,
+                maximum_error_rate_millionths: 0,
+                maximum_cost_regression_millionths: 0,
+            },
+        )
+        .unwrap();
+        let controller = ArtifactController::new(
+            Some(artifact),
+            RolloutPolicy {
+                shadow: false,
+                canary_basis_points: 0,
+                minimum_samples: 100,
+                operation_limit: 6,
+            },
+        );
+        state.artifact = Some(ArtifactRuntime {
+            controller,
+            catalog_revision,
+            route_revision,
+        });
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let mut decision = state.route.decide(&state.catalog, &request).unwrap();
+        let applied = apply_artifact_policy(&state, &request, "tenant-a", "task-a", &mut decision)
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.source, DecisionSource::ActiveArtifact);
+        assert_eq!(decision.tier, "capable");
+        assert_eq!(decision.reason, "artifact_active");
+
+        state.artifact.as_mut().unwrap().route_revision = "stale".to_owned();
+        let mut fallback = state.route.decide(&state.catalog, &request).unwrap();
+        let evidence = apply_artifact_policy(&state, &request, "tenant-a", "task-a", &mut fallback)
+            .unwrap()
+            .unwrap();
+        assert_eq!(evidence.source, DecisionSource::Rule);
+        assert_eq!(
+            evidence.fallback_reason.as_deref(),
+            Some("control_revision_changed")
+        );
+        assert_eq!(fallback.tier, "efficient");
+    }
+
+    #[tokio::test]
+    async fn controlled_exploration_requires_explicit_consent_and_records_propensity() {
+        let mut state = test_state_with_route(route()).await;
+        state.exploration = ExplorationPolicy {
+            epsilon_millionths: 1_000_000,
+            maximum_budget_nano_usd: 10_000,
+        };
+        let mut request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "hello"}],
+            "urouter": {
+                "contract_version": 2,
+                "task": {"id": "task-explore"},
+                "agent": {
+                    "harness": "test",
+                    "prompt_profile_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                    "toolset_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                },
+                "call": {"role": "primary"},
+                "trace": {
+                    "turn": "turn-1",
+                    "conversation": "conversation-1",
+                    "branch": "main"
+                },
+                "data_policy": {
+                    "recording": "metadata_only",
+                    "allow_training": true,
+                    "allow_exploration": true,
+                    "exploration_budget_nano_usd": 5000
+                }
+            }
+        });
+        let mut decision = state.route.decide(&state.catalog, &request).unwrap();
+        let evidence = apply_controlled_exploration(
+            &state,
+            &request,
+            "tenant-a",
+            "task-explore",
+            false,
+            &mut decision,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(evidence.epsilon_millionths, 1_000_000);
+        assert!(evidence.propensity_millionths > 0);
+        assert!(evidence.eligible_set.len() >= 2);
+        assert!(evidence.selected_by_exploration);
+
+        request["urouter"]["data_policy"]["allow_exploration"] = json!(false);
+        let mut denied = state.route.decide(&state.catalog, &request).unwrap();
+        assert!(
+            apply_controlled_exploration(
+                &state,
+                &request,
+                "tenant-a",
+                "task-explore",
+                false,
+                &mut denied,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_affinity_prefers_the_last_successful_deployment_and_is_bounded() {
+        let mut configured = route();
+        let model = configured.tiers[0].model.clone();
+        configured.tiers[0].deployments = vec![
+            RouteDeployment {
+                id: "cold".to_owned(),
+                model: model.clone(),
+                base_url: None,
+                weight: 1,
+                order: 0,
+                provider_scope: None,
+                credential_scope: None,
+                enabled: true,
+                credential_available: true,
+                region: None,
+                residency: Vec::new(),
+                tenant_allowlist: Vec::new(),
+                quota_usage_millis: None,
+                accept_new_requests: true,
+                binding_grace_until_unix: None,
+            },
+            RouteDeployment {
+                id: "warm".to_owned(),
+                model,
+                base_url: None,
+                weight: 1,
+                order: 10,
+                provider_scope: None,
+                credential_scope: None,
+                enabled: true,
+                credential_available: true,
+                region: None,
+                residency: Vec::new(),
+                tenant_allowlist: Vec::new(),
+                quota_usage_millis: None,
+                accept_new_requests: true,
+                binding_grace_until_unix: None,
+            },
+        ];
+        let mut state = test_state_with_route(configured).await;
+        state.cache_affinity = CacheAffinityStore::new(1);
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let mut decision = state.route.decide(&state.catalog, &request).unwrap();
+        decision.prompt_profile_hash = Some("sha256:profile-a".to_owned());
+        state
+            .cache_affinity
+            .remember(decision.prompt_profile_hash.as_deref(), "warm");
+        let tier = execution_tier(&state, &decision, "efficient").unwrap();
+        let candidates = filter_deployments(&state, &tier, &decision, "tenant-a", &mut Vec::new());
+        assert_eq!(
+            candidates
+                .iter()
+                .find(|item| item.id == "warm")
+                .unwrap()
+                .order,
+            0
+        );
+        assert!(
+            candidates
+                .iter()
+                .find(|item| item.id == "cold")
+                .unwrap()
+                .order
+                > 0
+        );
+
+        state
+            .cache_affinity
+            .remember(Some("sha256:profile-b"), "cold");
+        assert!(
+            state
+                .cache_affinity
+                .preferred(Some("sha256:profile-a"))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn baseline_http_contract_routes_through_axum() {
+        let app = app_router(test_state_with_route(route()).await);
+
+        let health_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health_response.status(), StatusCode::OK);
+
+        let contract_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(contract_response.status(), StatusCode::OK);
+        assert_eq!(
+            contract_response.headers()[header::CONTENT_TYPE],
+            "application/json"
+        );
+
+        let models_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(models_response.status(), StatusCode::OK);
+        let models_body = to_bytes(models_response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let models_json: Value = serde_json::from_slice(&models_body).unwrap();
+        assert_eq!(models_json["object"], "list");
+        assert!(models_json["data"].as_array().unwrap().iter().any(|model| {
+            model["id"] == "urouter/auto" && model["urouter"]["contract_version"] == 2
+        }));
+
+        let explain_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/explain")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "urouter/auto",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explain_response.status(), StatusCode::OK);
+        let explain_body = to_bytes(explain_response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let explain_json: Value = serde_json::from_slice(&explain_body).unwrap();
+        assert_eq!(explain_json["schema_version"], 1);
+        assert_eq!(explain_json["feature_frame"]["schema_version"], 1);
+        assert_eq!(explain_json["routing_trace"]["completeness"], "summary");
+        assert_nonempty_cascade_trace(&explain_json);
+        assert_eq!(explain_json["route_id"], "urouter/auto");
+        assert!(explain_json["tier"].is_string());
+        assert!(explain_json["model"].is_string());
+
+        let error_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/explain")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "not-a-route",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(error_response.status(), StatusCode::BAD_REQUEST);
+        let error_body = to_bytes(error_response.into_body(), 1_048_576)
+            .await
+            .unwrap();
+        let error_json: Value = serde_json::from_slice(&error_body).unwrap();
+        assert_eq!(error_json["error"]["type"], "urouter_error");
+        assert_eq!(error_json["error"]["code"], "route_rejected");
+    }
+
+    #[tokio::test]
+    async fn readiness_rejects_traffic_while_draining() {
+        let state = test_state_with_route(route()).await;
+        let accepting = Arc::clone(&state.accepting);
+        let app = app_router(state);
+
+        let ready = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+
+        accepting.store(false, Ordering::SeqCst);
+        let draining = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(draining.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn metrics_v2_exposes_histograms_without_high_cardinality_labels() {
+        let state = test_state_with_route(route()).await;
+        observe_execution_metrics(&state.metrics, 25, 20, 1, None, Some("decision-test"));
+        state.metrics.ttft_ms.observe(10);
+        let response = metrics(State(state), HeaderMap::new()).await.unwrap();
+        let body = to_bytes(response.into_body(), 1_048_576).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        for metric in [
+            "urouter_request_duration_milliseconds_bucket",
+            "urouter_upstream_duration_milliseconds_bucket",
+            "urouter_time_to_first_token_milliseconds_bucket",
+            "urouter_request_cost_nano_usd_bucket",
+            "urouter_fallback_depth_bucket",
+        ] {
+            assert!(body.contains(metric), "missing {metric}");
+        }
+        for forbidden in ["tenant=", "task=", "request_id="] {
+            assert!(
+                !body.contains(forbidden),
+                "forbidden metric label {forbidden}"
+            );
+        }
+        assert!(body.contains("# {trace_id=\"decision-test\"} 25"));
+        assert!(body.ends_with("# EOF\n"));
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_drains_an_in_flight_request() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let handler_started = Arc::clone(&started);
+        let app = Router::new().route(
+            "/slow",
+            get(move || {
+                let handler_started = Arc::clone(&handler_started);
+                async move {
+                    handler_started.notify_one();
+                    sleep(Duration::from_millis(50)).await;
+                    "complete"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let server_accepting = Arc::clone(&accepting);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            serve_with_shutdown(listener, app, server_accepting, 1, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+        });
+
+        let response = tokio::spawn(async move {
+            reqwest::get(format!("http://{address}/slow"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        started.notified().await;
+        shutdown_tx.send(()).unwrap();
+        for _ in 0..20 {
+            if !accepting.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!accepting.load(Ordering::SeqCst));
+        assert_eq!(response.await.unwrap(), "complete");
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn zero_shutdown_grace_is_rejected() {
+        let mut args = Args::try_parse_from(["urouter-gateway"]).unwrap();
+        args.shutdown_grace_seconds = 0;
+        let error = validate_args(&args).unwrap_err();
+        assert!(error.to_string().contains("shutdown grace period"));
+    }
+
+    #[test]
     fn redis_authoritative_state_rejects_local_persistence_files() {
         let args = Args::try_parse_from([
             "urouter-gateway",
@@ -3606,18 +7549,66 @@ mod tests {
     fn record_for(request: &Value, decision_id: &str) -> DecisionRecord {
         let catalog =
             CatalogSnapshot::from_json_str(include_str!("../../../catalog/catalog.json")).unwrap();
-        let decision = route().decide(&catalog, request).unwrap();
+        let route = route();
+        let decision = route.decide(&catalog, request).unwrap();
         let model = catalog.model(&decision.model).unwrap();
+        let record = RecordSeed {
+            request_id: "req-test".to_owned(),
+            messages_hash: messages_hash(request).unwrap(),
+            features: FeatureFrame::from_openai_chat(request),
+            route_revision: route.revision(),
+            artifact: None,
+            exploration: None,
+        };
         build_record(
             &catalog,
             decision_id.to_owned(),
             decision,
             model,
-            messages_hash(request).unwrap(),
             &test_governance(),
+            &record,
             successful_execution(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn decision_record_v2_pins_features_candidates_and_revisions() {
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let record = record_for(&request, "decision-v2");
+        let context = record.context.as_ref().unwrap();
+        assert_eq!(context.schema_version, 2);
+        assert_eq!(context.request_id, "req-test");
+        assert_eq!(context.revisions.feature_schema, FEATURE_SCHEMA_VERSION);
+        assert!(context.revisions.catalog.starts_with("sha256:"));
+        assert!(context.revisions.route.starts_with("sha256:"));
+        assert!(!context.eligible_candidates.is_empty());
+        assert!(context.training_complete());
+        assert_eq!(
+            context.trace.completeness,
+            urouter_contracts::TraceCompleteness::Full
+        );
+        assert_eq!(context.trace.policy_filters.len(), 3);
+    }
+
+    #[test]
+    fn legacy_record_remains_readable_but_is_not_training_eligible() {
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "legacy"}],
+            "urouter": {"data_policy": {"allow_training": true}}
+        });
+        let mut value = serde_json::to_value(record_for(&request, "decision-v1")).unwrap();
+        value.as_object_mut().unwrap().remove("context");
+        value["training_eligible"] = Value::Bool(true);
+        let record = serde_json::from_value::<DecisionRecord>(value)
+            .unwrap()
+            .normalize_after_load();
+        assert!(record.context.is_none());
+        assert!(!record.training_eligible);
     }
 
     async fn test_state_with_route(route: RouteConfig) -> AppState {
@@ -3629,11 +7620,19 @@ mod tests {
         for tier in &route.tiers {
             capacity.register(&tier.effective_deployments());
         }
+        let records = RecordStore::open(None, 10, 1, 0).await.unwrap();
+        let route = Arc::new(route);
+        let control = ControlPlane::new(
+            ControlSnapshot::from_validated(Arc::clone(&catalog), Arc::clone(&route)),
+            ControlFailurePolicy::LastGood,
+            None,
+        );
         AppState {
             catalog,
-            route: Arc::new(route),
+            route,
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            records: RecordStore::open(None, 10, 1, 0).await.unwrap(),
+            records: records.clone(),
+            record_repository: MemoryDecisionRecordRepository::new(records),
             feedback: FeedbackStore::default(),
             metrics: GatewayMetrics::default(),
             request_timeout: Duration::from_secs(2),
@@ -3646,10 +7645,51 @@ mod tests {
             shared_circuits: Arc::new(LocalCircuitRepository::default()),
             max_fallback_depth: 5,
             bindings: Arc::new(MemoryTaskBindingRepository::new(100)),
+            idempotency: MemoryIdempotencyRepository::new(100),
+            idempotency_ttl_seconds: 86_400,
+            quota: MemoryQuotaRepository::new(0, 0, 0),
+            quota_default_max_output_tokens: 4_096,
+            budget: MemoryBudgetRepository::new(0, 2_592_000),
             shared_state: None,
             require_tenant_header: false,
             management_auth: ManagementAuth::disabled(),
+            accepting: Arc::new(AtomicBool::new(true)),
+            control,
+            control_source: None,
+            artifact: None,
+            exploration: ExplorationPolicy {
+                epsilon_millionths: 0,
+                maximum_budget_nano_usd: 0,
+            },
+            cache_affinity: CacheAffinityStore::new(100),
         }
+    }
+
+    async fn test_budget_accounting(
+        state: &AppState,
+        tenant_key: &str,
+        request_id: &str,
+        decision: &RouteDecision,
+        request: &Value,
+    ) -> BudgetAccounting {
+        let (lease, input_tokens, output_tokens) =
+            acquire_request_budget(state, tenant_key, request_id, decision, request)
+                .await
+                .unwrap();
+        BudgetAccounting {
+            lease,
+            input_tokens,
+            output_tokens,
+        }
+    }
+
+    async fn execute_test_request(
+        state: &AppState,
+        decision: &RouteDecision,
+        request: &Value,
+        request_id: &str,
+    ) -> Result<UpstreamExecution, RoutedFailure> {
+        execute_routed_upstream(state, decision, request, request_id, &tenant_key("local")).await
     }
 
     fn deployment(id: &str, model: &str, base_url: String, order: u16) -> RouteDeployment {
@@ -3661,6 +7701,14 @@ mod tests {
             order,
             provider_scope: None,
             credential_scope: None,
+            enabled: true,
+            credential_available: true,
+            region: None,
+            residency: Vec::new(),
+            tenant_allowlist: Vec::new(),
+            quota_usage_millis: None,
+            accept_new_requests: true,
+            binding_grace_until_unix: None,
         }
     }
 
@@ -4348,9 +8396,47 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        state_a.idempotency =
+            RedisIdempotencyRepository::new(state_a.shared_state.as_ref().unwrap().clone());
+        state_a.record_repository = RedisDecisionRecordRepository::new(
+            state_a.shared_state.as_ref().unwrap().clone(),
+            state_a.records.clone(),
+            state_a.records.capacity,
+        );
         let mut state_b = test_state_with_route(route()).await;
         state_b.shared_state = Some(RedisSharedState::connect(&url, prefix).await.unwrap());
+        state_b.idempotency =
+            RedisIdempotencyRepository::new(state_b.shared_state.as_ref().unwrap().clone());
+        state_b.record_repository = RedisDecisionRecordRepository::new(
+            state_b.shared_state.as_ref().unwrap().clone(),
+            state_b.records.clone(),
+            state_b.records.capacity,
+        );
         let tenant = tenant_key("shared-state-tenant");
+        let idempotency_request = json!({"model": "urouter/auto", "messages": []});
+        let headers = HeaderMap::from_iter([(
+            HeaderName::from_static("idempotency-key"),
+            HeaderValue::from_static("shared-operation"),
+        )]);
+        let first_request_id = resolve_request_id(
+            &state_a,
+            &headers,
+            &tenant,
+            &idempotency_request,
+            "req_shared_first".to_owned(),
+        )
+        .await
+        .unwrap();
+        let second_request_id = resolve_request_id(
+            &state_b,
+            &headers,
+            &tenant,
+            &idempotency_request,
+            "req_shared_second".to_owned(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_request_id, second_request_id);
         let mut record = record_for(
             &primary_request("shared-state-task", "shared-state-turn", None),
             "shared-state-decision",
@@ -4635,6 +8721,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_management_reports_status_and_stable_conflicts() {
+        let state = test_state_with_route(route()).await;
+        let status = catalog_status(State(state.clone()), HeaderMap::new())
+            .await
+            .unwrap();
+        assert!(status.0.contains_key(header::ETAG));
+        assert_eq!(status.1.0["hot_reload"], false);
+        assert_eq!(status.1.0["control"]["ready"], true);
+
+        let refresh = refresh_catalog(State(state.clone()), HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(refresh.status, StatusCode::CONFLICT);
+        assert_eq!(refresh.code, "control_reload_not_configured");
+
+        let rollback = rollback_catalog(State(state), HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(rollback.status, StatusCode::CONFLICT);
+        assert_eq!(rollback.code, "control_rollback_unavailable");
+    }
+
+    #[tokio::test]
     async fn recording_none_retains_no_decision_or_piggyback_feedback() {
         let state = test_state_with_route(route()).await;
         let mut governance = test_governance();
@@ -4645,13 +8754,21 @@ mod tests {
         let catalog = &state.catalog;
         let decision = state.route.decide(catalog, &request).unwrap();
         let model = catalog.model(&decision.model).unwrap();
+        let record_seed = RecordSeed {
+            request_id: "req-private".to_owned(),
+            messages_hash: messages_hash(&request).unwrap(),
+            features: FeatureFrame::from_openai_chat(&request),
+            route_revision: state.route.revision(),
+            artifact: None,
+            exploration: None,
+        };
         let record = build_record(
             catalog,
             "decision-private".to_owned(),
             decision,
             model,
-            messages_hash(&request).unwrap(),
             &governance,
+            &record_seed,
             successful_execution(),
         )
         .unwrap();
@@ -4750,6 +8867,412 @@ mod tests {
         assert_eq!(records.front().unwrap().decision_id, "decision-1");
     }
 
+    async fn assert_record_repository_contract(repository: Arc<dyn DecisionRecordRepository>) {
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "record contract"}]
+        });
+        let mut record = record_for(&request, "decision-contract");
+        let tenant = record.tenant_key.clone();
+        record.task_key = Some("task-contract".to_owned());
+        repository.put(record).await.unwrap();
+        let other_tenant = tenant_key("record-contract-other");
+        let mut other = record_for(&request, "decision-other");
+        other.tenant_key.clone_from(&other_tenant);
+        repository.put(other).await.unwrap();
+
+        assert_eq!(repository.list(&tenant).await.unwrap().len(), 1);
+        assert_eq!(repository.list(&other_tenant).await.unwrap().len(), 1);
+        assert!(
+            repository
+                .get(&tenant, "decision-contract")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repository
+                .get(&other_tenant, "decision-contract")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repository
+                .delete(
+                    &tenant,
+                    RecordDelete::Task {
+                        decision_ids: vec!["decision-contract".to_owned()],
+                        task_key: "task-contract".to_owned(),
+                        before_generation: 1,
+                    },
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(repository.list(&tenant).await.unwrap().is_empty());
+        assert_eq!(repository.list(&other_tenant).await.unwrap().len(), 1);
+        assert_eq!(
+            repository
+                .delete(
+                    &other_tenant,
+                    RecordDelete::Decisions(vec!["decision-other".to_owned()]),
+                )
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_record_repository_passes_shared_contract() {
+        let store = RecordStore::open(None, 4, 1, 0).await.unwrap();
+        assert_record_repository_contract(MemoryDecisionRecordRepository::new(store)).await;
+    }
+
+    #[tokio::test]
+    async fn memory_record_repository_honors_generation_boundary() {
+        let store = RecordStore::open(None, 4, 1, 0).await.unwrap();
+        let repository = MemoryDecisionRecordRepository::new(store);
+        let request = json!({"model": "urouter/auto", "messages": []});
+        let mut record = record_for(&request, "decision-generation");
+        let tenant = record.tenant_key.clone();
+        record.task_key = Some("task-generation".to_owned());
+        repository.put(record).await.unwrap();
+        assert_eq!(
+            repository
+                .delete(
+                    &tenant,
+                    RecordDelete::Task {
+                        decision_ids: vec!["decision-generation".to_owned()],
+                        task_key: "task-generation".to_owned(),
+                        before_generation: 0,
+                    },
+                )
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_quota_rejects_at_limit_and_recovers_after_release() {
+        let mut state = test_state_with_route(route()).await;
+        state.quota = MemoryQuotaRepository::new(1, 0, 0);
+        let lease = acquire_tenant_quota(&state, "quota-tenant", 0)
+            .await
+            .unwrap();
+        let Err(error) = acquire_tenant_quota(&state, "quota-tenant", 0).await else {
+            panic!("quota reservation should be rejected at the configured limit");
+        };
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.code, "tenant_concurrency_exhausted");
+        assert_eq!(state.metrics.quota_rejections.load(Ordering::Relaxed), 1);
+        lease.release().await.unwrap();
+        acquire_tenant_quota(&state, "quota-tenant", 0)
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn chat_completions_returns_stable_error_when_tenant_quota_is_exhausted() {
+        let mut state = test_state_with_route(route()).await;
+        state.quota = MemoryQuotaRepository::new(1, 0, 0);
+        let held_lease = acquire_tenant_quota(&state, &tenant_key("local"), 0)
+            .await
+            .unwrap();
+        let app = app_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "urouter/auto",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = to_bytes(response.into_body(), 1_048_576).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["type"], "urouter_error");
+        assert_eq!(error["error"]["code"], "tenant_concurrency_exhausted");
+        held_lease.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chat_completions_returns_stable_error_when_budget_is_exhausted() {
+        let paid_route: RouteConfig = serde_json::from_value(json!({
+            "id": "urouter/auto",
+            "tiers": [{
+                "tier": "efficient",
+                "model": "anthropic/claude-sonnet-4-6"
+            }]
+        }))
+        .unwrap();
+        let mut state = test_state_with_route(paid_route).await;
+        state.budget = MemoryBudgetRepository::new(1, 2_592_000);
+        let app = app_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "urouter/auto",
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "max_tokens": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let body = to_bytes(response.into_body(), 1_048_576).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["type"], "urouter_error");
+        assert_eq!(error["error"]["code"], "tenant_budget_exhausted");
+    }
+
+    #[tokio::test]
+    async fn chat_completions_returns_stable_error_when_tenant_rpm_is_exhausted() {
+        let mut state = test_state_with_route(route()).await;
+        state.quota = MemoryQuotaRepository::new(0, 1, 0);
+        acquire_tenant_quota(&state, &tenant_key("local"), 0)
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+        let app = app_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "urouter/auto",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = to_bytes(response.into_body(), 1_048_576).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["type"], "urouter_error");
+        assert_eq!(error["error"]["code"], "tenant_rate_limit_exhausted");
+    }
+
+    #[test]
+    fn quota_estimate_reserves_retry_input_and_requested_output() {
+        let request = json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 12
+        });
+        let serialized = u64::try_from(serde_json::to_vec(&request).unwrap().len()).unwrap();
+        let expected_input = serialized.div_ceil(4);
+        assert_eq!(
+            estimate_quota_tokens(&request, 4_096, 1),
+            (expected_input, expected_input * 2 + 12)
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_returns_stable_error_when_tenant_tpm_is_exhausted() {
+        let mut state = test_state_with_route(route()).await;
+        state.quota = MemoryQuotaRepository::new(0, 0, 10);
+        acquire_tenant_quota(&state, &tenant_key("local"), 10)
+            .await
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+        let app = app_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "urouter/auto",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = to_bytes(response.into_body(), 1_048_576).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "tenant_token_limit_exhausted");
+    }
+
+    #[tokio::test]
+    async fn non_stream_usage_settles_tpm_reservation() {
+        async fn completion() -> Json<Value> {
+            Json(json!({
+                "id": "chatcmpl-quota",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }))
+        }
+
+        let upstream = Router::new().route("/chat/completions", post(completion));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let mut route = route();
+        set_tier_deployments(
+            &mut route,
+            "efficient",
+            vec![deployment(
+                "quota-upstream",
+                "local-vllm/qwen3.5-4b",
+                format!("http://{address}"),
+                0,
+            )],
+        );
+        let quota = MemoryQuotaRepository::new(0, 0, 100);
+        let mut state = test_state_with_route(route).await;
+        state.retry_policy.max_retries = 0;
+        state.quota_default_max_output_tokens = 5;
+        state.quota = quota.clone();
+        let app = app_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "urouter/auto",
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "max_tokens": 5
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let reservation = quota.reserve(&tenant_key("local"), 98).await.unwrap();
+        let quota::QuotaReservation::Granted(permit) = reservation else {
+            panic!("actual usage should replace the larger TPM reservation");
+        };
+        quota.release(permit).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_terminal_usage_settles_tpm_reservation() {
+        async fn completion() -> Response {
+            Response::new(Body::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+                 data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n\
+                 data: [DONE]\n\n",
+            ))
+        }
+
+        let upstream = Router::new().route("/chat/completions", post(completion));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let mut route = route();
+        set_tier_deployments(
+            &mut route,
+            "efficient",
+            vec![deployment(
+                "quota-stream-upstream",
+                "local-vllm/qwen3.5-4b",
+                format!("http://{address}"),
+                0,
+            )],
+        );
+        let quota = MemoryQuotaRepository::new(0, 0, 100);
+        let mut state = test_state_with_route(route).await;
+        state.retry_policy.max_retries = 0;
+        state.quota_default_max_output_tokens = 5;
+        state.quota = quota.clone();
+        let app = app_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "urouter/auto",
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "max_tokens": 5,
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 1_048_576).await.unwrap();
+
+        let reservation = quota.reserve(&tenant_key("local"), 98).await.unwrap();
+        let quota::QuotaReservation::Granted(permit) = reservation else {
+            panic!("terminal stream usage should replace the larger TPM reservation");
+        };
+        quota.release(permit).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a Redis service at UROUTER_TEST_REDIS_URL"]
+    async fn redis_record_repository_passes_shared_contract() {
+        let url = std::env::var("UROUTER_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:16380/".to_owned());
+        let prefix = format!("urouter-record-contract-{}", next_decision_id());
+        let shared = RedisSharedState::connect(&url, prefix).await.unwrap();
+        let local = RecordStore::open(None, 4, 1, 0).await.unwrap();
+        assert_record_repository_contract(RedisDecisionRecordRepository::new(shared, local, 4))
+            .await;
+    }
+
     #[tokio::test]
     async fn retries_on_a_different_deployment_and_opens_failed_primary() {
         async fn primary() -> Response {
@@ -4784,19 +9307,50 @@ mod tests {
                 ),
             ],
         );
-        let state = test_state_with_route(route).await;
+        let mut state = test_state_with_route(route).await;
+        state.quota = MemoryQuotaRepository::new(1, 0, 0);
         let request = json!({
             "model": "urouter/auto",
             "messages": [{"role": "user", "content": "hello"}]
         });
         let decision = state.route.decide(&state.catalog, &request).unwrap();
-        let execution = execute_routed_upstream(&state, &decision, &request)
+        let execution = execute_test_request(&state, &decision, &request, "req-retry")
             .await
             .unwrap();
         assert_eq!(execution.response.status(), StatusCode::OK);
         assert_eq!(execution.attempts.len(), 2);
         assert_eq!(execution.attempts[0].deployment, "efficient-primary");
         assert_eq!(execution.attempts[1].deployment, "efficient-backup");
+        assert!(
+            execution.attempts[0]
+                .selection_trace
+                .iter()
+                .any(|candidate| {
+                    candidate.deployment == "efficient-backup"
+                        && candidate.reasons == ["lower_priority_order"]
+                })
+        );
+        assert!(
+            execution.attempts[1]
+                .selection_trace
+                .iter()
+                .any(|candidate| {
+                    candidate.deployment == "efficient-primary"
+                        && candidate.disposition == DeploymentDisposition::Excluded
+                        && candidate
+                            .reasons
+                            .iter()
+                            .any(|reason| reason == "retry_excluded")
+                })
+        );
+        assert_eq!(
+            execution.attempts[0].attempt_id.as_deref(),
+            Some("req-retry:attempt:1")
+        );
+        assert_eq!(
+            execution.attempts[1].attempt_id.as_deref(),
+            Some("req-retry:attempt:2")
+        );
         assert!(execution.attempts[0].retry);
         assert_eq!(state.metrics.retries.load(Ordering::Relaxed), 1);
         let health = state.capacity.snapshot();
@@ -4809,6 +9363,144 @@ mod tests {
             urouter_gateway::capacity::CircuitState::Open
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn exhausted_tier_without_attempt_retains_top_level_filter_trace() {
+        let mut route = route();
+        route.tiers[0].fallbacks.clear();
+        route.tiers[0].deployments = vec![
+            deployment(
+                "cooling-a",
+                "local-vllm/qwen3.5-4b",
+                "http://127.0.0.1:1/a".to_owned(),
+                0,
+            ),
+            deployment(
+                "cooling-b",
+                "local-vllm/qwen3.5-4b",
+                "http://127.0.0.1:1/b".to_owned(),
+                0,
+            ),
+        ];
+        let state = test_state_with_route(route).await;
+        let deployments = state.route.tiers[0].effective_deployments();
+        state
+            .capacity
+            .select(&deployments, &BTreeSet::new())
+            .unwrap()
+            .complete(Err(UpstreamErrorKind::ServerError));
+        state
+            .capacity
+            .select(&deployments, &BTreeSet::new())
+            .unwrap()
+            .complete(Err(UpstreamErrorKind::ServerError));
+
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let decision = state.route.decide(&state.catalog, &request).unwrap();
+        let result = execute_test_request(&state, &decision, &request, "req-exhausted").await;
+        let Err(failure) = result else {
+            panic!("cooling deployments must be exhausted before an upstream attempt");
+        };
+        assert!(failure.attempts.is_empty());
+        assert_eq!(failure.runtime_filter_trace.len(), 2);
+        assert!(failure.runtime_filter_trace.iter().all(|candidate| {
+            candidate.disposition == DeploymentDisposition::Excluded
+                && candidate
+                    .reasons
+                    .iter()
+                    .any(|reason| reason == "local_circuit_unavailable")
+        }));
+    }
+
+    #[tokio::test]
+    async fn deployment_policy_filters_emit_complete_machine_reasons() {
+        let mut route = route();
+        route.tiers.truncate(1);
+        route.tiers[0].fallbacks.clear();
+        let mut restricted = deployment(
+            "restricted",
+            "local-vllm/qwen3.5-4b",
+            "http://127.0.0.1:1".to_owned(),
+            0,
+        );
+        restricted.enabled = false;
+        restricted.credential_available = false;
+        restricted.region = Some("cn-east".to_owned());
+        restricted.residency = vec!["cn".to_owned()];
+        restricted.tenant_allowlist = vec!["tenant-a".to_owned()];
+        route.tiers[0].deployments = vec![restricted];
+        let state = test_state_with_route(route).await;
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "hello"}],
+            "urouter": {"policy": {"region": "us-west", "residency": "eu"}}
+        });
+        let decision = state.route.decide(&state.catalog, &request).unwrap();
+        let result = execute_routed_upstream(
+            &state,
+            &decision,
+            &request,
+            "req-policy",
+            &tenant_key("tenant-b"),
+        )
+        .await;
+        let Err(failure) = result else {
+            panic!("restricted deployment must be filtered before execution");
+        };
+        assert!(failure.attempts.is_empty());
+        assert_eq!(failure.runtime_filter_trace.len(), 1);
+        assert_eq!(
+            failure.runtime_filter_trace[0].reasons,
+            [
+                "deployment_disabled",
+                "credential_unavailable",
+                "region_mismatch",
+                "residency_mismatch",
+                "tenant_not_allowed"
+            ]
+        );
+        let counters = state.metrics.filter_rejections.lock().unwrap();
+        assert_eq!(counters.get("region_mismatch"), Some(&1));
+        assert_eq!(counters.get("tenant_not_allowed"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn retired_deployment_only_serves_bound_requests_during_grace() {
+        let state = test_state_with_route(route()).await;
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "summarize this document"}]
+        });
+        let mut decision = state.route.decide(&state.catalog, &request).unwrap();
+        let mut retired = deployment(
+            "retired",
+            "local-vllm/qwen3.5-4b",
+            "http://127.0.0.1:1".to_owned(),
+            0,
+        );
+        retired.accept_new_requests = false;
+        retired.binding_grace_until_unix = Some(unix_seconds() + 60);
+
+        assert!(
+            deployment_filter_reasons(&state, &retired, &decision, "local")
+                .contains(&"deployment_retired".to_owned())
+        );
+
+        decision.reason = "task_binding".to_owned();
+        assert!(
+            !deployment_filter_reasons(&state, &retired, &decision, "local")
+                .contains(&"deployment_retired".to_owned())
+        );
+
+        retired.binding_grace_until_unix = Some(unix_seconds().saturating_sub(1));
+        assert!(
+            deployment_filter_reasons(&state, &retired, &decision, "local")
+                .contains(&"deployment_retired".to_owned())
+        );
     }
 
     #[tokio::test]
@@ -4854,7 +9546,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}]
         });
         let decision = state.route.decide(&state.catalog, &request).unwrap();
-        let execution = execute_routed_upstream(&state, &decision, &request)
+        let execution = execute_test_request(&state, &decision, &request, "req-fallback")
             .await
             .unwrap();
         assert_eq!(execution.tier, "capable");
@@ -4891,7 +9583,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}]
         });
         let decision = state.route.decide(&state.catalog, &request).unwrap();
-        let failure = execute_routed_upstream(&state, &decision, &request)
+        let failure = execute_test_request(&state, &decision, &request, "req-bad-request")
             .await
             .err()
             .unwrap();
@@ -4899,6 +9591,100 @@ mod tests {
         assert_eq!(failure.attempts.len(), 1);
         assert_eq!(state.metrics.fallbacks.load(Ordering::Relaxed), 0);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn timeout_uses_its_typed_fallback_chain() {
+        async fn slow() -> Response {
+            sleep(Duration::from_millis(100)).await;
+            Json(json!({"unexpected": true})).into_response()
+        }
+        async fn generic() -> Response {
+            Json(json!({"path": "generic"})).into_response()
+        }
+        async fn timeout_backup() -> Response {
+            Json(json!({"path": "timeout"})).into_response()
+        }
+
+        let slow_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_address = slow_listener.local_addr().unwrap();
+        let slow_server = tokio::spawn(async move {
+            axum::serve(
+                slow_listener,
+                Router::new().route("/chat/completions", post(slow)),
+            )
+            .await
+            .unwrap();
+        });
+        let generic_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let generic_address = generic_listener.local_addr().unwrap();
+        let generic_server = tokio::spawn(async move {
+            axum::serve(
+                generic_listener,
+                Router::new().route("/chat/completions", post(generic)),
+            )
+            .await
+            .unwrap();
+        });
+        let timeout_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let timeout_address = timeout_listener.local_addr().unwrap();
+        let timeout_server = tokio::spawn(async move {
+            axum::serve(
+                timeout_listener,
+                Router::new().route("/chat/completions", post(timeout_backup)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut route = route();
+        route.tiers[0].deployments = vec![deployment(
+            "slow",
+            "local-vllm/qwen3.5-4b",
+            format!("http://{slow_address}"),
+            0,
+        )];
+        route.tiers[1].deployments = vec![deployment(
+            "generic",
+            "local-vllm-qwen38/qwen3.8-27b",
+            format!("http://{generic_address}"),
+            0,
+        )];
+        let mut timeout_tier = route.tiers[1].clone();
+        timeout_tier.tier = "timeout-backup".to_owned();
+        timeout_tier.fallbacks.clear();
+        timeout_tier.deployments = vec![deployment(
+            "timeout-backup",
+            "local-vllm-qwen38/qwen3.8-27b",
+            format!("http://{timeout_address}"),
+            0,
+        )];
+        route.tiers.push(timeout_tier);
+        route.tiers[0]
+            .fallbacks_by_error
+            .insert(FallbackCause::Timeout, vec!["timeout-backup".to_owned()]);
+        let mut state = test_state_with_route(route).await;
+        state.request_timeout = Duration::from_millis(25);
+        state.retry_policy.max_retries = 0;
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let decision = state.route.decide(&state.catalog, &request).unwrap();
+        let execution = execute_test_request(&state, &decision, &request, "req-timeout")
+            .await
+            .unwrap();
+        assert_eq!(execution.tier, "timeout-backup");
+        assert_eq!(execution.attempts.len(), 2);
+        assert_eq!(
+            execution.attempts[0].error_kind,
+            Some(UpstreamErrorKind::Timeout)
+        );
+        assert_eq!(execution.attempts[1].deployment, "timeout-backup");
+
+        slow_server.abort();
+        generic_server.abort();
+        timeout_server.abort();
     }
 
     #[tokio::test]
@@ -4921,6 +9707,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn dropping_gateway_stream_cancels_upstream_body() {
         struct DropFlag(Arc<AtomicU64>);
         impl Drop for DropFlag {
@@ -4960,24 +9747,47 @@ mod tests {
                 0,
             )],
         );
-        let state = test_state_with_route(route).await;
+        let mut state = test_state_with_route(route).await;
+        state.quota = MemoryQuotaRepository::new(1, 0, 0);
         let request = json!({
             "model": "urouter/auto",
             "messages": [{"role": "user", "content": "stream"}],
             "stream": true
         });
         let decision = state.route.decide(&state.catalog, &request).unwrap();
-        let execution = execute_routed_upstream(&state, &decision, &request)
+        let execution = execute_test_request(&state, &decision, &request, "req-stream")
             .await
             .unwrap();
+        let QuotaAdmission::Granted(quota) =
+            QuotaLease::acquire(Arc::clone(&state.quota), "stream-tenant", 0)
+                .await
+                .unwrap()
+        else {
+            panic!("initial stream quota should be granted");
+        };
+        let budget =
+            test_budget_accounting(&state, "stream-tenant", "req-stream", &decision, &request)
+                .await;
         let response = stream_response(
-            state,
+            state.clone(),
             execution,
-            "decision-cancel".to_owned(),
-            decision,
-            messages_hash(&request).unwrap(),
-            test_governance(),
-            HeaderMap::new(),
+            ResponseContext {
+                decision_id: "decision-cancel".to_owned(),
+                decision,
+                governance: test_governance(),
+                record: RecordSeed {
+                    request_id: "req-stream".to_owned(),
+                    messages_hash: messages_hash(&request).unwrap(),
+                    features: FeatureFrame::from_openai_chat(&request),
+                    route_revision: state.route.revision(),
+                    artifact: None,
+                    exploration: None,
+                },
+                headers: HeaderMap::new(),
+                quota,
+                quota_input_tokens: 0,
+                budget,
+            },
         );
         drop(response);
         for _ in 0..50 {
@@ -4987,6 +9797,111 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        let mut replacement = None;
+        for _ in 0..50 {
+            replacement = match QuotaLease::acquire(Arc::clone(&state.quota), "stream-tenant", 0)
+                .await
+                .unwrap()
+            {
+                QuotaAdmission::Granted(lease) => Some(lease),
+                QuotaAdmission::Rejected(_) => None,
+            };
+            if replacement.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        replacement.unwrap().release().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn partial_stream_failure_never_runs_success_finalization() {
+        async fn broken_stream() -> Response {
+            let chunks = stream::unfold(0_u8, |step| async move {
+                match step {
+                    0 => Some((
+                        Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: {\"delta\":1}\n\n")),
+                        1,
+                    )),
+                    1 => {
+                        sleep(Duration::from_millis(25)).await;
+                        Some((Err(std::io::Error::other("stream interrupted")), 2))
+                    }
+                    _ => None,
+                }
+            });
+            Response::new(Body::from_stream(chunks))
+        }
+
+        let app = Router::new().route("/chat/completions", post(broken_stream));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut route = route();
+        route.tiers[0].fallbacks.clear();
+        set_tier_deployments(
+            &mut route,
+            "efficient",
+            vec![deployment(
+                "broken-stream",
+                "local-vllm/qwen3.5-4b",
+                format!("http://{address}"),
+                0,
+            )],
+        );
+        let mut state = test_state_with_route(route).await;
+        state.retry_policy.max_retries = 0;
+        state.quota = MemoryQuotaRepository::new(1, 0, 0);
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "stream"}],
+            "stream": true
+        });
+        let decision = state.route.decide(&state.catalog, &request).unwrap();
+        let execution = execute_test_request(&state, &decision, &request, "req-broken")
+            .await
+            .unwrap();
+        let QuotaAdmission::Granted(quota) =
+            QuotaLease::acquire(Arc::clone(&state.quota), "broken-tenant", 0)
+                .await
+                .unwrap()
+        else {
+            panic!("stream quota should be granted");
+        };
+        let budget =
+            test_budget_accounting(&state, "broken-tenant", "req-broken", &decision, &request)
+                .await;
+        let response = stream_response(
+            state.clone(),
+            execution,
+            ResponseContext {
+                decision_id: "decision-broken".to_owned(),
+                decision,
+                governance: test_governance(),
+                record: RecordSeed {
+                    request_id: "req-broken".to_owned(),
+                    messages_hash: messages_hash(&request).unwrap(),
+                    features: FeatureFrame::from_openai_chat(&request),
+                    route_revision: state.route.revision(),
+                    artifact: None,
+                    exploration: None,
+                },
+                headers: HeaderMap::new(),
+                quota,
+                quota_input_tokens: 0,
+                budget,
+            },
+        );
+        let mut body = response.into_body().into_data_stream();
+        while body.next().await.is_some() {}
+        assert_eq!(state.metrics.stream_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(state.metrics.streams_completed.load(Ordering::Relaxed), 0);
+        assert!(state.records.records.read().await.is_empty());
+        let replacement = QuotaLease::acquire(Arc::clone(&state.quota), "broken-tenant", 0)
+            .await
+            .unwrap();
+        assert!(matches!(replacement, QuotaAdmission::Granted(_)));
         server.abort();
     }
 }

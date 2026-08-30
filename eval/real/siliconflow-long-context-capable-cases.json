@@ -1,0 +1,11 @@
+[
+  {
+    "id": "long-context-capable-control-run-1",
+    "category": "long_context",
+    "semantic_task": "long_context",
+    "quality_millionths": 1000000,
+    "cost_nano_usd": 2178408,
+    "latency_ms": 15448,
+    "supported": true
+  }
+]

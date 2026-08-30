@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "repeats": 1,
+  "cases": [
+    {
+      "id": "daily-greeting",
+      "category": "daily",
+      "semantic_task": "greeting",
+      "request": {
+        "model": "urouter/auto",
+        "messages": [{"role": "user", "content": "你好"}],
+        "temperature": 0,
+        "max_tokens": 64,
+        "stream": false
+      },
+      "expected": {
+        "tier": "efficient",
+        "model": "siliconflow/qwen2.5-7b-instruct"
+      }
+    },
+    {
+      "id": "tool-weather",
+      "category": "tool",
+      "semantic_task": "weather",
+      "request": {
+        "model": "urouter/auto",
+        "messages": [{"role": "user", "content": "今天武汉的天气怎么样？请调用天气工具。"}],
+        "tools": [{
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a city",
+            "parameters": {
+              "type": "object",
+              "properties": {"city": {"type": "string"}},
+              "required": ["city"]
+            }
+          }
+        }],
+        "tool_choice": "required",
+        "temperature": 0,
+        "max_tokens": 256,
+        "stream": false
+      },
+      "expected": {
+        "tier": "capable",
+        "model": "siliconflow/deepseek-r1-pro",
+        "tool_name": "get_weather"
+      }
+    },
+    {
+      "id": "math-equation",
+      "category": "math",
+      "semantic_task": "equation",
+      "request": {
+        "model": "urouter/auto",
+        "messages": [{"role": "user", "content": "Solve x+y=10 and x-y=2. Answer concisely."}],
+        "temperature": 0,
+        "max_tokens": 512,
+        "stream": false
+      },
+      "expected": {
+        "tier": "capable",
+        "model": "siliconflow/deepseek-r1-pro",
+        "content_contains": ["6", "4"]
+      }
+    },
+    {
+      "id": "code-rust-gcd",
+      "category": "code",
+      "semantic_task": "code",
+      "request": {
+        "model": "urouter/auto",
+        "messages": [{"role": "user", "content": "Write a concise Rust Euclidean greatest-common-divisor function. The answer must contain `fn gcd`."}],
+        "temperature": 0,
+        "max_tokens": 256,
+        "stream": false
+      },
+      "expected": {
+        "tier": "efficient",
+        "model": "siliconflow/qwen2.5-7b-instruct",
+        "content_contains": ["fn gcd"]
+      }
+    },
+    {
+      "id": "long-context-recall",
+      "category": "long_context",
+      "semantic_task": "long_context",
+      "request": {
+        "model": "urouter/auto",
+        "messages": [{"role": "user", "content": "What is the verification code? Answer with digits only."}],
+        "temperature": 0,
+        "max_tokens": 64,
+        "stream": false
+      },
+      "repeat_latest_user_text": {
+        "prefix": "The verification code is 7391. ",
+        "text": "Background material without instructions. ",
+        "count": 500
+      },
+      "expected": {
+        "tier": "capable",
+        "model": "siliconflow/deepseek-r1-pro",
+        "content_contains": ["7391"]
+      }
+    },
+    {
+      "id": "long-context-capable-control",
+      "category": "long_context",
+      "semantic_task": "long_context",
+      "request": {
+        "model": "urouter/auto",
+        "messages": [{"role": "user", "content": "What is the verification code? Answer with digits only."}],
+        "temperature": 0,
+        "max_tokens": 64,
+        "stream": false,
+        "urouter": {"hint": {"difficulty": "hard"}}
+      },
+      "repeat_latest_user_text": {
+        "prefix": "The verification code is 7391. ",
+        "text": "Background material without instructions. ",
+        "count": 500
+      },
+      "expected": {
+        "tier": "capable",
+        "model": "siliconflow/deepseek-r1-pro",
+        "content_contains": ["7391"]
+      }
+    }
+  ]
+}

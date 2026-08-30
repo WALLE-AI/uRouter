@@ -11,5 +11,6 @@
       "model": "siliconflow/deepseek-r1-pro"
     }
   ],
-  "default_preference_bias_millis": 0
+  "default_preference_bias_millis": 0,
+  "long_context_quality_threshold_tokens": 2048
 }

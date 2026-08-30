@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "instance_id": "ark-cn-beijing-main",
+  "vendor": "volcengine-ark",
+  "driver": "reviewed_static",
+  "source": "volcengine-ark/reviewed-models.json",
+  "first_fetched_at_unix": 1787997652,
+  "complete": true,
+  "content_hash": "sha256:f689b0d73f11f75bc2341595c3ebce357594bf3d33c5296f8ca881ad0e61d5c9",
+  "models": [
+    {
+      "upstream_id": "doubao-seed-2-0-lite-260215",
+      "name": "Doubao Seed 2.0 Lite",
+      "raw": {
+        "id": "doubao-seed-2-0-lite-260215",
+        "name": "Doubao Seed 2.0 Lite",
+        "note": "Discovery evidence only; runtime capability and pricing probes are required before Catalog publication.",
+        "protocol_candidates": [
+          "open_ai_chat",
+          "open_ai_responses"
+        ],
+        "review_status": "candidate"
+      }
+    }
+  ]
+}

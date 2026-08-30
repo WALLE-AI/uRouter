@@ -1,0 +1,11 @@
+[
+  {
+    "id": "long-context-recall-run-1",
+    "category": "long_context",
+    "semantic_task": "long_context",
+    "quality_millionths": 0,
+    "cost_nano_usd": 0,
+    "latency_ms": 725,
+    "supported": true
+  }
+]

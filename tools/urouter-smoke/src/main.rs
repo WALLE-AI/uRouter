@@ -262,15 +262,34 @@ fn resolve_headers(
     endpoint: &EndpointPlan,
 ) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let mut headers = endpoint.public_headers.clone();
-    if let AuthPlan::ApiKeyEnv {
-        env: variable,
-        header,
-        prefix,
-    } = &endpoint.auth
-    {
-        let secret = env::var(variable)
-            .map_err(|_| format!("credential environment variable {variable} is not set"))?;
-        headers.insert(header.clone(), format!("{prefix}{secret}"));
+    match &endpoint.auth {
+        AuthPlan::ApiKeyEnv {
+            env: variable,
+            header,
+            prefix,
+        }
+        | AuthPlan::AmbientEnv {
+            env: variable,
+            header,
+            prefix,
+        } => {
+            let secret = env::var(variable).map_err(|_| "credential environment is unavailable")?;
+            headers.insert(header.clone(), format!("{prefix}{secret}"));
+        }
+        AuthPlan::OAuthBearerFile {
+            path,
+            header,
+            prefix,
+        } => {
+            let secret =
+                fs::read_to_string(path).map_err(|_| "OAuth credential file is unavailable")?;
+            let secret = secret.trim();
+            if secret.is_empty() {
+                return Err("OAuth credential file is empty".into());
+            }
+            headers.insert(header.clone(), format!("{prefix}{secret}"));
+        }
+        AuthPlan::None => {}
     }
     Ok(headers)
 }
