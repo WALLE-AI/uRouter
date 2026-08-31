@@ -1,6 +1,6 @@
 # uRouter 设计文档执行状态与完成预测
 
-> 更新日期：2026-08-30
+> 更新日期：2026-08-31
 > 口径：以 `uRouter_技术架构深度评审与优化方案.md` 的收敛里程碑为执行基线，
 > 不把原设计中的全部设想误算为首个可发布版本。
 
@@ -34,7 +34,7 @@
 3. 启动、查询和后台 sweep 的 TTL 执行。
 4. decision/task/tenant 持久删除，覆盖 JSONL、轮转副本、feedback 和 binding。
 5. `POST /v1/explain` 无上游 dry-run。
-6. P0 阶段基线曾包含 133 个可执行测试；当前全量基线已增长为 188 个通过、0 个失败、7 个 Redis 条件忽略，另有 1 个 rustdoc 通过，详见第 25 项及各阶段执行状态报告。
+6. P0 阶段基线曾包含 133 个可执行测试；当前全量基线为单条 `cargo test --workspace --no-fail-fast` 的 247 个通过、0 个失败、7 个 Redis 条件忽略，详见第 25 项及各阶段执行状态报告。
 7. 真实验证 8087 Qwen3.5-4B 与 Qwen3.8-27B（当前为 19121/starvlm，原端口 8094）；27B Auto 请求、跨租户 404、
    `recording=none` 和删除语义均通过。
 8. 完成 GW-500/510：内存/Redis 共享状态端口与原子 CAS；两个真实网关实例验证跨实例 27B continuity。
@@ -50,13 +50,24 @@
 18. 完成 P2-02 代码闭环：按 fallback/retry 最坏成本进行固定点预算预授权，请求 ID 去重，成功 Usage 结算，缺失 Usage/取消保守记账，Memory/Redis 状态端口及稳定 `402 tenant_budget_exhausted`；真实 Redis/provider 账单对账仍属外部验收。
 19. 完成 P2-03～P2-06：完整部署过滤原因、四种 Picker、按错误类型的 fallback、Bad Request 硬停止、流式取消与部分失败保守记账均有自动化测试。
 20. 完成 P2-07～P2-08：`/health/live`、`/health/ready`、有界 drain；请求/上游/TTFT/成本/fallback OpenMetrics 直方图和 trace exemplar，不使用 tenant/task/request 常规标签。
-21. 完成 P2-09～P2-11 代码闭环：Redis 重启/超时/断流 CI 脚本、一致性故障矩阵、HMAC 控制 manifest、required revision readiness、last-good/fail-closed、原子快照和回滚。当前主机无 Docker，混沌脚本留给 CI/Redis 环境执行。
+21. 完成 P2-09～P2-11 代码闭环：Redis 重启/超时/断流混沌门禁、一致性故障矩阵、HMAC 控制 manifest、required revision readiness、last-good/fail-closed、原子快照和回滚。混沌门禁已从 PowerShell 改写为 `urouter-xtask chaos`；当前主机无 Docker，仍留给 CI/Redis 环境执行。CI 另新增 `redis-contracts` job（带 redis service），使 7 个 Redis 条件测试首次真正在 CI 中执行——此前它们始终被静默忽略。
 22. 完成 P3-01～P3-05：SiliconFlow/OpenAI、百炼分页、火山 reviewed-static 统一驱动，显式限速与原始证据；字段级人工证据、费用受限能力探测、候选隔离 JSON Schema、control-last 发布和一键回滚。
 23. 完成 P3-06～P3-09：Catalog/Route revision 与 ETag、Gateway 热加载、RBAC/audit 管理端点、OAuth bearer-file/ambient credential、两阶段部署退役和绑定宽限。
 24. 完成 P3-10～P3-12：规则优先语义分类、置信度与 abstain；“你好”保持 efficient，方程升级 reasoning-capable，武汉天气强制要求 Host `get_weather` 工具，无工具稳定拒绝，tool-result continuation 保持 capable。
-25. 2026-08-30 最新门禁：等价分拆的全 workspace 集合 188 passed/0 failed/7 Redis 条件忽略，另有 1 个 rustdoc 通过；Gateway binary 81 passed、Gateway library 22 passed、Catalog/provider 12 passed；全 workspace Clippy `-D warnings`、纯 crate 边界与 Secret 扫描通过。单条 workspace 命令会命中被 Windows 应用控制缓存封禁的旧测试 exe，因此 contracts/eval 使用单包重编译执行。
+25. 2026-08-31 最新门禁：单条 `cargo test --workspace --no-fail-fast` 得到 247 passed/0 failed/7 Redis 条件忽略；Gateway binary 103 passed、Gateway library 11 passed、xtask 22 passed。全 workspace `cargo fmt --check`、Clippy `-D warnings`、`cargo deny check`、纯 crate 边界、Secret 扫描、定价 fixture 与部署清单门禁全部通过。此前需要分拆执行的原因是 Windows 应用控制缓存封禁旧测试 exe；门禁脚本改写为跨平台的 `urouter-xtask` 后不再需要分拆。
 26. 当前完成版运行于 `127.0.0.1:8790`：readiness 200；问候选择 efficient，方程与带 `get_weather` 的天气请求选择 capable，无工具天气请求返回 400 `missing_required_tool`；Catalog ETag 与活动 revision 一致。原 8787 服务未中断。
 27. 完成 P4-01～P6-07 仓库内实现：`urouter-eval`、`urouter-artifact`、`urouter-protocol`、`urouter-client`、`urouter-embed` 与 `urouter-lab`；Gateway 增加显式授权 epsilon 探索、签名 artifact 在线控制、Responses/Anthropic 入口及 provider transport。逐项证据和外部验收边界见 `docs/p4-p6-execution-status.md`。
+28. 工程基建补齐（此前未列入矩阵的缺口）：
+    - 结构化日志。Gateway 此前只有 metrics 和 DecisionRecord，没有任何 `tracing`/`log` 调用，单请求故障无排查依据。现每个请求有 `chat` span（request_id / decision_id / tenant_key / tier / model），每个被拒请求有一行带稳定错误码的日志；请求体与上游错误正文不进日志。
+    - 交付形态。新增 distroless `Dockerfile`、双网关 + Redis 的 `docker-compose.yml`、含 drain 一致时序的 `deploy/kubernetes/gateway.yaml`。`urouter-xtask check-deploy` 用 Gateway 自身的 `--dry-run` 校验每一组清单参数。
+    - 供应链门禁。新增 `deny.toml` 与 CI job；首次运行即发现 RUSTSEC-2021-0073（`prost-types 0.6.1`），经确认仅经 `onnx-pb` 进入离线工具、不在 Gateway 依赖树中，已用 `wrappers` ban 锁定范围。
+    - 发布可行性。`urouter-ai` 的内部依赖缺少 version 要求，`cargo package` 会无条件失败——M4 的 crate 发布此前是硬阻塞的。已补齐，并为 8 个不在发布面上的 crate 标注 `publish = false`。
+    - `main.rs` 从 11250 行降至 6646 行，拆出 `dry_run`、`protocol_translation`、`persistence` 三个模块，测试移入 `tests.rs`。
+29. 修复的真实缺陷：
+    - `credential.rs` 跨进程 token 刷新缺少锁内二次检查，导致并发实例重复铸 token（对"重新签发即吊销旧 token"的 provider 会互相踢下线）。
+    - `catalog/manifest.json` 与 `catalog.json` 哈希漂移，使主干 CI 与 `--dry-run` 均为失败状态。
+    - 三处 `reqwest` 客户端未设 `no_proxy`，在设置了 `http_proxy` 的机器上导致测试失败或无限挂起。
+    - 两个依赖固定 `sleep` 的 flaky 测试改为带截止时间的轮询（压测 60/60 通过）。
 
 P2/P3 的逐项证据与外部验收边界见 `docs/p2-p3-execution-status.md`。`code_complete` 不等于生产 `accepted`：至少一个非 SiliconFlow 云端真实发现、付费 probe、Redis HA/ACL/TLS、多 Gateway 分发故障和 Agent Host 真实天气工具仍需对应权限与环境。
 

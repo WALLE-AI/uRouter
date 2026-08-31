@@ -1,0 +1,76 @@
+# Supply-chain policy for the uRouter workspace.
+#
+# The workspace resolves ~220 packages and had no dependency gate at all, so a
+# published advisory or an incompatible license would have reached a release
+# unnoticed. Run with `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2021-0073: `prost-types` 0.6.1 can overflow and panic converting an
+    # untrusted `Timestamp` to `SystemTime`.
+    #
+    # Reachability: it enters only through `onnx-pb` 0.1.4, whose sole consumers
+    # are `urouter-infer` and `urouter-lab` — the offline artifact tooling. It is
+    # NOT in the `urouter-gateway` dependency tree, so no request-serving code
+    # path can reach it. `cargo tree -i onnx-pb` is the check.
+    #
+    # No fix is available: 0.1.4 is the only published `onnx-pb` version, and it
+    # pins the prost 0.6 line. The `onnx-pb` ban below is what keeps this
+    # confined; if that ban ever has to be relaxed, this ignore must be revisited
+    # rather than extended.
+    #
+    # Reassess by 2027-02-28, or immediately if `onnx-pb` publishes a release.
+    "RUSTSEC-2021-0073",
+]
+
+[licenses]
+# `Apache-2.0` is the workspace license; the allow-list is the set that is
+# compatible with redistributing an Apache-2.0 binary. Crates offering a choice
+# (`MIT OR Apache-2.0` and similar) resolve against this list automatically.
+version = 2
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    # `webpki-roots` only: the Mozilla CA root store, published as data under the
+    # Community Data License Agreement. Permissive and redistributable.
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Intra-workspace `path` dependencies carry no version requirement by design.
+allow-wildcard-paths = true
+
+# The Gateway uses rustls precisely so that a deployment needs no system OpenSSL.
+# A transitive dependency pulling it back in would silently reintroduce that
+# requirement and change the runtime image's base.
+[[bans.deny]]
+name = "openssl"
+
+[[bans.deny]]
+name = "openssl-sys"
+
+[[bans.deny]]
+name = "native-tls"
+
+# Confines the unmaintained ONNX protobuf stack — and the RUSTSEC-2021-0073
+# advisory ignored above — to the offline tooling. If `onnx-pb` ever appears
+# under any other crate, this fails and the ignore stops being justified.
+[[bans.deny]]
+name = "onnx-pb"
+wrappers = ["urouter-infer", "urouter-lab"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

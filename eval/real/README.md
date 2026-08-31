@@ -5,7 +5,7 @@ commercial-provider calls. It must not contain credentials, raw retained prompts
 provider response bodies.
 
 `siliconflow-2026-08-30-cases.json` is derived from
-`uRouter_SiliconFlow真实模型路由验证报告.md`. Quality is a manually reviewed binary
+`docs/reports/uRouter_SiliconFlow真实模型路由验证报告.md`. Quality is a manually reviewed binary
 task-success score: `1_000_000` means the observed route and answer/tool behavior met
 the case expectation. It is not a judge-model score.
 

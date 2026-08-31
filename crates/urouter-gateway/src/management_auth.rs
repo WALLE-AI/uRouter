@@ -403,6 +403,43 @@ mod tests {
         let _ = tokio::fs::remove_file(audit_path).await;
     }
 
+    /// Waits for `marker` to reach the audit file. The audit sink is a queue
+    /// drained by a writer task, so a read immediately after the triggering call
+    /// races with that drain.
+    async fn await_audit_contains(path: &Path, marker: &str) {
+        for _ in 0..200 {
+            if tokio::fs::read_to_string(path)
+                .await
+                .is_ok_and(|audit| audit.contains(marker))
+            {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("audit never contained {marker}");
+    }
+
+    /// Waits for a hot-reloaded keyring to start accepting `token`.
+    async fn await_accepted(auth: &ManagementAuth, token: &str, tenant: &str) {
+        for _ in 0..200 {
+            if auth
+                .authorize(
+                    &headers(token),
+                    tenant,
+                    ManagementRole::Admin,
+                    "metrics.read",
+                    None,
+                )
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("keyring reload never accepted {token}");
+    }
+
     #[tokio::test]
     async fn hot_reload_retains_valid_keyring_and_accepts_rotated_key() {
         let (keyring_path, audit_path) = temporary_paths("reload");
@@ -423,7 +460,9 @@ mod tests {
         let tenant = digest("tenant-a");
 
         tokio::fs::write(&keyring_path, "not-json").await.unwrap();
-        sleep(Duration::from_millis(30)).await;
+        // The rejected reload has no effect other than the audit line, so the
+        // audit is what tells us it has actually been attempted.
+        await_audit_contains(&audit_path, "invalid_keyring_retained_previous").await;
         assert!(
             auth.authorize(
                 &headers("old-token"),
@@ -442,18 +481,10 @@ mod tests {
         )
         .await
         .unwrap();
-        sleep(Duration::from_millis(30)).await;
-        assert!(
-            auth.authorize(
-                &headers("new-token"),
-                &tenant,
-                ManagementRole::Admin,
-                "metrics.read",
-                None,
-            )
-            .await
-            .is_ok()
-        );
+        // The reload interval is 10ms, but a fixed sleep makes this assertion a
+        // function of host load rather than of the reload contract. Poll to a
+        // generous deadline instead.
+        await_accepted(&auth, "new-token", &tenant).await;
         assert!(matches!(
             auth.authorize(
                 &headers("old-token"),
@@ -465,9 +496,7 @@ mod tests {
             .await,
             Err(ManagementAuthError::InvalidCredential)
         ));
-        let audit = tokio::fs::read_to_string(&audit_path).await.unwrap();
-        assert!(audit.contains("invalid_keyring_retained_previous"));
-        assert!(audit.contains("\"reason\":\"reloaded\""));
+        await_audit_contains(&audit_path, "\"reason\":\"reloaded\"").await;
         let _ = tokio::fs::remove_file(keyring_path).await;
         let _ = tokio::fs::remove_file(audit_path).await;
     }

@@ -114,7 +114,11 @@ pub(crate) async fn run(
             format!("suite requests {request_count} exceed maximum {maximum_requests}").into(),
         );
     }
+    // The benchmark addresses a Gateway directly, like the Gateway's own
+    // upstream client. An ambient `http_proxy` must not silently re-route a
+    // benchmark run or stall a loopback Gateway.
     let client = Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(timeout_seconds))
         .build()?;
     let gateway_token = gateway_api_key_env

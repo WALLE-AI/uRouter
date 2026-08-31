@@ -14,7 +14,7 @@ observations may fail open only where explicitly listed.
 | Metrics counters | Process-local, monotonic best effort | Fail open | Scrape gaps are observable externally; metrics never authorize traffic |
 | Latency EWMA / picker signal | Process-local advisory value | Fail open to deterministic weighted selection | New samples rebuild the EWMA; no correctness decision depends on it |
 
-The automated gate is `scripts/run-p2-chaos.ps1`. It starts a repository-owned,
+The automated gate is `cargo run -p urouter-xtask -- chaos`. It starts a repository-owned,
 uniquely named Redis container, runs all ignored Redis contracts, restarts that exact
 container, reruns the contracts, and writes `target/p2-chaos-report.json`. Any failed
 contract or configured `urouter-soak` SLO threshold exits non-zero.

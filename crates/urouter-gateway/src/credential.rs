@@ -132,6 +132,15 @@ impl CredentialManager {
             }
             return Err(CredentialError::RefreshLockTimeout);
         }
+        // Re-check under the lock. The pre-lock check above can observe an
+        // expired token, then block long enough for another holder to refresh
+        // and release; without this second read that holder's work is discarded
+        // and a redundant token is minted. Providers that invalidate the prior
+        // token on re-issue would then revoke the one already in the file.
+        if let Some(token) = read_valid_token(token_path).await {
+            let _ = fs::remove_file(&lock_path).await;
+            return Ok(token.access_token);
+        }
         let result = self
             .refresh_token(
                 token_url,

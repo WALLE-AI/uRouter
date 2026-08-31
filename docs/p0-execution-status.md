@@ -30,7 +30,7 @@ Passed locally:
 - `cargo test --release --workspace`: the same complete workspace passed in release mode
 - `cargo doc --workspace --no-deps`
 - Catalog validation and identity diff
-- `scripts/check-secrets.ps1`: 134 repository files scanned with no finding
+- `urouter-xtask check-secrets`: repository files scanned with no finding
 - OpenAPI JSON parse and route-coverage test
 - Release Catalog benchmark: 10,000 models loaded in 116 ms and 1,000,000 operations
   completed in 165 ms on the current workstation

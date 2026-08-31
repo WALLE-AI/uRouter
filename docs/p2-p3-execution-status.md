@@ -17,7 +17,7 @@ means the repository gates pass; it does not claim production acceptance.
 | P2-06 | code_complete | Downstream cancellation, partial-stream failure and conservative accounting tests | Network fault exercise |
 | P2-07 | code_complete | `/health/live`, `/health/ready`, drain state and bounded graceful shutdown | Orchestrator termination exercise |
 | P2-08 | code_complete | Low-cardinality cumulative histograms for duration, TTFT, cost and fallback; OpenMetrics trace exemplar | Dashboard and alert provisioning |
-| P2-09 | code_complete | `scripts/run-p2-chaos.ps1` and CI report artifact cover Redis restart, timeout and stream faults | Local run is pending because Docker is unavailable on this host |
+| P2-09 | code_complete | `urouter-xtask chaos` and the CI report artifact cover Redis restart, timeout and stream faults | Local run is pending because Docker is unavailable on this host |
 | P2-10 | code_complete | Per-domain fail-open/fail-closed contract and `docs/redis-consistency-matrix.md` | Redis HA/ACL/TLS drill |
 | P2-11 | code_complete | Signed Catalog/Route control manifest, required revision readiness, last-good/fail-closed, atomic snapshot and rollback tests | Multi-Gateway distribution outage drill |
 
@@ -40,7 +40,7 @@ means the repository gates pass; it does not claim production acceptance.
 
 ## Verified Gates
 
-- Equivalent split execution of the complete workspace test set: 188 passed,
+- Complete workspace test set in a single command: 247 passed,
   0 failed, 7 Redis-conditional ignored. A single workspace invocation on this
   host can select an older test executable blocked by Windows Application
   Control, so the affected packages are rebuilt and run separately.
@@ -56,6 +56,6 @@ means the repository gates pass; it does not claim production acceptance.
   without the Host tool returned HTTP 400 `missing_required_tool`; Catalog ETag
   matched the active revision.
 
-The ignored Redis contracts are executed by `scripts/run-p2-chaos.ps1` when Docker
+The ignored Redis contracts are executed by `urouter-xtask chaos` when Docker
 and Redis are available. Commercial provider calls are intentionally not made by
 the test suite because they require explicit spend authorization and credentials.

@@ -1,0 +1,166 @@
+# Reference Kubernetes deployment for the uRouter Gateway.
+#
+# The point of this manifest is the shutdown path. The Gateway implements a
+# bounded drain: on SIGTERM it stops accepting new connections, lets in-flight
+# requests finish, and exits. That only produces zero-error rollouts if the
+# numbers below agree with each other:
+#
+#   preStop sleep        >= readiness failureThreshold * periodSeconds
+#   terminationGrace     >  preStop sleep + --shutdown-grace-seconds
+#
+# The preStop sleep exists because endpoint removal is eventually consistent:
+# kube-proxy may still route to this Pod for a moment after SIGTERM. Sleeping
+# first lets readiness go false and the endpoint be withdrawn *before* the
+# process stops accepting.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: urouter-gateway
+  labels:
+    app.kubernetes.io/name: urouter-gateway
+spec:
+  selector:
+    app.kubernetes.io/name: urouter-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: urouter-gateway
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: urouter-gateway
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: urouter-gateway
+  labels:
+    app.kubernetes.io/name: urouter-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: urouter-gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: urouter-gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8787"
+    spec:
+      # preStop sleep (10s) + --shutdown-grace-seconds (30s) + headroom.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: urouter-gateway:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--bind"
+            - "0.0.0.0:8787"
+            - "--redis-url"
+            - "redis://redis:6379/"
+            - "--redis-prefix"
+            - "urouter-prod"
+            # Mandatory with --redis-url: correctness-domain state must fail
+            # closed with a stable 503 rather than silently routing on stale
+            # local state.
+            - "--on-state-unavailable"
+            - "fail_closed"
+            - "--log-format"
+            - "json"
+            - "--shutdown-grace-seconds"
+            - "30"
+            # Readiness fails closed while a required revision is missing, so a
+            # bad control rollout withdraws the Pod instead of serving stale
+            # routes.
+            - "--control-failure-policy"
+            - "last_good"
+          ports:
+            - name: http
+              containerPort: 8787
+          # Liveness must not depend on Redis. /health/live reports process
+          # liveness only; using /health/ready here would restart every Pod
+          # during a Redis outage instead of merely withdrawing them from the
+          # Service, turning a degraded cluster into a crash loop.
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Readiness checks drain state, shared-state dependencies and the
+          # required control revision.
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 3
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          lifecycle:
+            preStop:
+              # `sleep` requires the SleepAction feature (beta in Kubernetes
+              # 1.29, GA in 1.32). It is used because the distroless image has no
+              # shell for the usual `exec: ["sh", "-c", "sleep 10"]`. On an older
+              # cluster, either switch the runtime stage to a shell-bearing base
+              # or move the delay into an ingress drain hook.
+              sleep:
+                seconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Safe only because `--redis-url` makes Redis the sole authority and
+            # local `--records`/`--feedback-records` files are rejected in that
+            # mode. Adding `--management-audit` requires a writable volume, since
+            # that audit must be persisted synchronously.
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # The reviewed Catalog/Route revision, published as a signed control
+            # manifest rather than baked into the image.
+            - name: control
+              mountPath: /app/catalog
+              subPath: catalog
+              readOnly: true
+            - name: control
+              mountPath: /app/gateway
+              subPath: gateway
+              readOnly: true
+      volumes:
+        - name: control
+          configMap:
+            name: urouter-control
+            optional: true

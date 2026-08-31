@@ -16,6 +16,7 @@ members = [
     "tools/urouter-smoke",
     "tools/urouter-soak",
     "tools/urouter-lab",
+    "tools/urouter-xtask",
 ]
 resolver = "2"
 
@@ -39,6 +40,8 @@ subtle = "2.6"
 thiserror = "2.0"
 tokio = { version = "1.52", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "json", "smallvec", "std", "time"] }
 url = "2.5"
 onnx-pb = "0.1.4"
 

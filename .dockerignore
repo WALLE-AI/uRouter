@@ -1,0 +1,14 @@
+# Vendored upstream projects and build output dominate the context otherwise.
+target/
+opensource/
+.git/
+.github/
+node_modules/
+
+# Local state and secrets must never enter a layer.
+.env
+.env.*
+!.env.example
+*.jsonl
+*.log
+.claude/

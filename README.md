@@ -29,8 +29,9 @@ cargo run -q -p urouter-gateway -- --bind 127.0.0.1:8787 \
   --management-keyring gateway/management-keyring.json \
   --management-audit /var/log/urouter/management-audit.jsonl
 cargo run --release -p urouter-catalog --example release_benchmark
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/check-secrets.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/check-pure-crates.ps1
+cargo run -q -p urouter-xtask -- check-secrets
+cargo run -q -p urouter-xtask -- check-pure-crates
+cargo run -q -p urouter-xtask -- check-pricing-fixture
 ```
 
 P4-P6 add a governed offline pipeline, signed learned-policy rollout, normalized
@@ -114,19 +115,43 @@ P2 adds typed fallback chains, dependency-aware readiness, graceful drain and
 OpenMetrics duration/TTFT/cost/fallback histograms. `GET /health/live` reports
 process liveness; `GET /health/ready` also checks drain state, shared-state
 dependencies and the required control revision. Run the reproducible Redis and
-upstream fault gate with `scripts/run-p2-chaos.ps1`; it writes
+upstream fault gate with `cargo run -p urouter-xtask -- chaos`; it writes
 `target/p2-chaos-report.json` and fails CI when a scenario fails.
+
+Structured logs complete the observability triple alongside metrics and
+DecisionRecords. Every request opens a `chat` span carrying `request_id`,
+`decision_id`, `tenant_key`, `tier` and `model`, and every rejected request emits
+one line with its stable error code, so a metric can be pivoted to a log line and
+then to a record. `--log-format` selects `json` (default) or `text`;
+`--log-level` sets the default filter and `RUST_LOG` overrides it. Bodies and
+upstream error text are never log fields — they stay on the DecisionRecord, which
+the tenant data policy governs.
+
+```bash
+cargo run -q -p urouter-gateway -- --bind 127.0.0.1:8787 \
+  --log-format text --log-level urouter_gateway=debug,info
+```
+
+Ambient `http_proxy`/`https_proxy` are always ignored for upstream calls: a
+Gateway routinely addresses loopback and in-cluster deployments that an inherited
+proxy would silently re-route or stall. An egress proxy is opted into explicitly:
+
+```bash
+cargo run -q -p urouter-gateway -- --bind 127.0.0.1:8787 \
+  --upstream-proxy http://egress.internal:3128 \
+  --upstream-no-proxy 127.0.0.1,localhost,.svc.cluster.local
+```
 
 P3 adds provider-neutral discovery, reviewed candidates, bounded capability
 probes, signed control manifests and hot reload. Bootstrap the checked-in
 Catalog/Route revision and start reload mode with:
 
-```powershell
+```bash
 cargo run -q -p urouter-catalog -- sync control-manifest
-cargo run -q -p urouter-gateway -- `
-  --bind 127.0.0.1:8787 `
-  --control-manifest gateway/control-manifest.json `
-  --control-reload-seconds 5 `
+cargo run -q -p urouter-gateway -- \
+  --bind 127.0.0.1:8787 \
+  --control-manifest gateway/control-manifest.json \
+  --control-reload-seconds 5 \
   --control-failure-policy last_good
 ```
 
@@ -147,6 +172,36 @@ The running Gateway exposes its P0 machine-readable API contract at
 `schema_version: 1`. Configuration-level `--dry-run` also avoids upstream, Redis, and
 listener activity; it returns the 16 design checks with explicit
 `pass/fail/warning/not_applicable/blocked` status and exits with code 2 on failure.
+
+## Deployment
+
+The `Dockerfile` produces a distroless image: the Gateway needs no shell and its
+TLS comes from rustls, not system OpenSSL. `docker-compose.yml` brings up two
+Gateways over one AOF-enabled Redis, which is the smallest topology that actually
+exercises the multi-instance guarantees — shared bindings, shared circuit state,
+one global Half-Open probe and Redis-authoritative records. A single instance
+proves none of them.
+
+```bash
+docker compose up --build
+curl -s localhost:8787/health/ready
+curl -s localhost:8788/health/ready
+```
+
+`deploy/kubernetes/gateway.yaml` is the reference manifest. Its substance is the
+shutdown path: `preStop` sleep must exceed the readiness detection window, and
+`terminationGracePeriodSeconds` must exceed `preStop + --shutdown-grace-seconds`,
+or the bounded drain cannot produce a zero-error rollout. Liveness deliberately
+uses `/health/live` rather than `/health/ready`, so a Redis outage withdraws Pods
+from the Service instead of crash-looping them.
+
+Shipped manifests are checked against the binary's own argument rules, so a
+manifest that names a rejected flag fails review rather than rollout:
+
+```bash
+cargo run -q -p urouter-xtask -- check-deploy
+cargo deny check
+```
 
 Execution status is tracked in
 [`docs/requirements-traceability.md`](docs/requirements-traceability.md). Architecture

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# Not part of the published surface in docs/public-api-and-semver.md:
+# internal ONNX loader for the offline lab only.
+publish = false
 description = "Bounded ONNX inference runtime for uRouter artifacts"
 
 [dependencies]

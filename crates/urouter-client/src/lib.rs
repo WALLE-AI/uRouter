@@ -31,7 +31,14 @@ impl UrouterClient {
             return Err(ClientError::InvalidGatewayScheme);
         }
         Ok(Self {
-            http: reqwest::Client::builder().timeout(timeout).build()?,
+            // Gateways are addressed directly, exactly like the Gateway's own
+            // upstream client. An ambient `http_proxy` must never silently
+            // re-route a Gateway call or turn a loopback deployment into a
+            // proxied request.
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(timeout)
+                .build()?,
             gateways,
             maximum_attempts,
         })

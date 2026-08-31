@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# Not part of the published surface in docs/public-api-and-semver.md:
+# distributed as a Python wheel via maturin, not on crates.io.
+publish = false
 description = "Python bindings for uRouter feature extraction and exact pricing"
 
 [lib]

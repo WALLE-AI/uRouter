@@ -1,0 +1,83 @@
+# Two Gateways over one Redis: the smallest topology that actually exercises the
+# multi-instance guarantees (shared task/session bindings, shared circuit state,
+# one global Half-Open probe, Redis-authoritative DecisionRecords and quota).
+#
+# A single Gateway proves nothing about those paths, which is why the M1 items in
+# docs/requirements-traceability.md stay `code_complete` until they are exercised
+# against a real deployment.
+#
+#   docker compose up --build
+#   curl -s localhost:8787/health/ready
+#   curl -s localhost:8788/health/ready
+
+services:
+  redis:
+    image: redis:7-alpine
+    # Restart durability depends on AOF; without it a Redis restart silently
+    # drops every binding and circuit the Gateways treat as authoritative.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway-a:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8787:8787"
+    command:
+      - "--bind"
+      - "0.0.0.0:8787"
+      - "--redis-url"
+      - "redis://redis:6379/"
+      - "--redis-prefix"
+      - "urouter-compose"
+      # Mandatory with --redis-url: shared state fails closed with a stable 503.
+      - "--on-state-unavailable"
+      - "fail_closed"
+      - "--log-format"
+      - "json"
+    healthcheck:
+      # distroless has no shell or curl, so the Gateway's own dry-run is the only
+      # in-container check available. Liveness/readiness HTTP probes belong to the
+      # orchestrator, which can reach the port directly (see deploy/kubernetes).
+      test: ["CMD", "/usr/local/bin/urouter-gateway", "--dry-run"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  gateway-b:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8788:8787"
+    command:
+      - "--bind"
+      - "0.0.0.0:8787"
+      - "--redis-url"
+      - "redis://redis:6379/"
+      - "--redis-prefix"
+      - "urouter-compose"
+      # Mandatory with --redis-url: shared state fails closed with a stable 503.
+      - "--on-state-unavailable"
+      - "fail_closed"
+      - "--log-format"
+      - "json"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/urouter-gateway", "--dry-run"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  redis-data:

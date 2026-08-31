@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# Not part of the published surface in docs/public-api-and-semver.md:
+# repository tooling.
+publish = false
 
 [dependencies]
 clap = { workspace = true, features = ["env"] }

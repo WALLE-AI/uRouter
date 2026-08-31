@@ -144,11 +144,15 @@ flowchart LR
 ## 主要实现位置
 
 - 网关入口与请求执行：`crates/urouter-gateway/src/main.rs`
+- 启动配置检查（`--dry-run`）：`crates/urouter-gateway/src/dry_run.rs`
+- 结构化日志与 span：`crates/urouter-gateway/src/logging.rs`
+- 客户端协议转换：`crates/urouter-gateway/src/protocol_translation.rs`
+- DecisionRecord/Feedback 持久化：`crates/urouter-gateway/src/persistence.rs`
 - 幂等状态端口：`crates/urouter-gateway/src/idempotency.rs`
 - 配额状态端口：`crates/urouter-gateway/src/quota.rs`
 - 预算状态端口：`crates/urouter-gateway/src/budget.rs`
 - Catalog/Route 控制面：`crates/urouter-gateway/src/control.rs`
-- 路由配置与决策算法：`crates/urouter-gateway/src/lib.rs`
+- 路由配置与决策算法：`crates/urouter-core/src/lib.rs`（Gateway 的 `lib.rs` 仅重新导出）
 - 模型事实与目录快照：`crates/urouter-ai/src/catalog.rs`
 - 公共类型与计价类型：`crates/urouter-types/src/`
 - 当前 Auto 路由配置：`gateway/route.json`
@@ -156,6 +160,8 @@ flowchart LR
 - 机器可读 API 契约：`gateway/openapi.json`，运行时为 `GET /openapi.json`
 - Provider 同步与发布：`tools/urouter-catalog/src/provider_sync.rs`
 - 后续实施状态：`docs/requirements-traceability.md`、`docs/p2-p3-execution-status.md`
+- 交付形态：`Dockerfile`、`docker-compose.yml`、`deploy/kubernetes/gateway.yaml`
+- 仓库门禁：`tools/urouter-xtask/`、`deny.toml`
 
 ## P4-P6 当前实现流程（覆盖旧的“仅 open_ai_chat”说明）
 
@@ -196,4 +202,4 @@ flowchart LR
 
 ## 验证说明
 
-本架构图依据当前代码、配置和测试定义维护。2026-08-30 的等价分拆全 workspace 门禁为 188 passed、0 failed、7 个 Redis 条件测试忽略，另有 1 个 rustdoc 通过；严格 Clippy、纯 crate 边界和 Secret 扫描通过。HTTP 契约覆盖 liveness/readiness、Catalog/Artifact 管理、OpenAPI、模型、Explain、Chat、Responses/Anthropic 转换和标准错误 envelope。Redis 条件测试仍需要显式提供 `UROUTER_TEST_REDIS_URL`；生产 Redis HA/ACL/TLS、真实数据集、shadow/canary 观察、跨云发布和真实 Agent Host 工具联调仍属于外部验收。
+本架构图依据当前代码、配置和测试定义维护。2026-08-31 的全 workspace 门禁为单条命令 247 passed、0 failed、7 个 Redis 条件测试忽略；严格 Clippy、`cargo deny check`、纯 crate 边界、Secret 扫描和部署清单 dry-run 校验全部通过。HTTP 契约覆盖 liveness/readiness、Catalog/Artifact 管理、OpenAPI、模型、Explain、Chat、Responses/Anthropic 转换和标准错误 envelope。Redis 条件测试仍需要显式提供 `UROUTER_TEST_REDIS_URL`；生产 Redis HA/ACL/TLS、真实数据集、shadow/canary 观察、跨云发布和真实 Agent Host 工具联调仍属于外部验收。

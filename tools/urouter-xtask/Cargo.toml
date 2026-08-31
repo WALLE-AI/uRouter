@@ -1,5 +1,5 @@
 [package]
-name = "urouter-smoke"
+name = "urouter-xtask"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,10 +10,7 @@ publish = false
 
 [dependencies]
 clap.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-urouter-ai = { path = "../../crates/urouter-ai" }
-urouter-types = { path = "../../crates/urouter-types" }
 
 [lints]
 workspace = true

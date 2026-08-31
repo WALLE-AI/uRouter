@@ -14,7 +14,7 @@ Overall status: `code_complete`, not production `accepted`.
 | P1-06 reliability policy extraction | code_complete | Typed errors, bounded retry/cooldown, acyclic fallback plan and stable migration taxonomy remain pure | provider error mapping review |
 | P1-07 DecisionCascade | code_complete | Pure pin/signal/quality/cost/default cascade, signed artifact decider and bounded Judge/Escalation step contract | remote Judge activation requires approval |
 | P1-08 State ports | code_complete | Memory/Redis binding, circuit, idempotency, DecisionRecord, quota and budget adapters share repository contracts | Redis HA/ACL/TLS drill |
-| P1-09 dependency boundary | code_complete | CI and `scripts/check-pure-crates.ps1` prevent forbidden I/O dependencies in pure crates | extend the deny list as crates evolve |
+| P1-09 dependency boundary | code_complete | CI and `urouter-xtask check-pure-crates` prevent forbidden I/O dependencies in pure crates | extend the deny list as crates evolve |
 | P1-10 configuration dry-run | code_complete | Stable 16-item report validates manifest/auth/Route, artifact signature/schema/revisions/tiers and exploration constraints without opening Redis/listener | deployment configuration regression |
 | P1-11 property/fuzz/state tests | code_complete | Generated malformed Catalog/endpoint/cost properties, fallback graph, monotonic cooldown/cost, CAS and quota concurrency tests | expand corpus as policies evolve |
 
@@ -42,11 +42,11 @@ contract.
 - `cargo test -p urouter-gateway --lib`: 21 passed, 2 Redis-conditional ignored.
 - `cargo test -p urouter-gateway --bin urouter-gateway`: 81 passed,
   5 Redis-conditional ignored.
-- Equivalent split execution of the complete workspace set: 188 passed, 0 failed,
+- Complete workspace set in a single command: 247 passed, 0 failed,
   7 Redis-conditional ignored. The affected packages are rebuilt separately because
   Windows Application Control blocks an older cached test executable on this host.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
-- `scripts/check-pure-crates.ps1`: passed.
+- `urouter-xtask check-pure-crates`: passed.
 
 ## Quota Boundary
 

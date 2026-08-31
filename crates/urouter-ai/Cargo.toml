@@ -11,7 +11,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 url.workspace = true
-urouter-types = { path = "../urouter-types" }
+urouter-types = { version = "0.1.0", path = "../urouter-types" }
 
 [dev-dependencies]
 serde_json.workspace = true

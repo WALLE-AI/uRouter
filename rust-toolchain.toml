@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned so that local runs and CI execute the same fmt/clippy/test gates.
+# `rust-version = "1.88"` in Cargo.toml remains the declared MSRV; this pin is
+# the toolchain the release gate is reproduced with.
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
