@@ -4604,6 +4604,24 @@ fn next_eligible_model(
         .find(|model| decision.admission.eligible.contains(model))
 }
 
+pub(crate) const BINDING_SKIP_COMPATIBILITY: &str = "compatibility_mode";
+
+/// Why `commit_task_binding` declines to persist a binding, or `None` when it
+/// should proceed. Extracted so the reason can be logged and asserted rather
+/// than being an anonymous early return.
+fn binding_skip_reason(decision: &RouteDecision) -> Option<&'static str> {
+    if decision.compatibility_mode {
+        return Some(BINDING_SKIP_COMPATIBILITY);
+    }
+    if decision.call_role != Some(CallRole::Primary) {
+        return Some("not_a_primary_call");
+    }
+    if decision.reason == "explicit_model" {
+        return Some("explicit_model");
+    }
+    None
+}
+
 async fn commit_task_binding(
     state: &AppState,
     governance: &RequestGovernance,
@@ -4611,13 +4629,26 @@ async fn commit_task_binding(
     tier: &str,
     model: &ModelId,
 ) -> Result<(), GatewayError> {
-    if decision.compatibility_mode
-        || decision.call_role != Some(CallRole::Primary)
-        || decision.reason == "explicit_model"
-    {
+    if let Some(reason) = binding_skip_reason(decision) {
+        if reason == BINDING_SKIP_COMPATIBILITY {
+            // The other skip reasons are deliberate choices by the caller. This
+            // one is almost always a mistake, and it is otherwise invisible: the
+            // integrator gets a Gateway that looks healthy while session
+            // continuity silently does not hold. Neither the response nor the
+            // DecisionRecord says anything about it.
+            tracing::warn!(
+                reason,
+                "task binding not committed: the request is in compatibility mode, so session \
+                 continuity will not hold. It must carry task.id, agent.harness, call.role, \
+                 trace.turn and data_policy, and a trusted tenant header."
+            );
+        } else {
+            tracing::debug!(reason, "task binding not committed");
+        }
         return Ok(());
     }
     let Some(task_id) = decision.task_id.as_deref() else {
+        tracing::debug!(reason = "no_task_id", "task binding not committed");
         return Ok(());
     };
     let Some(binding_key) = decision_binding_key(&governance.tenant_key, decision) else {

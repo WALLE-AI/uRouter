@@ -44,6 +44,53 @@ jobs:
       # the reasoning behind each exception live in deny.toml.
       - run: cargo deny check
 
+  coverage:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # Measured without Redis the figure is meaningless: shared_state.rs reads
+      # 0.00% purely because the Redis contracts are #[ignore]d, and every Redis
+      # branch of binding/circuit/quota/budget/idempotency is understated. With
+      # Redis the workspace measures 73.40% instead of 66.50%.
+      UROUTER_TEST_REDIS_URL: redis://127.0.0.1:6379/
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # `urouter-smoke` and `urouter-soak` are CLIs whose whole purpose is
+      # hitting real endpoints; their ~6% is correct and would otherwise depress
+      # the total permanently and mask real regressions.
+      #
+      # The threshold is the measured baseline minus one point. It exists to
+      # prevent regression, not to force test-writing: a high threshold set up
+      # front produces tests written for the counter, which turns the gate green
+      # without finding defects. Raise it by hand as docs/test-coverage-plan.md
+      # phases land.
+      - name: Workspace coverage with Redis
+        run: |
+          cargo llvm-cov --workspace \
+            --ignore-filename-regex '(urouter-smoke|urouter-soak)/src' \
+            --fail-under-lines 78 \
+            --lcov --output-path lcov.info \
+            -- --include-ignored
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lcov
+          path: lcov.info
+
   redis-contracts:
     runs-on: ubuntu-latest
     services:

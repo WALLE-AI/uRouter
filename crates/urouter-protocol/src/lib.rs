@@ -912,6 +912,499 @@ mod tests {
         assert_eq!(report.losses.len(), 2);
     }
 
+    /// A transport that can carry nothing optional, for asserting that each
+    /// unsupported feature is reported rather than dropped.
+    fn bare_capabilities() -> TransportCapabilities {
+        TransportCapabilities {
+            api: WireApi::Custom("limited".to_owned()),
+            developer_role: false,
+            tools: false,
+            images: false,
+            structured_output: false,
+            reasoning: false,
+        }
+    }
+
+    fn chat(value: &Value) -> NormalizedRequest {
+        from_openai_chat(value).unwrap()
+    }
+
+    fn kinds(report: &LossReport) -> Vec<LossKind> {
+        report.losses.iter().map(|loss| loss.kind).collect()
+    }
+
+    // --- LossKind: one condition per variant, on every target that can produce it
+
+    #[test]
+    fn role_downgraded_is_reported_by_chat_and_by_anthropic() {
+        let request = chat(&json!({
+            "model": "m",
+            "messages": [{"role": "developer", "content": "policy"}]
+        }));
+
+        let (_, report) =
+            to_openai_chat(&request, &bare_capabilities(), LossPolicy::AllowDocumented).unwrap();
+        assert_eq!(kinds(&report), vec![LossKind::RoleDowngraded]);
+
+        // Anthropic has no developer role at all: it merges into `system`.
+        let (wire, report) = to_anthropic_messages(&request, LossPolicy::AllowDocumented).unwrap();
+        assert_eq!(kinds(&report), vec![LossKind::RoleDowngraded]);
+        assert_eq!(wire["system"][0]["text"], "policy");
+    }
+
+    #[test]
+    fn reasoning_dropped_is_reported_by_every_target_that_cannot_replay_it() {
+        let request = chat(&json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": "x", "reasoning_content": "why"}]
+        }));
+
+        let (wire, report) =
+            to_openai_chat(&request, &bare_capabilities(), LossPolicy::AllowDocumented).unwrap();
+        assert_eq!(kinds(&report), vec![LossKind::ReasoningDropped]);
+        assert!(wire["messages"][0].get("reasoning_content").is_none());
+
+        let (_, report) = to_openai_responses(&request, LossPolicy::AllowDocumented).unwrap();
+        assert_eq!(kinds(&report), vec![LossKind::ReasoningDropped]);
+
+        let (_, report) = to_anthropic_messages(&request, LossPolicy::AllowDocumented).unwrap();
+        assert_eq!(kinds(&report), vec![LossKind::ReasoningDropped]);
+    }
+
+    #[test]
+    fn image_dropped_is_reported_when_the_target_has_no_image_support() {
+        let request = chat(&json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": "https://example/i.png"}}
+            ]}]
+        }));
+        let (wire, report) =
+            to_openai_chat(&request, &bare_capabilities(), LossPolicy::AllowDocumented).unwrap();
+        assert_eq!(kinds(&report), vec![LossKind::ImageDropped]);
+        // The text survives and the image is gone, rather than being emitted in
+        // a shape the transport cannot read.
+        assert_eq!(wire["messages"][0]["content"], "look");
+    }
+
+    #[test]
+    fn tool_dropped_is_reported_for_an_unsupported_transport_and_for_a_tool_result_without_an_id() {
+        let with_tools = chat(&json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {}}}]
+        }));
+        let (wire, report) = to_openai_chat(
+            &with_tools,
+            &bare_capabilities(),
+            LossPolicy::AllowDocumented,
+        )
+        .unwrap();
+        assert_eq!(kinds(&report), vec![LossKind::ToolDropped]);
+        assert!(wire.get("tools").is_none());
+
+        // Anthropic tool_result requires a tool_use_id; a tool message without
+        // one cannot be represented at all.
+        let orphan_result = chat(&json!({
+            "model": "m",
+            "messages": [{"role": "tool", "content": "done"}]
+        }));
+        let (_, report) =
+            to_anthropic_messages(&orphan_result, LossPolicy::AllowDocumented).unwrap();
+        assert_eq!(kinds(&report), vec![LossKind::ToolDropped]);
+    }
+
+    #[test]
+    fn structured_output_dropped_is_reported_by_chat_and_by_anthropic() {
+        let request = chat(&json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"}
+        }));
+
+        let (wire, report) =
+            to_openai_chat(&request, &bare_capabilities(), LossPolicy::AllowDocumented).unwrap();
+        assert_eq!(kinds(&report), vec![LossKind::StructuredOutputDropped]);
+        assert!(wire.get("response_format").is_none());
+
+        // Anthropic Messages has no response schema field at all.
+        let (_, report) = to_anthropic_messages(&request, LossPolicy::AllowDocumented).unwrap();
+        assert_eq!(kinds(&report), vec![LossKind::StructuredOutputDropped]);
+    }
+
+    /// The load-bearing property of the permissive policy: it tolerates loss but
+    /// never hides it. A loss that is dropped without a report leaves no evidence
+    /// on the `DecisionRecord` and cannot be attributed afterwards.
+    #[test]
+    fn allow_documented_still_reports_every_loss_it_tolerates() {
+        let request = chat(&json!({
+            "model": "m",
+            "messages": [
+                {"role": "developer", "content": "policy"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image_url", "image_url": {"url": "https://example/i.png"}}
+                ]},
+                {"role": "assistant", "content": "x", "reasoning_content": "why"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {}}}],
+            "response_format": {"type": "json_object"}
+        }));
+
+        let rejected = to_openai_chat(&request, &bare_capabilities(), LossPolicy::Reject);
+        assert!(matches!(rejected, Err(ProtocolError::SemanticLoss(_))));
+
+        let (_, report) =
+            to_openai_chat(&request, &bare_capabilities(), LossPolicy::AllowDocumented).unwrap();
+        let reported = kinds(&report);
+        for kind in [
+            LossKind::RoleDowngraded,
+            LossKind::ReasoningDropped,
+            LossKind::ImageDropped,
+            LossKind::ToolDropped,
+            LossKind::StructuredOutputDropped,
+        ] {
+            assert!(reported.contains(&kind), "{kind:?} was tolerated silently");
+        }
+        // Every loss carries a path and a reason, so it can be attributed.
+        for loss in &report.losses {
+            assert!(!loss.path.is_empty());
+            assert!(!loss.detail.is_empty());
+        }
+        assert_eq!(report.source_api, WireApi::OpenAiChat);
+        assert_eq!(report.target_api, WireApi::Custom("limited".to_owned()));
+    }
+
+    // --- ProtocolError: one test per variant
+
+    #[test]
+    fn missing_required_fields_are_reported_by_name() {
+        let cases: Vec<(&str, Value)> = vec![
+            ("model", json!({"messages": []})),
+            ("messages", json!({"model": "m"})),
+            (
+                "role",
+                json!({"model": "m", "messages": [{"content": "x"}]}),
+            ),
+            (
+                "content.type",
+                json!({"model": "m", "messages": [{"role": "user", "content": [{"text": "x"}]}]}),
+            ),
+            (
+                "image_url.url",
+                json!({"model": "m", "messages": [{"role": "user",
+                    "content": [{"type": "image_url", "image_url": {}}]}]}),
+            ),
+            (
+                "function.arguments",
+                json!({"model": "m", "messages": [{"role": "assistant", "content": null,
+                    "tool_calls": [{"id": "c1", "function": {"name": "f"}}]}]}),
+            ),
+            (
+                "tools.function",
+                json!({"model": "m", "messages": [], "tools": [{"type": "function"}]}),
+            ),
+        ];
+        for (field, value) in cases {
+            match from_openai_chat(&value) {
+                Err(ProtocolError::MissingField(reported)) => {
+                    assert_eq!(reported, field, "wrong field reported for {field}");
+                }
+                other => panic!("{field} was not reported as missing: {other:?}"),
+            }
+        }
+
+        // Responses and Anthropic report their own required fields.
+        assert!(matches!(
+            from_openai_responses(&json!({"model": "m"})),
+            Err(ProtocolError::MissingField("input"))
+        ));
+        assert!(matches!(
+            from_anthropic_messages(&json!({"model": "m"})),
+            Err(ProtocolError::MissingField("messages"))
+        ));
+        assert!(matches!(
+            from_anthropic_messages(&json!({"model": "m", "messages": [{"role": "user"}]})),
+            Err(ProtocolError::MissingField("content"))
+        ));
+    }
+
+    #[test]
+    fn invalid_fields_are_distinguished_from_missing_ones() {
+        // Content that is neither a string nor an array.
+        assert!(matches!(
+            from_openai_chat(&json!({"model": "m", "messages": [{"role": "user", "content": 7}]})),
+            Err(ProtocolError::InvalidField("content"))
+        ));
+        // Tool-call arguments are a JSON string; unparseable text is invalid,
+        // not missing.
+        assert!(matches!(
+            from_openai_chat(&json!({"model": "m", "messages": [{"role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "not json"}}]}]})),
+            Err(ProtocolError::InvalidField("function.arguments"))
+        ));
+        assert!(matches!(
+            from_anthropic_messages(&json!({"model": "m",
+                "messages": [{"role": "user", "content": 7}]})),
+            Err(ProtocolError::InvalidField("content"))
+        ));
+    }
+
+    #[test]
+    fn an_unknown_role_is_rejected_rather_than_coerced() {
+        match from_openai_chat(&json!({
+            "model": "m",
+            "messages": [{"role": "narrator", "content": "x"}]
+        })) {
+            Err(ProtocolError::UnsupportedRole(role)) => assert_eq!(role, "narrator"),
+            other => panic!("expected UnsupportedRole, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_content_part_is_rejected_rather_than_dropped() {
+        match from_openai_chat(&json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [{"type": "audio", "audio": {}}]}]
+        })) {
+            Err(ProtocolError::UnsupportedContent(kind)) => assert_eq!(kind, "audio"),
+            other => panic!("expected UnsupportedContent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_required_string_counts_as_missing() {
+        assert!(matches!(
+            from_openai_chat(&json!({"model": "", "messages": []})),
+            Err(ProtocolError::MissingField("model"))
+        ));
+    }
+
+    // --- Anthropic and Responses parsing: previously one happy path each
+
+    #[test]
+    fn anthropic_parsing_covers_system_tools_tool_use_tool_result_and_images() {
+        let request = from_anthropic_messages(&json!({
+            "model": "claude",
+            "system": "be brief",
+            "max_tokens": 256,
+            "stream": true,
+            "urouter": {"contract_version": 2},
+            "tools": [{"name": "lookup", "description": "d", "input_schema": {"type": "object"}}],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image", "source": {"type": "url", "url": "https://example/i.png"}}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {"id": 1}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call-1", "content": "done"}
+                ]}
+            ]
+        }))
+        .unwrap();
+
+        // `system` becomes a leading System message rather than a side channel.
+        assert_eq!(request.messages[0].role, Role::System);
+        assert_eq!(
+            request.messages[0].content,
+            vec![ContentPart::Text {
+                text: "be brief".to_owned()
+            }]
+        );
+        assert_eq!(
+            request.messages[1].content[1],
+            ContentPart::ImageUrl {
+                url: "https://example/i.png".to_owned()
+            }
+        );
+        assert_eq!(request.messages[2].tool_calls[0].name, "lookup");
+        assert_eq!(
+            request.messages[2].tool_calls[0].arguments,
+            json!({"id": 1})
+        );
+        assert_eq!(request.messages[3].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(request.tools[0].parameters, json!({"type": "object"}));
+        assert_eq!(request.max_output_tokens, Some(256));
+        assert!(request.stream);
+        assert_eq!(request.extensions, json!({"contract_version": 2}));
+        // Anthropic Messages carries no response schema.
+        assert_eq!(request.response_schema, None);
+    }
+
+    /// A tool definition without `input_schema` defaults to an empty object
+    /// schema rather than failing, so a provider that omits it stays routable.
+    #[test]
+    fn anthropic_tool_without_an_input_schema_defaults_to_an_object() {
+        let request = from_anthropic_messages(&json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "lookup"}]
+        }))
+        .unwrap();
+        assert_eq!(request.tools[0].parameters, json!({"type": "object"}));
+        assert_eq!(request.tools[0].description, None);
+    }
+
+    /// Content blocks the IR has no representation for are skipped rather than
+    /// rejected, because Anthropic adds block types independently of uRouter.
+    #[test]
+    fn anthropic_skips_unknown_content_blocks_instead_of_failing() {
+        let request = from_anthropic_messages(&json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "keep"},
+                {"type": "thinking", "thinking": "ignore"}
+            ]}]
+        }))
+        .unwrap();
+        assert_eq!(
+            request.messages[0].content,
+            vec![ContentPart::Text {
+                text: "keep".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn responses_parsing_covers_flat_tools_array_input_and_text_format() {
+        let request = from_openai_responses(&json!({
+            "model": "gpt",
+            "input": [
+                {"role": "system", "content": "policy"},
+                {"role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+            ],
+            "tools": [{"type": "function", "name": "lookup", "description": "d",
+                       "parameters": {"type": "object"}}],
+            "text": {"format": {"type": "json_schema"}},
+            "max_output_tokens": 64,
+            "stream": true,
+            "urouter": {"contract_version": 2}
+        }))
+        .unwrap();
+
+        assert_eq!(request.messages[0].role, Role::System);
+        assert_eq!(
+            request.messages[1].content,
+            vec![ContentPart::Text {
+                text: "hello".to_owned()
+            }]
+        );
+        // Responses tools are flat, not nested under `function` as in Chat.
+        assert_eq!(request.tools[0].name, "lookup");
+        assert_eq!(request.tools[0].parameters, json!({"type": "object"}));
+        assert_eq!(
+            request.response_schema,
+            Some(json!({"type": "json_schema"}))
+        );
+        assert_eq!(request.max_output_tokens, Some(64));
+        assert!(request.stream);
+        assert_eq!(request.extensions, json!({"contract_version": 2}));
+    }
+
+    #[test]
+    fn responses_tool_without_a_name_is_rejected() {
+        assert!(matches!(
+            from_openai_responses(&json!({
+                "model": "gpt",
+                "input": "hi",
+                "tools": [{"type": "function", "parameters": {}}]
+            })),
+            Err(ProtocolError::MissingField("name"))
+        ));
+    }
+
+    /// Anthropic has no optional output bound, so the converter substitutes one.
+    /// That default changes provider behaviour, so it is pinned rather than left
+    /// as an implementation detail.
+    #[test]
+    fn anthropic_substitutes_a_default_max_tokens_when_the_request_omits_one() {
+        let request = chat(&json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(request.max_output_tokens, None);
+        let (wire, report) = to_anthropic_messages(&request, LossPolicy::Reject).unwrap();
+        assert!(report.losses.is_empty());
+        assert_eq!(wire["max_tokens"], 1024);
+
+        let bounded = chat(&json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 32
+        }));
+        assert_eq!(
+            to_anthropic_messages(&bounded, LossPolicy::Reject)
+                .unwrap()
+                .0["max_tokens"],
+            32
+        );
+    }
+
+    #[test]
+    fn anthropic_round_trip_preserves_system_tools_and_tool_calls() {
+        let source = chat(&json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call-1", "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"id\":1}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "done"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+            "max_tokens": 32
+        }));
+        let (wire, report) = to_anthropic_messages(&source, LossPolicy::Reject).unwrap();
+        assert!(report.losses.is_empty());
+        let reparsed = from_anthropic_messages(&wire).unwrap();
+
+        assert_eq!(reparsed.model, source.model);
+        assert_eq!(reparsed.max_output_tokens, source.max_output_tokens);
+        assert_eq!(reparsed.tools, source.tools);
+        assert_eq!(reparsed.messages[0].role, Role::System);
+        assert_eq!(
+            reparsed.messages[0].content,
+            vec![ContentPart::Text {
+                text: "be brief".to_owned()
+            }]
+        );
+        // The tool call survives with its identity and arguments intact.
+        let call = &reparsed.messages[2].tool_calls[0];
+        assert_eq!(call.id, "call-1");
+        assert_eq!(call.name, "lookup");
+        assert_eq!(call.arguments, json!({"id": 1}));
+        // The tool result keeps the id that links it back to the call.
+        assert_eq!(reparsed.messages[3].tool_call_id.as_deref(), Some("call-1"));
+    }
+
+    /// `to_openai_responses` emits tool traffic as `function_call` /
+    /// `function_call_output` items, which carry no `role`. Reparsing therefore
+    /// fails by design rather than inventing one. This pins the boundary of the
+    /// Responses round trip so it is not mistaken for a defect.
+    #[test]
+    fn responses_tool_items_are_not_reparseable_and_say_so() {
+        let source = chat(&json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call-1", "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }]}]
+        }));
+        let (wire, _) = to_openai_responses(&source, LossPolicy::Reject).unwrap();
+        assert_eq!(wire["input"][1]["type"], "function_call");
+        assert!(matches!(
+            from_openai_responses(&wire),
+            Err(ProtocolError::MissingField("role"))
+        ));
+    }
+
     #[test]
     fn responses_and_anthropic_share_the_same_ir() {
         let responses = from_openai_responses(&json!({

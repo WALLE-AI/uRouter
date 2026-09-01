@@ -31,21 +31,39 @@ pub(crate) async fn tombstone_record_vectors(
     Ok(())
 }
 
+/// One retention pass: collect what has expired, prune it, and tombstone the
+/// semantic vectors it referenced.
+///
+/// Separated from the loop so the sweep can be asserted directly. Leaving it
+/// inline would mean the only way to exercise TTL enforcement is to wait out the
+/// sweep interval, so in practice it would never be tested at all.
+///
+/// Vectors are tombstoned only after the prune succeeds: a failed prune leaves
+/// the records readable, and their vectors must stay readable with them.
+pub(crate) async fn sweep_expired_records(
+    records: &RecordStore,
+    vectors: Option<&VectorSideStore>,
+) -> usize {
+    let expired = records
+        .records
+        .read()
+        .await
+        .iter()
+        .filter(|record| record_expired(record))
+        .cloned()
+        .collect::<Vec<_>>();
+    if records.prune_expired().await.is_ok() {
+        let _ = tombstone_record_vectors(vectors, &expired).await;
+        return expired.len();
+    }
+    0
+}
+
 pub(crate) fn spawn_retention_sweeper(records: RecordStore, vectors: Option<Arc<VectorSideStore>>) {
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(60)).await;
-            let expired = records
-                .records
-                .read()
-                .await
-                .iter()
-                .filter(|record| record_expired(record))
-                .cloned()
-                .collect::<Vec<_>>();
-            if records.prune_expired().await.is_ok() {
-                let _ = tombstone_record_vectors(vectors.as_deref(), &expired).await;
-            }
+            sweep_expired_records(&records, vectors.as_deref()).await;
         }
     });
 }

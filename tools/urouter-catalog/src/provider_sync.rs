@@ -2034,6 +2034,278 @@ mod tests {
         server.await.unwrap();
     }
 
+    // --- Driver error and throttling paths (docs/test-coverage-plan.md Phase 5)
+    //
+    // Discovery output passes human review, candidate quarantine and
+    // control-last publish before it can reach the active Catalog, so the goal
+    // here is not overall coverage. It is that a provider behaving badly — a
+    // 401, a truncated page set, a body that is not the documented shape — is
+    // refused with a typed reason instead of yielding a partial inventory that
+    // looks complete.
+
+    /// Serves `responses` in order on one connection each, then stops.
+    async fn fixture_server(
+        responses: Vec<(u16, String)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            for (status, body) in responses {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = vec![0_u8; 8192];
+                let _ = socket.read(&mut buffer).await;
+                let reason = if status == 200 { "OK" } else { "ERROR" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (address.to_string(), handle)
+    }
+
+    fn discovery_client() -> Client {
+        Client::builder().no_proxy().build().unwrap()
+    }
+
+    /// Present on every platform the workspace builds for.
+    const ALWAYS_PRESENT_ENV: &str = "PATH";
+
+    /// An upstream error must surface as a typed HTTP failure carrying the
+    /// status, not as an empty inventory that would read as "this provider has
+    /// no models" and silently retire every model it publishes.
+    #[tokio::test]
+    async fn discovery_reports_upstream_error_statuses_with_their_body() {
+        for status in [401_u16, 429, 500] {
+            let (address, server) =
+                fixture_server(vec![(status, r#"{"error":"denied"}"#.to_owned())]).await;
+            let instance = instance(DiscoveryConfig::OpenAiModels {
+                url: format!("http://{address}/v1/models"),
+                auth_env: None,
+                query: BTreeMap::new(),
+                min_request_interval_ms: 0,
+            });
+            let client = discovery_client();
+            let context = DiscoveryContext {
+                client: &client,
+                instance: &instance,
+                base_dir: Path::new("."),
+            };
+            match OpenAiModelsDriver.discover(&context).await {
+                Err(SyncError::Http {
+                    status: reported,
+                    body,
+                }) => {
+                    assert_eq!(reported.as_u16(), status);
+                    assert!(body.contains("denied"), "{body}");
+                }
+                other => panic!("HTTP {status} was not reported: {other:?}"),
+            }
+            server.abort();
+        }
+    }
+
+    /// A 200 whose body is not the documented shape is refused rather than
+    /// parsed into an empty list.
+    #[tokio::test]
+    async fn discovery_refuses_a_successful_response_of_the_wrong_shape() {
+        let (address, server) =
+            fixture_server(vec![(200, r#"{"object":"error","data":[]}"#.to_owned())]).await;
+        let instance = instance(DiscoveryConfig::OpenAiModels {
+            url: format!("http://{address}/v1/models"),
+            auth_env: None,
+            query: BTreeMap::new(),
+            min_request_interval_ms: 0,
+        });
+        let client = discovery_client();
+        let context = DiscoveryContext {
+            client: &client,
+            instance: &instance,
+            base_dir: Path::new("."),
+        };
+        assert!(matches!(
+            OpenAiModelsDriver.discover(&context).await,
+            Err(SyncError::InvalidResponse(_))
+        ));
+        server.abort();
+    }
+
+    /// A configured credential that is absent must fail before the request is
+    /// sent, so an unauthenticated call is never made against a paid endpoint.
+    #[test]
+    fn a_missing_credential_fails_before_the_request_is_sent() {
+        let client = discovery_client();
+        let request = client.get("https://example.com/v1/models");
+        match apply_bearer(request, Some("UROUTER_TEST_ABSENT_CREDENTIAL")) {
+            Err(SyncError::MissingCredential(name)) => {
+                assert_eq!(name, "UROUTER_TEST_ABSENT_CREDENTIAL");
+            }
+            other => panic!("expected MissingCredential, got {other:?}"),
+        }
+        // No configured credential is not an error: loopback and unauthenticated
+        // inventories are legitimate.
+        assert!(apply_bearer(client.get("https://example.com/v1/models"), None).is_ok());
+    }
+
+    /// Pagination must terminate. A provider that keeps reporting more pages
+    /// than configured is refused rather than looped over indefinitely.
+    #[tokio::test]
+    async fn bailian_pagination_stops_at_the_configured_page_limit() {
+        // Every page is full and claims a larger total, so the driver never sees
+        // a natural end.
+        let page = |page_no: u32| {
+            (
+                200_u16,
+                serde_json::to_string(&json!({
+                    "output": {
+                        "total": 100,
+                        "page_no": page_no,
+                        "page_size": 2,
+                        "models": [
+                            {"model": format!("m-{page_no}-a")},
+                            {"model": format!("m-{page_no}-b")}
+                        ]
+                    }
+                }))
+                .unwrap(),
+            )
+        };
+        let (address, server) = fixture_server(vec![page(1), page(2)]).await;
+        let instance = instance(DiscoveryConfig::BailianCatalog {
+            url: format!("http://{address}/models"),
+            // The workspace forbids `unsafe_code` and `env::set_var` is unsafe in
+            // edition 2024, so the test borrows a variable that always exists.
+            // Only the presence of a credential matters here, not its value.
+            auth_env: ALWAYS_PRESENT_ENV.to_owned(),
+            page_size: 2,
+            max_pages: 2,
+            query: BTreeMap::new(),
+            min_request_interval_ms: 0,
+        });
+        let client = discovery_client();
+        let context = DiscoveryContext {
+            client: &client,
+            instance: &instance,
+            base_dir: Path::new("."),
+        };
+        match BailianCatalogDriver.discover(&context).await {
+            Err(SyncError::PaginationLimit(limit)) => assert_eq!(limit, 2),
+            other => panic!("expected PaginationLimit, got {other:?}"),
+        }
+        server.abort();
+    }
+
+    /// A short page means the inventory is complete, so the driver stops early
+    /// rather than spending the remaining page budget on empty requests.
+    #[tokio::test]
+    async fn bailian_pagination_stops_early_on_a_short_page() {
+        let body = serde_json::to_string(&json!({
+            "output": {
+                "total": 100,
+                "page_no": 1,
+                "page_size": 10,
+                "models": [{"model": "only-one"}]
+            }
+        }))
+        .unwrap();
+        let (address, server) = fixture_server(vec![(200, body)]).await;
+        let instance = instance(DiscoveryConfig::BailianCatalog {
+            url: format!("http://{address}/models"),
+            auth_env: ALWAYS_PRESENT_ENV.to_owned(),
+            page_size: 10,
+            max_pages: 5,
+            query: BTreeMap::new(),
+            min_request_interval_ms: 0,
+        });
+        let client = discovery_client();
+        let context = DiscoveryContext {
+            client: &client,
+            instance: &instance,
+            base_dir: Path::new("."),
+        };
+        let models = BailianCatalogDriver.discover(&context).await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].upstream_id, "only-one");
+        server.abort();
+    }
+
+    /// Malformed Bailian pages are rejected by shape rather than yielding a
+    /// partially parsed inventory.
+    #[test]
+    fn bailian_pages_are_rejected_by_shape() {
+        for value in [
+            json!({}),
+            json!({"output": {}}),
+            json!({"output": {"models": [{"name": "no id"}]}}),
+        ] {
+            assert!(
+                matches!(
+                    parse_bailian_page(&value),
+                    Err(SyncError::InvalidResponse(_))
+                ),
+                "accepted a malformed page: {value}"
+            );
+        }
+    }
+
+    /// The static driver is the reviewed-inventory path. A missing or malformed
+    /// file must be typed, not a panic or an empty inventory.
+    #[tokio::test]
+    async fn reviewed_static_driver_reports_missing_and_malformed_inventories() {
+        let root = env::temp_dir().join(format!("urouter-static-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let client = discovery_client();
+
+        let absent = instance(DiscoveryConfig::ReviewedStatic {
+            path: PathBuf::from("absent.json"),
+        });
+        assert!(matches!(
+            ReviewedStaticDriver
+                .discover(&DiscoveryContext {
+                    client: &client,
+                    instance: &absent,
+                    base_dir: &root,
+                })
+                .await,
+            Err(SyncError::Io(_))
+        ));
+
+        fs::write(root.join("bad.json"), b"{\"models\": {}}").unwrap();
+        let malformed = instance(DiscoveryConfig::ReviewedStatic {
+            path: PathBuf::from("bad.json"),
+        });
+        assert!(matches!(
+            ReviewedStaticDriver
+                .discover(&DiscoveryContext {
+                    client: &client,
+                    instance: &malformed,
+                    base_dir: &root,
+                })
+                .await,
+            Err(SyncError::InvalidResponse(_))
+        ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An endpoint template naming an unset variable must fail with the variable
+    /// name, so a misconfigured registry is diagnosable without guessing.
+    #[test]
+    fn endpoint_templates_report_the_missing_variable_by_name() {
+        match endpoint_url(
+            "https://${UROUTER_TEST_ABSENT_HOST}/v1/models",
+            &BTreeMap::new(),
+        ) {
+            Err(SyncError::MissingEndpointVariable(name)) => {
+                assert_eq!(name, "UROUTER_TEST_ABSENT_HOST");
+            }
+            other => panic!("expected MissingEndpointVariable, got {other:?}"),
+        }
+    }
+
     #[test]
     fn unreviewed_candidate_is_quarantined_with_all_required_evidence() {
         let catalog =

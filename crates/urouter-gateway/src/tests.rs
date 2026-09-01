@@ -8,6 +8,9 @@ use crate::dry_run::{
     CASCADE_COST_CLASSES, ValidationCostClass, cost_override_reason_check, dry_run_report,
     monotonic_cost_class_status,
 };
+use crate::persistence::{
+    remove_rotated_copy, rewrite_feedback, rewrite_records, rotate_if_needed, sweep_expired_records,
+};
 use crate::protocol_translation::{chat_to_anthropic, chat_to_responses, translate_chat_sse_event};
 use axum::{body::to_bytes, http::Request};
 use serde_json::json;
@@ -447,6 +450,1074 @@ fn provider_transports_convert_non_stream_requests_and_responses_without_guessin
         provider_request(&stream, &model).unwrap_err().code,
         "unsupported_provider_streaming"
     );
+}
+
+/// The existing transport test reaches the stream guard only on the Anthropic
+/// branch. Responses has its own call site and was never exercised.
+#[test]
+fn responses_transport_rejects_streaming_before_conversion() {
+    let catalog =
+        CatalogSnapshot::from_json_str(include_str!("../../../catalog/catalog.json")).unwrap();
+    let mut model = catalog.models().next().unwrap().clone();
+    model.upstream_id = "provider-model".to_owned();
+    model.api = WireApi::OpenAiResponses;
+    let request = json!({
+        "model": "urouter/auto",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": true
+    });
+    let error = provider_request(&request, &model).unwrap_err();
+    assert_eq!(error.code, "unsupported_provider_streaming");
+    assert!(
+        error.message.contains("open_ai_responses"),
+        "{}",
+        error.message
+    );
+}
+
+/// A request the normalizer cannot read must surface as a typed Bad Request
+/// rather than reaching the provider. Both non-Chat transports map it.
+#[test]
+fn provider_request_maps_a_conversion_failure_to_protocol_conversion_failed() {
+    let catalog =
+        CatalogSnapshot::from_json_str(include_str!("../../../catalog/catalog.json")).unwrap();
+    let mut model = catalog.models().next().unwrap().clone();
+    model.upstream_id = "provider-model".to_owned();
+    // `messages` is required by the normalized IR.
+    let request = json!({"model": "urouter/auto"});
+    for api in [WireApi::OpenAiResponses, WireApi::AnthropicMessages] {
+        model.api = api.clone();
+        let error = provider_request(&request, &model).unwrap_err();
+        assert_eq!(error.code, "protocol_conversion_failed", "{api:?}");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+}
+
+/// Both non-Chat transports convert under `LossPolicy::Reject`. This is the
+/// boundary that refuses a request whose semantics the target cannot carry,
+/// instead of silently dropping them and calling the provider anyway.
+#[test]
+fn provider_request_maps_semantic_loss_to_protocol_semantic_loss() {
+    let catalog =
+        CatalogSnapshot::from_json_str(include_str!("../../../catalog/catalog.json")).unwrap();
+    let mut model = catalog.models().next().unwrap().clone();
+    model.upstream_id = "provider-model".to_owned();
+    // Replayed plaintext reasoning is not representable on either target.
+    let request = json!({
+        "model": "urouter/auto",
+        "messages": [{
+            "role": "assistant",
+            "content": "partial",
+            "reasoning_content": "step one, step two"
+        }]
+    });
+    for api in [WireApi::OpenAiResponses, WireApi::AnthropicMessages] {
+        model.api = api.clone();
+        let error = provider_request(&request, &model).unwrap_err();
+        assert_eq!(error.code, "protocol_semantic_loss", "{api:?}");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+}
+
+/// Builds a Gateway state carrying an active artifact plus a management keyring,
+/// which is the only configuration under which the artifact endpoints do
+/// anything. Returns the state and a header factory for the three roles.
+async fn artifact_management_state() -> (AppState, PathBuf, PathBuf) {
+    use urouter_artifact::{ArtifactSupportDomain, ExportGates, FeatureWeights, LinearPolicy};
+
+    let suffix = next_decision_id();
+    let keyring_path = std::env::temp_dir().join(format!("urouter-artifact-keyring-{suffix}.json"));
+    let audit_path = std::env::temp_dir().join(format!("urouter-artifact-audit-{suffix}.jsonl"));
+    let key = |id: &str, token: &str, role: &str| {
+        json!({
+            "id": id,
+            "token_sha256": format!("sha256:{:x}", Sha256::digest(token.as_bytes())),
+            "role": role,
+            "tenant_keys": ["*"]
+        })
+    };
+    tokio::fs::write(
+        &keyring_path,
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "keys": [
+                key("reader", "reader-token", "reader"),
+                key("admin", "admin-token", "admin")
+            ]
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut state = test_state_with_route(route()).await;
+    state.management_auth = ManagementAuth::open(
+        Some(keyring_path.clone()),
+        Some(audit_path.clone()),
+        16,
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+
+    let catalog_revision = state.catalog.hashes().content.to_string();
+    let route_revision = state.route.revision();
+    let artifact = RouterArtifact::build(
+        FEATURE_SCHEMA_VERSION,
+        catalog_revision.clone(),
+        route_revision.clone(),
+        "sha256:dataset",
+        42,
+        100,
+        LinearPolicy {
+            baseline_tier: "efficient".to_owned(),
+            promoted_tier: "capable".to_owned(),
+            threshold_millis: 1_000,
+            bias_millis: 2_000,
+            weights: FeatureWeights {
+                input_kib_millis: 0,
+                message_millis: 0,
+                tool_millis: 0,
+                image_millis: 0,
+                structured_millis: 0,
+                reasoning_millis: 0,
+            },
+        },
+        ArtifactSupportDomain {
+            semantic_tasks: BTreeSet::from(["greeting".to_owned()]),
+            maximum_input_text_bytes: 10_000,
+            tools_supported: false,
+        },
+        ExportGates {
+            reproducible: true,
+            privacy_passed: true,
+            support_domain_defined: true,
+            counterfactual_passed: true,
+            quality_lower_bound_millionths: 1,
+            maximum_error_rate_millionths: 0,
+            maximum_cost_regression_millionths: 0,
+        },
+    )
+    .unwrap();
+    state.artifact = Some(ArtifactRuntime {
+        controller: ArtifactController::new(
+            Some(artifact),
+            RolloutPolicy {
+                shadow: false,
+                canary_basis_points: 0,
+                minimum_samples: 100,
+                operation_limit: 6,
+            },
+        ),
+        catalog_revision,
+        route_revision,
+    });
+    (state, keyring_path, audit_path)
+}
+
+fn management_headers(token: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-urouter-tenant-id", HeaderValue::from_static("tenant-a"));
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    headers
+}
+
+/// `/v1/responses` and `/v1/messages` are separate HTTP entrypoints that
+/// normalize into Chat before routing. Only the inner `provider_request` was
+/// covered; the entrypoints themselves were unexecuted, so a malformed request
+/// reaching them had nothing proving it is refused with a typed error.
+#[tokio::test]
+async fn non_chat_entrypoints_reject_malformed_requests_with_their_own_codes() {
+    let state = test_state_with_route(route()).await;
+
+    let responses = openai_responses(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(json!({"model": "urouter/auto"})),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(responses.code, "invalid_responses_request");
+    assert_eq!(responses.status, StatusCode::BAD_REQUEST);
+
+    let anthropic = anthropic_messages(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(json!({"model": "urouter/auto"})),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(anthropic.code, "invalid_anthropic_request");
+    assert_eq!(anthropic.status, StatusCode::BAD_REQUEST);
+
+    // An unknown role is rejected by the normalizer rather than reaching routing.
+    let bad_role = anthropic_messages(
+        State(state),
+        HeaderMap::new(),
+        Json(json!({"model": "urouter/auto", "max_tokens": 16,
+                    "messages": [{"role": "narrator", "content": "x"}]})),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(bad_role.status, StatusCode::BAD_REQUEST);
+}
+
+/// The internal Chat capabilities used when normalizing a non-Chat entrypoint
+/// must claim everything, or `/v1/responses` and `/v1/messages` would report a
+/// semantic loss against uRouter's own Chat representation rather than against
+/// the provider.
+#[test]
+fn internal_chat_capabilities_lose_nothing() {
+    let capabilities = internal_chat_capabilities();
+    assert!(capabilities.developer_role);
+    assert!(capabilities.tools);
+    assert!(capabilities.images);
+    assert!(capabilities.structured_output);
+    assert!(capabilities.reasoning);
+}
+
+/// Binding skips are correct but silent. Naming the reason is what lets the
+/// Gateway log why session continuity did not hold, which is otherwise
+/// invisible to an integrator who omits part of the minimum contract.
+#[test]
+fn binding_skip_reasons_are_named() {
+    let request = primary_request("task-a", "turn-a", None);
+    let state_route = route();
+    let catalog =
+        CatalogSnapshot::from_json_str(include_str!("../../../catalog/catalog.json")).unwrap();
+    let decision = state_route.decide(&catalog, &request).unwrap();
+    assert_eq!(binding_skip_reason(&decision), None);
+
+    let mut compatibility = decision.clone();
+    compatibility.compatibility_mode = true;
+    assert_eq!(
+        binding_skip_reason(&compatibility),
+        Some(BINDING_SKIP_COMPATIBILITY)
+    );
+
+    let mut auxiliary = decision.clone();
+    auxiliary.call_role = Some(CallRole::Auxiliary);
+    assert_eq!(binding_skip_reason(&auxiliary), Some("not_a_primary_call"));
+
+    let mut explicit = decision;
+    "explicit_model".clone_into(&mut explicit.reason);
+    assert_eq!(binding_skip_reason(&explicit), Some("explicit_model"));
+}
+
+// --- Governance and retention (docs/test-coverage-plan.md Phase 4)
+
+fn retention_path(suffix: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("urouter-retention-{}-{suffix}", next_decision_id()))
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Retention is a governance assertion, not a cache policy: a record that
+/// outlives its tenant TTL is a compliance failure. The boundary is inclusive,
+/// so a record whose deadline is exactly now is already expired.
+#[test]
+fn record_expiry_is_inclusive_at_the_deadline() {
+    let mut record = record_for(&primary_request("task-a", "turn-a", None), "decision-a");
+
+    record.expires_at_unix_s = 0;
+    assert!(record_expired(&record), "epoch deadline must be expired");
+
+    record.expires_at_unix_s = unix_now();
+    assert!(record_expired(&record), "deadline of now must be expired");
+
+    record.expires_at_unix_s = unix_now() + 3_600;
+    assert!(!record_expired(&record));
+
+    record.expires_at_unix_s = unix_now() + 365 * 24 * 60 * 60;
+    assert!(
+        !record_expired(&record),
+        "the maximum TTL must not be expired"
+    );
+}
+
+/// Replay after a restart must not invent governance evidence. It fills only the
+/// two fields that a pre-governance record legitimately lacks, and leaves an
+/// existing tenant or deadline exactly as written.
+#[test]
+fn replay_normalization_fills_only_missing_governance_fields() {
+    let mut legacy = record_for(&primary_request("task-a", "turn-a", None), "decision-a");
+    legacy.tenant_key = String::new();
+    legacy.expires_at_unix_s = 0;
+    let recording = legacy.recording;
+    let training_before = legacy.training_eligible;
+
+    normalize_replayed_record(&mut legacy);
+    assert_eq!(legacy.tenant_key, tenant_key("local"));
+    // A legacy record defaults to seven days rather than to "never expires".
+    assert!(legacy.expires_at_unix_s > unix_now());
+    assert!(legacy.expires_at_unix_s <= unix_now() + 7 * 24 * 60 * 60);
+    // Nothing else is invented: consent and retention policy stay as recorded.
+    assert_eq!(legacy.recording, recording);
+    assert_eq!(legacy.training_eligible, training_before);
+
+    // An already-governed record is left untouched.
+    let mut governed = record_for(&primary_request("task-b", "turn-b", None), "decision-b");
+    governed.tenant_key = "sha256:explicit".to_owned();
+    governed.expires_at_unix_s = 42;
+    normalize_replayed_record(&mut governed);
+    assert_eq!(governed.tenant_key, "sha256:explicit");
+    assert_eq!(governed.expires_at_unix_s, 42);
+}
+
+/// Rotation keeps exactly one previous generation. Without the boundary check a
+/// record file would grow without bound; without the single-generation rule a
+/// deleted record could survive in an arbitrarily old copy.
+#[tokio::test]
+async fn rotation_respects_the_size_boundary_and_keeps_one_generation() {
+    let path = retention_path("rotate.jsonl");
+    let rotated = PathBuf::from(format!("{}.1", path.display()));
+    let errors = AtomicU64::new(0);
+    tokio::fs::write(&path, b"0123456789").await.unwrap();
+
+    // Disabled by `max_bytes == 0`, whatever the incoming size.
+    rotate_if_needed(&path, 0, 1_000_000, &errors).await;
+    assert!(!rotated.exists());
+
+    // Exactly at the limit does not rotate; one byte over does.
+    rotate_if_needed(&path, 20, 10, &errors).await;
+    assert!(!rotated.exists(), "10 + 10 == 20 must not rotate");
+    rotate_if_needed(&path, 20, 11, &errors).await;
+    assert!(rotated.exists(), "10 + 11 > 20 must rotate");
+    assert!(!path.exists(), "the live file is moved aside, not copied");
+    assert_eq!(errors.load(Ordering::Relaxed), 0);
+
+    // A second rotation replaces the previous generation rather than keeping
+    // `.2`, so at most one historical copy ever exists.
+    tokio::fs::write(&path, b"second-generation").await.unwrap();
+    rotate_if_needed(&path, 1, 1, &errors).await;
+    assert_eq!(
+        tokio::fs::read(&rotated).await.unwrap(),
+        b"second-generation"
+    );
+    assert!(!PathBuf::from(format!("{}.2", path.display())).exists());
+
+    let _ = tokio::fs::remove_file(&path).await;
+    let _ = tokio::fs::remove_file(&rotated).await;
+}
+
+/// A rewrite is how deletion reaches disk. It must replace the live file
+/// atomically *and* drop the rotated copy, or a deleted record would still be
+/// readable in the previous generation.
+#[tokio::test]
+async fn rewriting_records_replaces_the_file_and_drops_the_rotated_copy() {
+    let path = retention_path("rewrite.jsonl");
+    let rotated = PathBuf::from(format!("{}.1", path.display()));
+    let temporary = PathBuf::from(format!("{}.rewrite.tmp", path.display()));
+    tokio::fs::write(&rotated, b"deleted-record-must-not-survive")
+        .await
+        .unwrap();
+
+    let kept = record_for(&primary_request("task-a", "turn-a", None), "decision-keep");
+    rewrite_records(&path, std::slice::from_ref(&kept))
+        .await
+        .unwrap();
+
+    let contents = tokio::fs::read_to_string(&path).await.unwrap();
+    assert_eq!(contents.lines().count(), 1);
+    assert!(contents.contains("decision-keep"));
+    assert!(!rotated.exists(), "the rotated copy must be removed");
+    assert!(
+        !temporary.exists(),
+        "the temporary file must be renamed away"
+    );
+
+    // An empty rewrite truncates rather than leaving the previous contents.
+    rewrite_records(&path, &[]).await.unwrap();
+    assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "");
+
+    let _ = tokio::fs::remove_file(&path).await;
+}
+
+#[tokio::test]
+async fn rewriting_feedback_replaces_the_file_and_drops_the_rotated_copy() {
+    let path = retention_path("feedback.jsonl");
+    let rotated = PathBuf::from(format!("{}.1", path.display()));
+    tokio::fs::write(&rotated, b"stale").await.unwrap();
+
+    let event = FeedbackEvent {
+        tenant_key: tenant_key("tenant-a"),
+        turn: "turn-a".to_owned(),
+        signals: vec![FeedbackSignal {
+            kind: "accepted".to_owned(),
+            strength: 1.0,
+        }],
+    };
+    rewrite_feedback(&path, std::slice::from_ref(&event))
+        .await
+        .unwrap();
+    let contents = tokio::fs::read_to_string(&path).await.unwrap();
+    assert!(contents.contains("turn-a"));
+    assert!(!rotated.exists());
+
+    let _ = tokio::fs::remove_file(&path).await;
+}
+
+/// Removing a rotated copy that was never created is not an error, so deletion
+/// stays idempotent on a Gateway that has not rotated yet.
+#[tokio::test]
+async fn removing_an_absent_rotated_copy_succeeds() {
+    let path = retention_path("absent.jsonl");
+    remove_rotated_copy(&path).await.unwrap();
+}
+
+/// Replay drops records that expired while the process was down, and rewrites
+/// the file so they do not come back on the next start.
+#[tokio::test]
+async fn restart_replay_drops_expired_records_and_persists_the_pruned_file() {
+    let path = retention_path("replay.jsonl");
+    let mut expired = record_for(
+        &primary_request("task-a", "turn-a", None),
+        "decision-expired",
+    );
+    expired.expires_at_unix_s = 1;
+    let mut live = record_for(&primary_request("task-b", "turn-b", None), "decision-live");
+    live.expires_at_unix_s = unix_now() + 3_600;
+    let mut contents = serde_json::to_string(&expired).unwrap();
+    contents.push('\n');
+    contents.push_str(&serde_json::to_string(&live).unwrap());
+    contents.push('\n');
+    tokio::fs::write(&path, contents).await.unwrap();
+
+    let store = RecordStore::open(Some(path.clone()), 10, 4, 0)
+        .await
+        .unwrap();
+    let retained = store.records.read().await.clone();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].decision_id, "decision-live");
+
+    // The pruned set is persisted, so the expired record is gone from disk too.
+    for _ in 0..50 {
+        let on_disk = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        if !on_disk.contains("decision-expired") {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    let on_disk = tokio::fs::read_to_string(&path).await.unwrap();
+    assert!(
+        !on_disk.contains("decision-expired"),
+        "expired record survived on disk: {on_disk}"
+    );
+
+    let _ = tokio::fs::remove_file(&path).await;
+}
+
+/// `evaluate_override` is tested directly, but the wiring that attaches its
+/// verdict to the stored record and counts it was not. Value attribution reads
+/// the `paired` counter, so a record that is paired but never counted, or
+/// counted but stored without its override evidence, silently corrupts it.
+#[tokio::test]
+async fn storing_a_pinned_retry_attaches_and_counts_the_override_verdict() {
+    let state = test_state_with_route(route()).await;
+    let tenant = test_governance().tenant_key;
+
+    let parent_request = json!({
+        "model": "urouter/auto",
+        "messages": [{"role": "user", "content": "solve"}],
+        "urouter": {"trace": {"id": "trace-1", "turn": "turn-1"}}
+    });
+    let mut parent = record_for(&parent_request, "decision-parent");
+    parent.tenant_key.clone_from(&tenant);
+    parent.expires_at_unix_s = unix_now() + 3_600;
+    store_record(&state, parent).await.unwrap();
+
+    let child_request = json!({
+        "model": "urouter/auto",
+        "messages": [{"role": "user", "content": "solve"}],
+        "urouter": {
+            "trace": {"id": "trace-1", "turn": "turn-2", "parent_turn": "turn-1"},
+            "preference": {"pin_tier": "capable"}
+        }
+    });
+    let mut child = record_for(&child_request, "decision-child");
+    child.tenant_key.clone_from(&tenant);
+    child.expires_at_unix_s = unix_now() + 3_600;
+    assert_eq!(child.reason, "preference_pin");
+    store_record(&state, child).await.unwrap();
+
+    let stored = state
+        .record_repository
+        .get(&tenant, "decision-child")
+        .await
+        .unwrap()
+        .expect("child record");
+    let override_record = stored.override_record.expect("override evidence attached");
+    assert!(override_record.paired);
+    assert_eq!(override_record.kind.as_deref(), Some("escalate"));
+    assert_eq!(
+        override_record.parent_decision_id.as_deref(),
+        Some("decision-parent")
+    );
+    assert_eq!(state.metrics.paired.load(Ordering::Relaxed), 1);
+    assert_eq!(state.metrics.paired_rejected.load(Ordering::Relaxed), 0);
+
+    // An unpairable retry is still stored, with the reason it was rejected, and
+    // counted separately so attribution does not silently absorb it.
+    let orphan_request = json!({
+        "model": "urouter/auto",
+        "messages": [{"role": "user", "content": "solve"}],
+        "urouter": {
+            "trace": {"id": "trace-1", "turn": "turn-3", "parent_turn": "turn-absent"},
+            "preference": {"pin_tier": "capable"}
+        }
+    });
+    let mut orphan = record_for(&orphan_request, "decision-orphan");
+    orphan.tenant_key.clone_from(&tenant);
+    orphan.expires_at_unix_s = unix_now() + 3_600;
+    store_record(&state, orphan).await.unwrap();
+
+    let stored = state
+        .record_repository
+        .get(&tenant, "decision-orphan")
+        .await
+        .unwrap()
+        .expect("orphan record");
+    assert_eq!(
+        stored
+            .override_record
+            .expect("override evidence attached")
+            .rejected_reason
+            .as_deref(),
+        Some("parent_not_found")
+    );
+    assert_eq!(state.metrics.paired.load(Ordering::Relaxed), 1);
+    assert_eq!(state.metrics.paired_rejected.load(Ordering::Relaxed), 1);
+}
+
+/// The periodic sweep is the third place retention is enforced, after startup
+/// replay and read-time pruning. Its body runs on a 60-second timer, so it is
+/// asserted directly rather than by waiting out the interval.
+#[tokio::test]
+async fn the_retention_sweep_prunes_expired_records_and_tombstones_their_vectors() {
+    let root = retention_path("vectors");
+    let vectors = VectorSideStore::open(root.clone(), 1_048_576)
+        .await
+        .unwrap();
+    let expired_ref = vectors.append(&[0.5, 0.25]).await.unwrap();
+    let live_ref = vectors.append(&[0.75, 0.125]).await.unwrap();
+
+    let store = RecordStore::open(None, 32, 4, 0).await.unwrap();
+    let mut expired = record_for(
+        &primary_request("task-a", "turn-a", None),
+        "decision-expired",
+    );
+    expired.expires_at_unix_s = 1;
+    expired.vector_ref = Some(expired_ref.clone());
+    let mut live = record_for(&primary_request("task-b", "turn-b", None), "decision-live");
+    live.expires_at_unix_s = unix_now() + 3_600;
+    live.vector_ref = Some(live_ref.clone());
+    store.append(expired).await;
+    store.append(live).await;
+
+    let swept = sweep_expired_records(&store, Some(&vectors)).await;
+    assert_eq!(swept, 1);
+
+    let retained = store.records.read().await.clone();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].decision_id, "decision-live");
+
+    // The expired record's vector is tombstoned; the surviving record's is not,
+    // because deleting it would break a record that is still readable.
+    assert!(vectors.read(&expired_ref).await.is_err());
+    assert_eq!(vectors.read(&live_ref).await.unwrap(), vec![0.75, 0.125]);
+
+    // A sweep with nothing expired is a no-op rather than an error.
+    assert_eq!(sweep_expired_records(&store, Some(&vectors)).await, 0);
+    // And it runs without a vector store configured.
+    assert_eq!(sweep_expired_records(&store, None).await, 0);
+
+    let _ = tokio::fs::remove_dir_all(&root).await;
+}
+
+/// Deletion is generation-guarded so that a request already in flight when a
+/// tenant or task was deleted cannot resurrect the deleted state.
+#[tokio::test]
+async fn record_deletion_is_scoped_by_tenant_task_and_generation() {
+    let store = RecordStore::open(None, 32, 4, 0).await.unwrap();
+    let repository = MemoryDecisionRecordRepository::new(store);
+    let tenant_a = tenant_key("tenant-a");
+    let tenant_b = tenant_key("tenant-b");
+    let task = task_scope_key(&tenant_a, "task-a");
+
+    let seed = |id: &str, tenant: &str, generation: u64| {
+        let mut record = record_for(&primary_request("task-a", "turn-a", None), id);
+        record.tenant_key = tenant.to_owned();
+        record.task_key = Some(task.clone());
+        record.task_generation = generation;
+        record.tenant_generation = generation;
+        record.expires_at_unix_s = unix_now() + 3_600;
+        record
+    };
+    for record in [
+        seed("old-a", &tenant_a, 1),
+        seed("new-a", &tenant_a, 5),
+        seed("old-b", &tenant_b, 1),
+    ] {
+        repository.put(record).await.unwrap();
+    }
+
+    assert_eq!(repository.backend_name(), "memory");
+    assert_eq!(repository.list(&tenant_a).await.unwrap().len(), 2);
+    // A tenant only ever sees its own records.
+    assert_eq!(repository.list(&tenant_b).await.unwrap().len(), 1);
+    assert!(repository.get(&tenant_b, "old-a").await.unwrap().is_none());
+    assert!(repository.get(&tenant_a, "old-a").await.unwrap().is_some());
+
+    // Deleting at generation 5 removes the older record and spares the one
+    // written at or after the deletion generation.
+    let deleted = repository
+        .delete(
+            &tenant_a,
+            RecordDelete::Task {
+                decision_ids: vec!["old-a".to_owned()],
+                task_key: task.clone(),
+                before_generation: 5,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+    let remaining = repository.list(&tenant_a).await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].decision_id, "new-a");
+    // The other tenant is untouched by a task-scoped deletion.
+    assert_eq!(repository.list(&tenant_b).await.unwrap().len(), 1);
+
+    // A tenant-wide deletion below the surviving generation removes nothing.
+    assert_eq!(
+        repository
+            .delete(
+                &tenant_a,
+                RecordDelete::Tenant {
+                    decision_ids: Vec::new(),
+                    before_generation: 5,
+                },
+            )
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        repository
+            .delete(
+                &tenant_a,
+                RecordDelete::Tenant {
+                    decision_ids: Vec::new(),
+                    before_generation: 6,
+                },
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(repository.list(&tenant_a).await.unwrap().is_empty());
+}
+
+/// `recording = none` means the request opted out entirely: nothing may reach
+/// the repository, not even a metadata-only row.
+#[tokio::test]
+async fn a_recording_none_request_never_reaches_the_repository() {
+    let state = test_state_with_route(route()).await;
+    let mut record = record_for(&primary_request("task-a", "turn-a", None), "decision-none");
+    record.recording = RecordingMode::None;
+    store_record(&state, record).await.unwrap();
+    assert!(
+        state
+            .record_repository
+            .list(&test_governance().tenant_key)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// The `/v1/feedback` ingest path and its typed rejections. Every branch of the
+/// signal normalizer was unexecuted, so an unsupported kind or an out-of-range
+/// strength had nothing proving it is refused rather than stored.
+#[tokio::test]
+async fn feedback_ingest_accepts_known_signals_and_rejects_everything_else() {
+    let state = test_state_with_route(route()).await;
+    let body = |value: Value| Json(serde_json::from_value::<FeedbackRequest>(value).unwrap());
+
+    let accepted = feedback(
+        State(state.clone()),
+        HeaderMap::new(),
+        body(json!({
+            "contract_version": 1,
+            "turn": "turn-a",
+            "signals": [{"kind": "accepted"}, {"kind": "task_succeeded", "strength": 0.25}]
+        })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(accepted.0["ok"], true);
+    assert_eq!(accepted.0["turn"], "turn-a");
+    assert_eq!(accepted.0["recorded"], true);
+
+    // The stored turn is readable back through the per-turn endpoint.
+    let stored = feedback_by_turn(
+        State(state.clone()),
+        Path("turn-a".to_owned()),
+        HeaderMap::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored.0["turn"], "turn-a");
+
+    let cases = [
+        (
+            json!({"contract_version": 2, "turn": "t", "signals": [{"kind": "accepted"}]}),
+            "unsupported_contract_version",
+        ),
+        (
+            json!({"turn": "", "signals": [{"kind": "accepted"}]}),
+            "invalid_feedback",
+        ),
+        (json!({"turn": "t", "signals": []}), "invalid_feedback"),
+        (
+            json!({"turn": "t", "signals": [{"kind": "shrugged"}]}),
+            "invalid_feedback_kind",
+        ),
+        (
+            json!({"turn": "t", "signals": [{"kind": "accepted", "strength": 1.5}]}),
+            "invalid_feedback_strength",
+        ),
+        (
+            json!({"turn": "t", "signals": [{"kind": "accepted"}],
+                   "data_policy": {"retention_days": 0}}),
+            "invalid_data_policy",
+        ),
+    ];
+    for (value, code) in cases {
+        let error = feedback(State(state.clone()), HeaderMap::new(), body(value))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, code);
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+}
+
+/// Every documented signal kind must normalize, or a Host emitting a valid kind
+/// would have its feedback silently rejected at ingest.
+#[test]
+fn every_documented_feedback_kind_normalizes_to_a_default_strength() {
+    for kind in [
+        "accepted",
+        "rejected",
+        "endorsed",
+        "disputed",
+        "reattempted",
+        "abandoned",
+        "advanced",
+        "task_succeeded",
+        "task_failed",
+    ] {
+        let signal = normalize_signal(kind, None)
+            .unwrap_or_else(|error| panic!("{kind}: {}", error.message));
+        assert_eq!(signal.kind, kind);
+        assert!(
+            (0.0..=1.0).contains(&signal.strength),
+            "{kind} default strength out of range"
+        );
+    }
+    assert_eq!(
+        normalize_signal("accepted", Some(f64::NAN))
+            .unwrap_err()
+            .code,
+        "invalid_feedback_strength"
+    );
+}
+
+/// The binding lifecycle endpoints. A missing binding must be a 404 scoped to
+/// the tenant, not an empty 200, or an agent cannot distinguish "no binding" from
+/// "binding belongs to someone else".
+#[tokio::test]
+async fn binding_lifecycle_endpoints_are_tenant_scoped_and_report_absence() {
+    let state = test_state_with_route(route()).await;
+
+    let missing = task_binding(
+        State(state.clone()),
+        Path("task-absent".to_owned()),
+        HeaderMap::new(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+
+    let missing_session = session_binding(
+        State(state.clone()),
+        Path(("conv-absent".to_owned(), "main".to_owned())),
+        HeaderMap::new(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(missing_session.status, StatusCode::NOT_FOUND);
+
+    // Deleting an absent binding reports 404 rather than 204: the endpoint
+    // distinguishes "removed something" from "there was nothing", so a caller
+    // cleaning up after a migration can tell the two apart.
+    assert_eq!(
+        delete_task_binding(
+            State(state.clone()),
+            Path("task-absent".to_owned()),
+            HeaderMap::new()
+        )
+        .await
+        .unwrap(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        delete_session_binding(
+            State(state.clone()),
+            Path(("conv-absent".to_owned(), "main".to_owned())),
+            HeaderMap::new()
+        )
+        .await
+        .unwrap(),
+        StatusCode::NOT_FOUND
+    );
+
+    // Scope values are length-validated before any state lookup, so an empty or
+    // oversized id is refused rather than hashed into a lookup key.
+    for id in [String::new(), "x".repeat(257)] {
+        let invalid = task_binding(State(state.clone()), Path(id), HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.code, "invalid_agent_scope");
+    }
+}
+
+/// `/v1/tiers` and `/v1/stats` are the operator's read-only view of deployment
+/// health and value attribution. Neither was executed.
+#[tokio::test]
+async fn tier_health_and_stats_are_readable() {
+    let state = test_state_with_route(route()).await;
+
+    let tiers = tiers(State(state.clone()), HeaderMap::new()).await.unwrap();
+    assert_eq!(tiers.0["object"], "list");
+    let listed = tiers.0["data"].as_array().expect("tier list");
+    assert!(!listed.is_empty());
+    assert!(listed.iter().any(|tier| tier["tier"] == "efficient"));
+
+    let attribution = stats(State(state), HeaderMap::new()).await.unwrap();
+    assert!(
+        attribution
+            .0
+            .as_object()
+            .is_some_and(|value| !value.is_empty()),
+        "stats returned nothing: {}",
+        attribution.0
+    );
+}
+
+/// Every artifact endpoint is Admin-only except `status`, which a Reader may
+/// call. Without this the rollout controls would be reachable by any token the
+/// keyring accepts.
+#[tokio::test]
+async fn artifact_endpoints_require_admin_except_status() {
+    let (state, keyring, audit) = artifact_management_state().await;
+
+    assert!(
+        artifact_status(State(state.clone()), management_headers("reader-token"))
+            .await
+            .is_ok()
+    );
+
+    let reason = json!({"reason": "test"});
+    let denied = [
+        promote_artifact(
+            State(state.clone()),
+            management_headers("reader-token"),
+            Json(serde_json::from_value(reason.clone()).unwrap()),
+        )
+        .await
+        .err(),
+        rollback_artifact(
+            State(state.clone()),
+            management_headers("reader-token"),
+            Json(serde_json::from_value(reason.clone()).unwrap()),
+        )
+        .await
+        .err(),
+        kill_artifact(
+            State(state.clone()),
+            management_headers("reader-token"),
+            Json(serde_json::from_value(json!({"killed": true})).unwrap()),
+        )
+        .await
+        .err(),
+    ];
+    for error in denied {
+        assert_eq!(
+            error.expect("reader must be denied").status,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    let _ = tokio::fs::remove_file(keyring).await;
+    let _ = tokio::fs::remove_file(audit).await;
+}
+
+/// Walks the operator-facing lifecycle end to end. Every one of these handlers
+/// was previously unexecuted, which is the whole M3 rollout control surface.
+#[tokio::test]
+async fn artifact_lifecycle_reports_status_rollout_kill_and_observation() {
+    let (state, keyring, audit) = artifact_management_state().await;
+    let admin = || management_headers("admin-token");
+
+    let status = artifact_status(State(state.clone()), admin())
+        .await
+        .unwrap();
+    assert!(status.0["status"]["active_revision"].is_string());
+    // Status discloses the revisions the artifact is bound to and whether they
+    // still match the live control plane, which is what makes a stale artifact
+    // visible to an operator instead of silently falling back to rules.
+    assert_eq!(status.0["stale"], false);
+    assert_eq!(
+        status.0["bound_revisions"]["route"],
+        Value::String(state.route.revision())
+    );
+
+    // A canary rollout is accepted; an operation limit below the floor is not.
+    let updated = update_artifact_rollout(
+        State(state.clone()),
+        admin(),
+        Json(
+            serde_json::from_value(json!({
+                "rollout": {"shadow": true, "canary_basis_points": 100,
+                            "minimum_samples": 10, "operation_limit": 6},
+                "reason": "start canary"
+            }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated.0["updated"], true);
+    let rejected = update_artifact_rollout(
+        State(state.clone()),
+        admin(),
+        Json(
+            serde_json::from_value(json!({
+                "rollout": {"shadow": false, "canary_basis_points": 20_000,
+                            "minimum_samples": 10, "operation_limit": 6}
+            }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(rejected.code, "invalid_artifact_rollout");
+    assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+
+    // The kill switch is the operator's immediate stop, so it must be
+    // unconditionally settable and reflected in status.
+    let killed = kill_artifact(
+        State(state.clone()),
+        admin(),
+        Json(serde_json::from_value(json!({"killed": true, "reason": "incident"})).unwrap()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(killed.0["killed"], true);
+    assert_eq!(killed.0["status"]["killed"], true);
+
+    // An observation inside the thresholds does not roll back.
+    let healthy = observe_artifact(
+        State(state.clone()),
+        admin(),
+        Json(
+            serde_json::from_value(json!({
+                "observation": {"samples": 50, "quality_delta_lower_millionths": 10,
+                    "error_rate_millionths": 0, "cost_regression_millionths": 0,
+                    "p95_latency_regression_millionths": 0},
+                "thresholds": {"minimum_quality_delta_lower_millionths": 0,
+                    "maximum_error_rate_millionths": 1_000,
+                    "maximum_cost_regression_millionths": 1_000,
+                    "maximum_p95_latency_regression_millionths": 1_000}
+            }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(healthy.0["rolled_back"], false);
+    assert!(
+        healthy.0["audit"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty())
+    );
+
+    let _ = tokio::fs::remove_file(keyring).await;
+    let _ = tokio::fs::remove_file(audit).await;
+}
+
+/// With a single active artifact and no candidate there is nothing to promote
+/// and no last-good to fall back to. Both must be typed conflicts rather than
+/// silent no-ops, or an operator cannot tell a failed promotion from a
+/// successful one.
+#[tokio::test]
+async fn promote_and_rollback_conflict_when_there_is_nothing_to_move_to() {
+    let (state, keyring, audit) = artifact_management_state().await;
+    let reason = || Json(serde_json::from_value(json!({"reason": "test"})).unwrap());
+
+    let promote = promote_artifact(
+        State(state.clone()),
+        management_headers("admin-token"),
+        reason(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(promote.status, StatusCode::CONFLICT);
+    assert_eq!(promote.code, "artifact_candidate_unavailable");
+
+    let rollback = rollback_artifact(
+        State(state.clone()),
+        management_headers("admin-token"),
+        reason(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(rollback.status, StatusCode::CONFLICT);
+    assert_eq!(rollback.code, "artifact_rollback_unavailable");
+
+    let _ = tokio::fs::remove_file(keyring).await;
+    let _ = tokio::fs::remove_file(audit).await;
+}
+
+/// A Gateway started without `--artifact-active` must say so, rather than
+/// reporting an empty status that reads like a healthy artifact.
+#[tokio::test]
+async fn artifact_endpoints_report_when_no_artifact_is_configured() {
+    let state = test_state_with_route(route()).await;
+    let error = artifact_status(State(state.clone()), HeaderMap::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::NOT_FOUND);
+    assert_eq!(error.code, "artifact_runtime_not_configured");
+
+    let error = kill_artifact(
+        State(state),
+        HeaderMap::new(),
+        Json(serde_json::from_value(json!({"killed": false})).unwrap()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "artifact_runtime_not_configured");
 }
 
 #[tokio::test]
