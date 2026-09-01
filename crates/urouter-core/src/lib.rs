@@ -120,6 +120,88 @@ pub struct RouteConfig {
     pub default_preference_bias_millis: i32,
     #[serde(default)]
     pub long_context_quality_threshold_tokens: u64,
+    /// Optional externalised semantic rules. Absent means the built-in rules
+    /// alone, which is what every existing Route already gets.
+    ///
+    /// Living inside the Route file is deliberate: the signed control manifest
+    /// already hashes it, so rules inherit revision binding, hot reload,
+    /// `last_good`/`fail_closed` and one-click rollback without a second
+    /// distribution channel to keep consistent.
+    #[serde(default)]
+    pub semantic_rules: Option<SemanticRuleSet>,
+}
+
+/// A reviewed set of semantic rules, published with the Route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticRuleSet {
+    pub schema_version: u16,
+    #[serde(default)]
+    pub mode: SemanticRuleMode,
+    pub rules: Vec<SemanticRule>,
+}
+
+/// How configured rules relate to the compiled-in ones.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticRuleMode {
+    /// Configured rules are tried first, then the built-ins. The built-in
+    /// weather rule keeps working, so a config that forgets it cannot silently
+    /// remove the guarantee that the Gateway never fabricates tool results.
+    #[default]
+    Extend,
+    /// Configured rules are the whole set. Opt-in only: this disables the
+    /// built-in weather, greeting and equation rules.
+    Replace,
+}
+
+/// One rule. Matching is over the latest user message, lowercased and stripped
+/// of trailing punctuation — the same normalisation the built-in rules use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticRule {
+    /// Stable identity, surfaced on the classification so a match can be
+    /// attributed to the rule that produced it.
+    pub id: String,
+    pub task: SemanticTask,
+    pub confidence_millis: u16,
+    /// Exact match after normalisation.
+    #[serde(default)]
+    pub equals: Vec<String>,
+    /// Matches when any listed substring is present.
+    #[serde(default)]
+    pub contains_any: Vec<String>,
+    /// Matches when every listed substring is present.
+    #[serde(default)]
+    pub contains_all: Vec<String>,
+    #[serde(default)]
+    pub requires_tools: bool,
+    #[serde(default)]
+    pub requires_reasoning: bool,
+    /// When set, the Host must have declared this tool or the request is
+    /// rejected before any upstream call.
+    #[serde(default)]
+    pub required_tool: Option<String>,
+}
+
+impl SemanticRule {
+    /// Returns true when `normalized` satisfies this rule.
+    ///
+    /// The three condition kinds are OR-ed with each other and a rule must
+    /// declare at least one, which `validate` enforces.
+    #[must_use]
+    pub fn matches(&self, normalized: &str) -> bool {
+        self.equals.iter().any(|value| value == normalized)
+            || self
+                .contains_any
+                .iter()
+                .any(|value| normalized.contains(value.as_str()))
+            || (!self.contains_all.is_empty()
+                && self
+                    .contains_all
+                    .iter()
+                    .all(|value| normalized.contains(value.as_str())))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -315,6 +397,11 @@ pub enum SemanticTask {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticClassification {
     pub task: SemanticTask,
+    /// Which rule produced this classification. `None` for the abstaining
+    /// default. Built-in rules report `builtin:<name>`; configured rules report
+    /// their own `id`, so a match is attributable to the rule that caused it.
+    #[serde(default)]
+    pub rule_id: Option<String>,
     pub confidence_millis: u16,
     pub abstained: bool,
     pub requires_tools: bool,
@@ -325,6 +412,20 @@ pub struct SemanticClassification {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum RouteError {
+    #[error("semantic rule set schema_version must be 1")]
+    UnsupportedSemanticRuleSchema(u16),
+    #[error("semantic rule id must not be empty")]
+    EmptySemanticRuleId,
+    #[error("duplicate semantic rule id: {0}")]
+    DuplicateSemanticRule(String),
+    #[error("semantic rule {0} declares no match condition")]
+    SemanticRuleWithoutCondition(String),
+    #[error("semantic rule {0} has an empty match pattern")]
+    EmptySemanticRulePattern(String),
+    #[error("semantic rule {0} confidence must be in 1..=1000")]
+    InvalidSemanticRuleConfidence(String),
+    #[error("semantic rule {0} declares an empty required_tool")]
+    EmptySemanticRuleTool(String),
     #[error("route id and tier names must not be empty")]
     EmptyName,
     #[error("route must contain at least one tier")]
@@ -385,6 +486,9 @@ impl RouteConfig {
         }
         if !(-1_000..=1_000).contains(&self.default_preference_bias_millis) {
             return Err(RouteError::InvalidDefaultBias);
+        }
+        if let Some(rules) = &self.semantic_rules {
+            validate_semantic_rules(rules)?;
         }
         let mut names = BTreeSet::new();
         let mut deployment_ids = BTreeSet::new();
@@ -537,7 +641,7 @@ impl RouteConfig {
             .ok_or(RouteError::InvalidRequestModel)?;
         let contract = parse_contract(request)?;
         let compatibility_mode = contract.compatibility_mode();
-        let (semantic, requirement) = semantic_requirement(request)?;
+        let (semantic, requirement) = semantic_requirement(request, self.semantic_rules.as_ref())?;
         if requested_model != self.id {
             let requested =
                 ModelId::new(requested_model).map_err(|_| RouteError::InvalidRequestModel)?;
@@ -680,6 +784,58 @@ fn selected_rule(rule: &str, reason: &str) -> RuleEvaluation {
     }
 }
 
+/// Validates a published rule set.
+///
+/// This runs inside `RouteConfig::validate`, which the control plane already
+/// calls on load and on every hot reload. A malformed rule set therefore fails
+/// the candidate Route and is handled by the configured `last_good` or
+/// `fail_closed` policy — no separate rejection path to keep in sync.
+fn validate_semantic_rules(rules: &SemanticRuleSet) -> Result<(), RouteError> {
+    if rules.schema_version != 1 {
+        return Err(RouteError::UnsupportedSemanticRuleSchema(
+            rules.schema_version,
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for rule in &rules.rules {
+        if rule.id.trim().is_empty() {
+            return Err(RouteError::EmptySemanticRuleId);
+        }
+        if !ids.insert(rule.id.as_str()) {
+            return Err(RouteError::DuplicateSemanticRule(rule.id.clone()));
+        }
+        if rule.equals.is_empty() && rule.contains_any.is_empty() && rule.contains_all.is_empty() {
+            // A rule with no condition would match nothing, which reads as
+            // "published but inert" — almost always an editing mistake.
+            return Err(RouteError::SemanticRuleWithoutCondition(rule.id.clone()));
+        }
+        if rule
+            .equals
+            .iter()
+            .chain(&rule.contains_any)
+            .chain(&rule.contains_all)
+            .any(|pattern| pattern.trim().is_empty())
+        {
+            // An empty substring matches every request, silently capturing all
+            // traffic into one rule.
+            return Err(RouteError::EmptySemanticRulePattern(rule.id.clone()));
+        }
+        if !(1..=1_000).contains(&rule.confidence_millis) {
+            // Zero confidence is the abstaining default and cannot be asserted
+            // by a rule; above 1000 is out of the scale.
+            return Err(RouteError::InvalidSemanticRuleConfidence(rule.id.clone()));
+        }
+        if rule
+            .required_tool
+            .as_ref()
+            .is_some_and(|tool| tool.trim().is_empty())
+        {
+            return Err(RouteError::EmptySemanticRuleTool(rule.id.clone()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_fallbacks(tiers: &[TierConfig]) -> Result<(), RouteError> {
     let indexes = tiers
         .iter()
@@ -815,8 +971,9 @@ fn parse_contract(request: &Value) -> Result<RequestContract, RouteError> {
 
 fn semantic_requirement(
     request: &Value,
+    rules: Option<&SemanticRuleSet>,
 ) -> Result<(SemanticClassification, CapabilityRequirement), RouteError> {
-    let semantic = classify_semantic_task(request);
+    let semantic = classify_with_rules(request, rules);
     if let Some(required) = semantic.required_tool.as_deref()
         && !host_provides_tool(request, required)
     {
@@ -868,14 +1025,33 @@ fn analyze_requirement(
 }
 
 #[must_use]
-pub fn classify_semantic_task(request: &Value) -> SemanticClassification {
+/// The single normalisation used by both built-in and configured rules.
+///
+/// Sharing it is the point: if a configured rule matched against differently
+/// normalised text than the built-ins, the same phrase could classify one way in
+/// config and another way in code.
+fn normalized_user_text(request: &Value) -> String {
     let text = latest_user_text(request).to_lowercase();
-    let normalized = text.trim_matches(|character: char| {
+    text.trim_matches(|character: char| {
         character.is_whitespace()
             || matches!(character, '!' | '?' | '.' | ',' | '。' | '！' | '？' | '，')
-    });
+    })
+    .to_owned()
+}
+
+#[must_use]
+pub fn classify_semantic_task(request: &Value) -> SemanticClassification {
+    let normalized = normalized_user_text(request);
+    let normalized = normalized.as_str();
     if matches!(normalized, "你好" | "您好" | "hello" | "hi" | "hey") {
-        return semantic_classification(SemanticTask::Greeting, 980, false, false, None);
+        return semantic_classification(
+            SemanticTask::Greeting,
+            "builtin:greeting",
+            980,
+            false,
+            false,
+            None,
+        );
     }
     if ["天气", "气温", "weather", "forecast"]
         .iter()
@@ -883,6 +1059,7 @@ pub fn classify_semantic_task(request: &Value) -> SemanticClassification {
     {
         return semantic_classification(
             SemanticTask::RealtimeWeather,
+            "builtin:realtime_weather",
             950,
             true,
             false,
@@ -899,13 +1076,21 @@ pub fn classify_semantic_task(request: &Value) -> SemanticClassification {
     .any(|keyword| normalized.contains(keyword))
         || (normalized.contains('=') && normalized.contains('x') && normalized.contains('y'))
     {
-        return semantic_classification(SemanticTask::EquationSolving, 930, false, true, None);
+        return semantic_classification(
+            SemanticTask::EquationSolving,
+            "builtin:equation_solving",
+            930,
+            false,
+            true,
+            None,
+        );
     }
-    semantic_classification(SemanticTask::General, 0, false, false, None)
+    semantic_classification(SemanticTask::General, "", 0, false, false, None)
 }
 
 fn semantic_classification(
     task: SemanticTask,
+    rule_id: &str,
     confidence_millis: u16,
     requires_tools: bool,
     requires_reasoning: bool,
@@ -913,12 +1098,40 @@ fn semantic_classification(
 ) -> SemanticClassification {
     SemanticClassification {
         task,
+        rule_id: (confidence_millis > 0).then(|| rule_id.to_owned()),
         confidence_millis,
         abstained: confidence_millis == 0,
         requires_tools,
         requires_reasoning,
         required_tool: required_tool.map(str::to_owned),
     }
+}
+
+/// Applies a configured rule set, then the built-in rules unless the set is in
+/// `Replace` mode.
+///
+/// Configured rules are tried in declaration order and the first match wins, so
+/// a published set has a deterministic precedence its author can reason about.
+fn classify_with_rules(request: &Value, rules: Option<&SemanticRuleSet>) -> SemanticClassification {
+    let normalized = normalized_user_text(request);
+    if let Some(set) = rules {
+        for rule in &set.rules {
+            if rule.matches(&normalized) {
+                return semantic_classification(
+                    rule.task,
+                    &rule.id,
+                    rule.confidence_millis,
+                    rule.requires_tools,
+                    rule.requires_reasoning,
+                    rule.required_tool.as_deref(),
+                );
+            }
+        }
+        if set.mode == SemanticRuleMode::Replace {
+            return semantic_classification(SemanticTask::General, "", 0, false, false, None);
+        }
+    }
+    classify_semantic_task(request)
 }
 
 fn latest_user_text(request: &Value) -> String {
@@ -1159,6 +1372,343 @@ mod tests {
 
     fn route() -> RouteConfig {
         serde_json::from_str(include_str!("../../../gateway/route.json")).unwrap()
+    }
+
+    // --- Externalised semantic rules
+
+    fn rule(id: &str, contains: &[&str]) -> SemanticRule {
+        SemanticRule {
+            id: id.to_owned(),
+            task: SemanticTask::EquationSolving,
+            confidence_millis: 900,
+            equals: Vec::new(),
+            contains_any: contains.iter().map(|value| (*value).to_owned()).collect(),
+            contains_all: Vec::new(),
+            requires_tools: false,
+            requires_reasoning: true,
+            required_tool: None,
+        }
+    }
+
+    fn route_with_rules(set: SemanticRuleSet) -> RouteConfig {
+        let mut route = route();
+        route.semantic_rules = Some(set);
+        route
+    }
+
+    fn ask(route: &RouteConfig, text: &str) -> RouteDecision {
+        route
+            .decide(
+                &catalog(),
+                &json!({"model": "urouter/auto", "messages": [{"role": "user", "content": text}]}),
+            )
+            .unwrap()
+    }
+
+    /// A Route without a rule set behaves exactly as before. This is what makes
+    /// the feature safe to ship: every existing Route keeps its semantics.
+    #[test]
+    fn a_route_without_configured_rules_uses_the_builtin_classifier() {
+        let route = route();
+        assert!(route.semantic_rules.is_none());
+        let greeting = ask(&route, "你好");
+        assert_eq!(greeting.semantic.task, SemanticTask::Greeting);
+        assert_eq!(
+            greeting.semantic.rule_id.as_deref(),
+            Some("builtin:greeting")
+        );
+        let general = ask(&route, "写一段 sql");
+        assert_eq!(general.semantic.task, SemanticTask::General);
+        assert_eq!(general.semantic.rule_id, None);
+        assert!(general.semantic.abstained);
+    }
+
+    /// The point of the feature: a phrase the built-ins do not know can be
+    /// taught without a release, and it changes routing.
+    #[test]
+    fn a_configured_rule_classifies_a_phrase_the_builtins_do_not_know() {
+        let route = route_with_rules(SemanticRuleSet {
+            schema_version: 1,
+            mode: SemanticRuleMode::Extend,
+            rules: vec![rule("sql_generation", &["写一段 sql", "生成建表语句"])],
+        });
+        let decision = ask(&route, "帮我写一段 sql 查询");
+        assert_eq!(decision.semantic.task, SemanticTask::EquationSolving);
+        assert_eq!(decision.semantic.rule_id.as_deref(), Some("sql_generation"));
+        assert_eq!(decision.semantic.confidence_millis, 900);
+        assert!(!decision.semantic.abstained);
+        // The rule asked for reasoning, so capability admission escalates the tier.
+        assert!(decision.requirement.reasoning);
+        assert_eq!(decision.tier, "capable");
+        assert_eq!(decision.reason, "capability_required");
+    }
+
+    /// `Extend` keeps the built-in weather rule, which is a safety assertion:
+    /// a config that forgets it cannot silently allow the Gateway to answer a
+    /// realtime weather question without a Host tool.
+    #[test]
+    fn extend_mode_keeps_the_builtin_weather_guarantee() {
+        let route = route_with_rules(SemanticRuleSet {
+            schema_version: 1,
+            mode: SemanticRuleMode::Extend,
+            rules: vec![rule("sql_generation", &["写一段 sql"])],
+        });
+        let error = route
+            .decide(
+                &catalog(),
+                &json!({"model": "urouter/auto",
+                        "messages": [{"role": "user", "content": "武汉天气"}]}),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            RouteError::RequiredToolUnavailable("weather".to_owned())
+        );
+    }
+
+    /// `Replace` is the opt-in that turns the built-ins off entirely. Asserting
+    /// it here makes the consequence explicit rather than incidental.
+    #[test]
+    fn replace_mode_disables_every_builtin_rule() {
+        let route = route_with_rules(SemanticRuleSet {
+            schema_version: 1,
+            mode: SemanticRuleMode::Replace,
+            rules: vec![rule("sql_generation", &["写一段 sql"])],
+        });
+        // Weather no longer requires a Host tool.
+        let weather = ask(&route, "武汉天气");
+        assert_eq!(weather.semantic.task, SemanticTask::General);
+        assert!(weather.semantic.abstained);
+        // Greeting no longer classifies either.
+        assert_eq!(ask(&route, "你好").semantic.task, SemanticTask::General);
+        // The configured rule still works.
+        assert_eq!(
+            ask(&route, "写一段 sql").semantic.rule_id.as_deref(),
+            Some("sql_generation")
+        );
+    }
+
+    /// Declaration order is the precedence, so a published set has a precedence
+    /// its author can read off the file.
+    #[test]
+    fn the_first_matching_configured_rule_wins() {
+        let mut first = rule("specific", &["紧急 sql"]);
+        first.confidence_millis = 990;
+        let route = route_with_rules(SemanticRuleSet {
+            schema_version: 1,
+            mode: SemanticRuleMode::Extend,
+            rules: vec![first, rule("general_sql", &["sql"])],
+        });
+        let decision = ask(&route, "紧急 sql 问题");
+        assert_eq!(decision.semantic.rule_id.as_deref(), Some("specific"));
+        assert_eq!(decision.semantic.confidence_millis, 990);
+    }
+
+    /// Configured rules are tried before the built-ins, so a set can override a
+    /// built-in classification for a phrase both would match.
+    #[test]
+    fn a_configured_rule_takes_precedence_over_a_builtin() {
+        let mut override_rule = rule("greeting_is_hard", &["你好"]);
+        override_rule.task = SemanticTask::General;
+        override_rule.requires_reasoning = false;
+        let route = route_with_rules(SemanticRuleSet {
+            schema_version: 1,
+            mode: SemanticRuleMode::Extend,
+            rules: vec![override_rule],
+        });
+        let decision = ask(&route, "你好");
+        assert_eq!(
+            decision.semantic.rule_id.as_deref(),
+            Some("greeting_is_hard")
+        );
+        assert_ne!(
+            decision.semantic.rule_id.as_deref(),
+            Some("builtin:greeting")
+        );
+    }
+
+    /// Configured and built-in rules must share one normalisation, or the same
+    /// phrase could classify differently depending on where the rule lives.
+    #[test]
+    fn configured_rules_see_the_same_normalisation_as_the_builtins() {
+        let mut exact = rule("exact_hello", &[]);
+        exact.equals = vec!["你好".to_owned()];
+        let route = route_with_rules(SemanticRuleSet {
+            schema_version: 1,
+            mode: SemanticRuleMode::Extend,
+            rules: vec![exact],
+        });
+        // Trailing punctuation and case are stripped before matching, exactly as
+        // the built-in greeting rule expects.
+        for text in ["你好", "你好！", "  你好  ", "你好。"] {
+            assert_eq!(
+                ask(&route, text).semantic.rule_id.as_deref(),
+                Some("exact_hello"),
+                "{text:?} did not match"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_all_requires_every_pattern() {
+        let mut all = rule("migration", &[]);
+        all.contains_all = vec!["数据库".to_owned(), "迁移".to_owned()];
+        let route = route_with_rules(SemanticRuleSet {
+            schema_version: 1,
+            mode: SemanticRuleMode::Extend,
+            rules: vec![all],
+        });
+        assert_eq!(
+            ask(&route, "帮我做数据库迁移").semantic.rule_id.as_deref(),
+            Some("migration")
+        );
+        // Only one of the two patterns present: no match.
+        assert_eq!(ask(&route, "帮我做数据库设计").semantic.rule_id, None);
+    }
+
+    /// A configured rule can require a Host tool, which is the same hard
+    /// rejection the built-in weather rule uses.
+    #[test]
+    fn a_configured_rule_can_require_a_host_tool() {
+        let mut stock = rule("stock_quote", &["股价"]);
+        stock.task = SemanticTask::RealtimeWeather;
+        stock.requires_tools = true;
+        stock.requires_reasoning = false;
+        stock.required_tool = Some("get_stock_quote".to_owned());
+        let route = route_with_rules(SemanticRuleSet {
+            schema_version: 1,
+            mode: SemanticRuleMode::Extend,
+            rules: vec![stock],
+        });
+        let error = route
+            .decide(
+                &catalog(),
+                &json!({"model": "urouter/auto",
+                        "messages": [{"role": "user", "content": "茅台股价"}]}),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            RouteError::RequiredToolUnavailable("get_stock_quote".to_owned())
+        );
+
+        // With the tool declared the request proceeds.
+        let decision = route
+            .decide(
+                &catalog(),
+                &json!({"model": "urouter/auto",
+                        "messages": [{"role": "user", "content": "茅台股价"}],
+                        "tools": [{"type": "function",
+                                   "function": {"name": "get_stock_quote", "parameters": {}}}]}),
+            )
+            .unwrap();
+        assert_eq!(decision.semantic.rule_id.as_deref(), Some("stock_quote"));
+        assert!(decision.requirement.tool_calling);
+    }
+
+    /// Every rejection path, so a malformed published set fails the candidate
+    /// Route and is handled by `last_good`/`fail_closed` instead of shipping.
+    #[test]
+    fn malformed_rule_sets_are_rejected_by_route_validation() {
+        let set = |rules: Vec<SemanticRule>, schema_version: u16| SemanticRuleSet {
+            schema_version,
+            mode: SemanticRuleMode::Extend,
+            rules,
+        };
+        let base = || rule("r1", &["x"]);
+
+        let cases: Vec<(SemanticRuleSet, RouteError)> = vec![
+            (
+                set(vec![base()], 2),
+                RouteError::UnsupportedSemanticRuleSchema(2),
+            ),
+            (
+                set(
+                    vec![SemanticRule {
+                        id: "  ".to_owned(),
+                        ..base()
+                    }],
+                    1,
+                ),
+                RouteError::EmptySemanticRuleId,
+            ),
+            (
+                set(vec![base(), base()], 1),
+                RouteError::DuplicateSemanticRule("r1".to_owned()),
+            ),
+            (
+                set(
+                    vec![SemanticRule {
+                        contains_any: Vec::new(),
+                        ..base()
+                    }],
+                    1,
+                ),
+                RouteError::SemanticRuleWithoutCondition("r1".to_owned()),
+            ),
+            (
+                set(
+                    vec![SemanticRule {
+                        contains_any: vec![String::new()],
+                        ..base()
+                    }],
+                    1,
+                ),
+                RouteError::EmptySemanticRulePattern("r1".to_owned()),
+            ),
+            (
+                set(
+                    vec![SemanticRule {
+                        confidence_millis: 0,
+                        ..base()
+                    }],
+                    1,
+                ),
+                RouteError::InvalidSemanticRuleConfidence("r1".to_owned()),
+            ),
+            (
+                set(
+                    vec![SemanticRule {
+                        confidence_millis: 1_001,
+                        ..base()
+                    }],
+                    1,
+                ),
+                RouteError::InvalidSemanticRuleConfidence("r1".to_owned()),
+            ),
+            (
+                set(
+                    vec![SemanticRule {
+                        required_tool: Some(String::new()),
+                        ..base()
+                    }],
+                    1,
+                ),
+                RouteError::EmptySemanticRuleTool("r1".to_owned()),
+            ),
+        ];
+        for (rules, expected) in cases {
+            let route = route_with_rules(rules);
+            assert_eq!(route.validate(&catalog()).unwrap_err(), expected);
+        }
+    }
+
+    /// A published set round-trips through the Route file, which is how it
+    /// reaches the signed control manifest.
+    #[test]
+    fn a_rule_set_round_trips_through_the_route_document() {
+        let route = route_with_rules(SemanticRuleSet {
+            schema_version: 1,
+            mode: SemanticRuleMode::Replace,
+            rules: vec![rule("sql_generation", &["sql"])],
+        });
+        let encoded = serde_json::to_string(&route).unwrap();
+        let decoded: RouteConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, route);
+        // An unknown field is refused rather than silently ignored, so a typo in
+        // a published rule fails review instead of becoming an inert rule.
+        let typo = encoded.replace("contains_any", "contain_any");
+        assert!(serde_json::from_str::<RouteConfig>(&typo).is_err());
     }
 
     #[test]
