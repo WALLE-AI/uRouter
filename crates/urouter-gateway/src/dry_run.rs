@@ -70,7 +70,7 @@ pub(crate) struct DryRunReport {
     pub(crate) errors: Vec<DryRunError>,
 }
 
-pub(crate) const DRY_RUN_CHECK_IDS: [&str; 16] = [
+pub(crate) const DRY_RUN_CHECK_IDS: [&str; 18] = [
     "cascade_cost_class_order",
     "filter_cost_class_order",
     "artifact_feature_schema",
@@ -87,6 +87,8 @@ pub(crate) const DRY_RUN_CHECK_IDS: [&str; 16] = [
     "custom_provider_compat",
     "endpoint_placeholders",
     "cost_override_reason",
+    "quota_limit_consistency",
+    "quota_scope_topology",
 ];
 
 pub(crate) fn check(
@@ -439,6 +441,11 @@ pub(crate) fn route_dry_run_checks(
             tool_decider_message(args, catalog, route),
         ),
         check(12, DRY_RUN_CHECK_IDS[11], route_status, route_message),
+        // Numbered after the catalog checks because they were added later; the
+        // report is assembled from three functions and each check states its
+        // own number.
+        quota_limit_consistency_check(route),
+        quota_scope_topology_check(args, route),
     ]
 }
 
@@ -464,6 +471,95 @@ pub(crate) fn catalog_dry_run_checks(
         ),
         check(16, DRY_RUN_CHECK_IDS[15], override_status, override_message),
     ]
+}
+
+/// A configured ledger that cannot behave as its author intended.
+///
+/// Two shapes are caught: a duplicated `(scope, window, dimension)`, where one
+/// of the two values is silently lost, and a daily cap below its own per-minute
+/// cap, where the minute window always rejects first so the daily one can never
+/// bind.
+fn quota_limit_consistency_check(route: &RouteConfig) -> DryRunCheck {
+    let limits = route.quota_limit_set();
+    if limits.limits.is_empty() {
+        return check(
+            17,
+            DRY_RUN_CHECK_IDS[16],
+            DryRunStatus::NotApplicable,
+            "no scoped quota limits are configured".to_owned(),
+        );
+    }
+    let duplicates = limits.duplicates();
+    if !duplicates.is_empty() {
+        return check(
+            17,
+            DRY_RUN_CHECK_IDS[16],
+            DryRunStatus::Fail,
+            format!("{} duplicate quota limit(s) configured", duplicates.len()),
+        );
+    }
+    let unreachable = limits.inconsistent_windows();
+    if !unreachable.is_empty() {
+        return check(
+            17,
+            DRY_RUN_CHECK_IDS[16],
+            DryRunStatus::Warning,
+            format!(
+                "{} daily cap(s) sit below their own per-minute cap and can never bind",
+                unreachable.len()
+            ),
+        );
+    }
+    check(
+        17,
+        DRY_RUN_CHECK_IDS[16],
+        DryRunStatus::Pass,
+        format!("{} scoped quota limit(s) are internally consistent", limits.limits.len()),
+    )
+}
+
+/// Cross-tenant quota scopes cannot be made hash-slot safe on Redis Cluster.
+///
+/// A single `EVAL` for one request touches tenant-, provider- and
+/// credential-scoped keys. Provider keys are shared across tenants, so no hash
+/// tag can co-slot every key in a plan. The workspace's `redis` dependency has
+/// no `cluster` feature today, which is why this is a warning rather than a
+/// failure — but it must be stated, not discovered.
+fn quota_scope_topology_check(args: &Args, route: &RouteConfig) -> DryRunCheck {
+    let shared_scopes = route.quota_limits.iter().any(|limit| {
+        matches!(
+            limit.scope,
+            urouter_contracts::QuotaScopeKind::Provider
+                | urouter_contracts::QuotaScopeKind::Credential
+        )
+    });
+    if !shared_scopes {
+        return check(
+            18,
+            DRY_RUN_CHECK_IDS[17],
+            DryRunStatus::NotApplicable,
+            "no cross-tenant quota scopes are configured".to_owned(),
+        );
+    }
+    let clustered = args
+        .redis_url
+        .as_deref()
+        .is_some_and(|url| url.contains("cluster") || url.matches(',').count() > 0);
+    if clustered {
+        return check(
+            18,
+            DRY_RUN_CHECK_IDS[17],
+            DryRunStatus::Fail,
+            "provider/credential quota scopes cannot be hash-slot safe on a Redis Cluster endpoint"
+                .to_owned(),
+        );
+    }
+    check(
+        18,
+        DRY_RUN_CHECK_IDS[17],
+        DryRunStatus::Pass,
+        "cross-tenant quota scopes are served by a single-slot Redis endpoint".to_owned(),
+    )
 }
 
 pub(crate) fn monotonic_cost_class_status(classes: &[ValidationCostClass]) -> DryRunStatus {

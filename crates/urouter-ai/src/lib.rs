@@ -30,3 +30,6 @@ pub mod projection;
 pub use catalog::{
     CatalogDocument, CatalogSnapshot, ModelResolution, ModelSpec, ModelVariantKey, ProviderSpec,
 };
+pub use compat::{
+    Compat, MaxTokensField, ParamPolicy, StructuredOutputFormat, ThinkingFormat, ToolCallFormat,
+};

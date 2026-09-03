@@ -198,6 +198,15 @@ mod tests {
                 "messages": [{"role": "user", "content": "plan a migration"}],
                 "urouter": {"hint": {"difficulty": "hard"}}
             }),
+            // An overstated output bound. Admission caps what this reserves
+            // against the context window, and the cap has to apply identically
+            // on both sides or the two routers disagree about which models are
+            // eligible for the same request.
+            json!({
+                "model": "urouter/auto",
+                "max_tokens": 32_000,
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
         ]
     }
 

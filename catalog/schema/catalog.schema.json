@@ -64,11 +64,44 @@
         },
         {
           "type": "object",
+          "required": [
+            "kind",
+            "token_url",
+            "client_id_env",
+            "client_secret_env",
+            "token_file"
+          ],
+          "properties": {
+            "kind": { "const": "oauth_client_credentials" },
+            "token_url": { "type": "string", "minLength": 1 },
+            "client_id_env": { "type": "string", "minLength": 1 },
+            "client_secret_env": { "type": "string", "minLength": 1 },
+            "token_file": { "type": "string", "minLength": 1 },
+            "scope": { "type": ["string", "null"] },
+            "audience": { "type": ["string", "null"] },
+            "header": { "type": "string" },
+            "prefix": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
           "required": ["kind"],
           "properties": {
             "kind": { "const": "none" },
             "allow_remote": { "type": "boolean" }
           },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "wire_api": {
+      "oneOf": [
+        { "enum": ["open_ai_chat", "open_ai_responses", "anthropic_messages"] },
+        {
+          "type": "object",
+          "required": ["custom"],
+          "properties": { "custom": { "type": "string", "minLength": 1 } },
           "additionalProperties": false
         }
       ]
@@ -112,7 +145,7 @@
         "upstream_id": { "type": "string", "minLength": 1 },
         "name": { "type": "string", "minLength": 1 },
         "provider": { "type": "string", "minLength": 1 },
-        "api": {},
+        "api": { "$ref": "#/$defs/wire_api" },
         "base_url": { "type": ["string", "null"] },
         "cost": {
           "type": "object",

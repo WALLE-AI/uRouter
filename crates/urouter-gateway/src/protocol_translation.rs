@@ -37,7 +37,7 @@ pub(crate) fn translate_chat_stream_response(
                     state.buffer.remove(0);
                 }
                 let bytes =
-                    translate_chat_sse_event(&event, state.protocol, &mut state.translation);
+                    translate_chat_sse_event(&event, &state.protocol, &mut state.translation);
                 if !bytes.is_empty() {
                     return Some((Ok::<Bytes, axum::Error>(Bytes::from(bytes)), state));
                 }
@@ -72,7 +72,7 @@ pub(crate) fn find_sse_event_end(buffer: &[u8]) -> Option<usize> {
 
 pub(crate) fn translate_chat_sse_event(
     event: &[u8],
-    protocol: ProtocolResponse,
+    protocol: &ProtocolResponse,
     state: &mut ProtocolTranslationState,
 ) -> Vec<u8> {
     let source = String::from_utf8_lossy(event);
@@ -90,6 +90,10 @@ pub(crate) fn translate_chat_sse_event(
         return match protocol {
             ProtocolResponse::Responses => named_sse("response.urouter", &data),
             ProtocolResponse::Anthropic => named_sse("urouter.decision", &data),
+            // Unreachable: the Gemini and Ollama handlers refuse a streaming
+            // request before a stream is ever created, precisely so no
+            // half-translated chunk can reach a client that cannot read it.
+            ProtocolResponse::Gemini | ProtocolResponse::Ollama { .. } => Vec::new(),
         };
     }
     if data == "[DONE]" {
@@ -109,6 +113,7 @@ pub(crate) fn translate_chat_sse_event(
     if !state.started {
         state.started = true;
         match protocol {
+            ProtocolResponse::Gemini | ProtocolResponse::Ollama { .. } => {}
             ProtocolResponse::Responses => append_json_sse(
                 &mut output,
                 "response.created",
@@ -170,7 +175,7 @@ pub(crate) fn translate_chat_sse_event(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn append_protocol_delta(
     output: &mut Vec<u8>,
-    protocol: ProtocolResponse,
+    protocol: &ProtocolResponse,
     state: &mut ProtocolTranslationState,
     index: u64,
     kind: &str,
@@ -179,6 +184,7 @@ pub(crate) fn append_protocol_delta(
     name: Option<&str>,
 ) {
     match protocol {
+        ProtocolResponse::Gemini | ProtocolResponse::Ollama { .. } => {}
         ProtocolResponse::Responses => match kind {
             "text" => append_json_sse(
                 output,
@@ -240,11 +246,12 @@ pub(crate) fn append_protocol_delta(
 }
 
 pub(crate) fn finish_protocol_stream(
-    protocol: ProtocolResponse,
+    protocol: &ProtocolResponse,
     state: &mut ProtocolTranslationState,
 ) -> Vec<u8> {
     let mut output = Vec::new();
     match protocol {
+        ProtocolResponse::Gemini | ProtocolResponse::Ollama { .. } => {}
         ProtocolResponse::Responses => append_json_sse(
             &mut output,
             "response.completed",
@@ -291,9 +298,13 @@ pub(crate) async fn translate_chat_response(
         .await
         .map_err(GatewayError::internal)?;
     let chat: Value = serde_json::from_slice(&bytes).map_err(GatewayError::internal)?;
-    let translated = match protocol {
+    let translated = match &protocol {
         ProtocolResponse::Responses => chat_to_responses(&chat),
         ProtocolResponse::Anthropic => chat_to_anthropic(&chat),
+        ProtocolResponse::Gemini => urouter_protocol::chat_to_gemini_response(&chat),
+        ProtocolResponse::Ollama { model } => {
+            urouter_protocol::chat_to_ollama_response(&chat, model)
+        }
     };
     let body = serde_json::to_vec(&translated).map_err(GatewayError::internal)?;
     parts.headers.remove(header::CONTENT_LENGTH);

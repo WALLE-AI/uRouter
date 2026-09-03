@@ -793,6 +793,199 @@ fn anthropic_content_part(part: &ContentPart) -> Value {
     }
 }
 
+// ── Gemini generateContent ──────────────────────────────────────────────────
+
+/// Read Google's native `generateContent` request shape.
+///
+/// Two structural differences from every other inbound protocol, both of which
+/// this has to undo:
+///
+/// * The system prompt is out-of-band in `systemInstruction`, not a turn.
+/// * The assistant turn is spelled `model`.
+///
+/// The model id is NOT in the body — it is in the URL path — so the caller
+/// supplies it.
+pub fn from_gemini_generate_content(
+    value: &Value,
+    model: &str,
+    stream: bool,
+) -> Result<NormalizedRequest, ProtocolError> {
+    let mut messages = Vec::new();
+    if let Some(system) = value.get("systemInstruction") {
+        let content = gemini_parts(system)?;
+        if !content.is_empty() {
+            messages.push(Message {
+                role: Role::System,
+                content,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                reasoning: None,
+            });
+        }
+    }
+    for turn in value
+        .get("contents")
+        .and_then(Value::as_array)
+        .ok_or(ProtocolError::MissingField("contents"))?
+    {
+        let role = match turn.get("role").and_then(Value::as_str) {
+            Some("model") => Role::Assistant,
+            _ => Role::User,
+        };
+        messages.push(Message {
+            role,
+            content: gemini_parts(turn)?,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            reasoning: None,
+        });
+    }
+    if messages.is_empty() {
+        return Err(ProtocolError::MissingField("contents"));
+    }
+    Ok(NormalizedRequest {
+        schema_version: 1,
+        model: model.to_owned(),
+        messages,
+        tools: Vec::new(),
+        response_schema: None,
+        max_output_tokens: value
+            .pointer("/generationConfig/maxOutputTokens")
+            .and_then(Value::as_u64),
+        stream,
+        extensions: value.get("urouter").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn gemini_parts(node: &Value) -> Result<Vec<ContentPart>, ProtocolError> {
+    let Some(parts) = node.get("parts").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut content = Vec::new();
+    for part in parts {
+        if let Some(text) = part.get("text").and_then(Value::as_str) {
+            content.push(ContentPart::Text {
+                text: text.to_owned(),
+            });
+        } else if let Some(uri) = part.pointer("/fileData/fileUri").and_then(Value::as_str) {
+            content.push(ContentPart::ImageUrl {
+                url: uri.to_owned(),
+            });
+        } else {
+            // Inline blobs, function calls and executable code have no faithful
+            // representation in the IR yet. Refusing is the honest answer:
+            // dropping them silently would answer a different question than the
+            // caller asked.
+            return Err(ProtocolError::UnsupportedContent("gemini_part".to_owned()));
+        }
+    }
+    Ok(content)
+}
+
+/// Render an `OpenAI` Chat response as a Gemini `generateContent` response.
+#[must_use]
+pub fn chat_to_gemini_response(chat: &Value) -> Value {
+    let text = chat
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let finish = match chat
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+    {
+        Some("length") => "MAX_TOKENS",
+        Some("content_filter") => "SAFETY",
+        _ => "STOP",
+    };
+    let prompt = chat
+        .pointer("/usage/prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let completion = chat
+        .pointer("/usage/completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    json!({
+        "candidates": [{
+            "content": {"role": "model", "parts": [{"text": text}]},
+            "finishReason": finish,
+            "index": 0
+        }],
+        "usageMetadata": {
+            "promptTokenCount": prompt,
+            "candidatesTokenCount": completion,
+            "totalTokenCount": prompt.saturating_add(completion)
+        },
+        "modelVersion": chat.get("model").cloned().unwrap_or(Value::Null)
+    })
+}
+
+// ── Ollama /api/chat ────────────────────────────────────────────────────────
+
+/// Read Ollama's native chat request.
+///
+/// Close to `OpenAI` Chat, with the sampling knobs nested under `options` and the
+/// output bound spelled `num_predict`. `stream` defaults to TRUE here, unlike
+/// every other protocol — that is Ollama's documented default and clients rely
+/// on it.
+pub fn from_ollama_chat(value: &Value) -> Result<NormalizedRequest, ProtocolError> {
+    let model = required_string(value, "model")?;
+    let messages = value
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or(ProtocolError::MissingField("messages"))?
+        .iter()
+        .map(|message| {
+            Ok(Message {
+                role: parse_role(message.get("role").and_then(Value::as_str))?,
+                content: vec![ContentPart::Text {
+                    text: message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                }],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                reasoning: None,
+            })
+        })
+        .collect::<Result<Vec<_>, ProtocolError>>()?;
+    Ok(NormalizedRequest {
+        schema_version: 1,
+        model,
+        messages,
+        tools: Vec::new(),
+        response_schema: None,
+        max_output_tokens: value
+            .pointer("/options/num_predict")
+            .and_then(Value::as_u64),
+        stream: value.get("stream").and_then(Value::as_bool).unwrap_or(true),
+        extensions: value.get("urouter").cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// Render an `OpenAI` Chat response as an Ollama chat response.
+#[must_use]
+pub fn chat_to_ollama_response(chat: &Value, model: &str) -> Value {
+    let text = chat
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json!({
+        "model": model,
+        "created_at": "1970-01-01T00:00:00Z",
+        "message": {"role": "assistant", "content": text},
+        "done": true,
+        "done_reason": chat
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("stop"),
+        "prompt_eval_count": chat.pointer("/usage/prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+        "eval_count": chat.pointer("/usage/completion_tokens").and_then(Value::as_u64).unwrap_or(0)
+    })
+}
+
 fn required_string(value: &Value, field: &'static str) -> Result<String, ProtocolError> {
     value
         .get(field)

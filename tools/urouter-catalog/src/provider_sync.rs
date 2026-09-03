@@ -192,6 +192,20 @@ enum DiscoveryConfig {
     ReviewedStatic {
         path: PathBuf,
     },
+    /// A `FreeLLMAPI` catalog export, filtered to one platform.
+    ///
+    /// The export carries context windows, per-model rate limits, modality and
+    /// tool-support flags — real, hard-won inventory. It carries NO pricing, no
+    /// `max_output_tokens`, no structured-output or reasoning support, no
+    /// `compat`, no lifecycle and no per-fact provenance, all of which uRouter
+    /// requires. So it enters as INVENTORY, at the same gate as any other
+    /// discovery driver, and every missing fact is quarantined for review
+    /// rather than invented. See `FreeLlmApiExportDriver`.
+    FreeLlmApiExport {
+        path: PathBuf,
+        /// The `platform` id in the export to take models from.
+        platform: String,
+    },
 }
 
 const fn default_page_size() -> u32 {
@@ -208,6 +222,7 @@ impl DiscoveryConfig {
             Self::OpenAiModels { .. } => "open_ai_models",
             Self::BailianCatalog { .. } => "bailian_catalog",
             Self::ReviewedStatic { .. } => "reviewed_static",
+            Self::FreeLlmApiExport { .. } => "freellmapi_export",
         }
     }
 
@@ -215,6 +230,9 @@ impl DiscoveryConfig {
         match self {
             Self::OpenAiModels { url, .. } | Self::BailianCatalog { url, .. } => url.clone(),
             Self::ReviewedStatic { path } => path.display().to_string(),
+            Self::FreeLlmApiExport { path, platform } => {
+                format!("{}#{platform}", path.display())
+            }
         }
     }
 }
@@ -380,6 +398,7 @@ trait ProviderDriver: Send + Sync {
 struct OpenAiModelsDriver;
 struct BailianCatalogDriver;
 struct ReviewedStaticDriver;
+struct FreeLlmApiExportDriver;
 
 #[derive(Debug, Error)]
 enum SyncError {
@@ -1440,6 +1459,14 @@ fn validate_instance(instance: &ProviderInstance) -> Result<(), SyncError> {
             return Err(invalid("reviewed static path must not be empty"));
         }
         DiscoveryConfig::ReviewedStatic { .. } => {}
+        DiscoveryConfig::FreeLlmApiExport { path, platform } => {
+            if path.as_os_str().is_empty() {
+                return Err(invalid("freellmapi export path must not be empty"));
+            }
+            if platform.trim().is_empty() {
+                return Err(invalid("freellmapi export platform must not be empty"));
+            }
+        }
     }
     Ok(())
 }
@@ -1470,6 +1497,7 @@ fn driver_for(config: &DiscoveryConfig) -> Box<dyn ProviderDriver> {
         DiscoveryConfig::OpenAiModels { .. } => Box::new(OpenAiModelsDriver),
         DiscoveryConfig::BailianCatalog { .. } => Box::new(BailianCatalogDriver),
         DiscoveryConfig::ReviewedStatic { .. } => Box::new(ReviewedStaticDriver),
+        DiscoveryConfig::FreeLlmApiExport { .. } => Box::new(FreeLlmApiExportDriver),
     }
 }
 
@@ -1578,6 +1606,87 @@ impl ProviderDriver for ReviewedStaticDriver {
             })?;
         models.iter().map(raw_model_from_id).collect()
     }
+}
+
+/// Import inventory from a `FreeLLMAPI` catalog export.
+///
+/// Adapted from the export shape produced by `FreeLLMAPI`
+/// `server/src/scripts/export-catalog.ts`, MIT License, Copyright (c) 2026
+/// Tashfeen Ahmed.
+///
+/// ## Why this is a discovery driver and not a catalog importer
+///
+/// It would be shorter to write the export straight into `catalog.json`. It
+/// would also be wrong. uRouter's catalog requires every fact to carry a source,
+/// a check date and a confidence, and requires `cost`, `max_output_tokens`,
+/// `compat` and `lifecycle` — none of which this export has. Filling those in
+/// with plausible values would put unattributed guesses behind a signed
+/// manifest, which is the one thing the review pipeline exists to prevent.
+///
+/// Entering as inventory means the existing `candidate` step quarantines every
+/// missing field and `publish` refuses until a human has supplied it.
+#[async_trait]
+impl ProviderDriver for FreeLlmApiExportDriver {
+    fn kind(&self) -> &'static str {
+        "freellmapi_export"
+    }
+
+    async fn discover(
+        &self,
+        context: &DiscoveryContext<'_>,
+    ) -> Result<Vec<RawProviderModel>, SyncError> {
+        let DiscoveryConfig::FreeLlmApiExport { path, platform } = &context.instance.discovery
+        else {
+            unreachable!("driver selected from discovery config")
+        };
+        let path = if path.is_absolute() {
+            path.clone()
+        } else {
+            context.base_dir.join(path)
+        };
+        let export: Value = serde_json::from_slice(&fs::read(path)?)?;
+        freellmapi_models(&export, platform)
+    }
+}
+
+/// Project one platform's rows out of an export into raw inventory.
+fn freellmapi_models(export: &Value, platform: &str) -> Result<Vec<RawProviderModel>, SyncError> {
+    let models = export
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            SyncError::InvalidResponse("freellmapi export needs models[]".to_owned())
+        })?;
+    let mut out = Vec::new();
+    for model in models {
+        if model.get("platform").and_then(Value::as_str) != Some(platform) {
+            continue;
+        }
+        let upstream_id = model
+            .get("modelId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                SyncError::InvalidResponse("freellmapi export model needs modelId".to_owned())
+            })?;
+        // `raw` keeps the whole row verbatim. A reviewer needs the rate limits
+        // and the quirks to fill in what uRouter requires, and dropping them
+        // here would mean going back to the export by hand.
+        out.push(RawProviderModel {
+            upstream_id: upstream_id.to_owned(),
+            name: model
+                .get("displayName")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            raw: model.clone(),
+        });
+    }
+    if out.is_empty() {
+        return Err(SyncError::InvalidResponse(format!(
+            "freellmapi export contains no models for platform {platform}"
+        )));
+    }
+    Ok(out)
 }
 
 fn endpoint_url(template: &str, query: &BTreeMap<String, String>) -> Result<Url, SyncError> {
@@ -1993,6 +2102,111 @@ mod tests {
         };
         let models = ReviewedStaticDriver.discover(&context).await.unwrap();
         assert_eq!(models[0].upstream_id, "reviewed/model");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A `FreeLLMAPI` catalog export, in the shape
+    /// `server/src/scripts/export-catalog.ts` documents.
+    fn freellmapi_export() -> serde_json::Value {
+        json!({
+            "version": "2026.09.03",
+            "tier": "live",
+            "platforms": [{"id": "groq", "name": "Groq"}, {"id": "cerebras", "name": "Cerebras"}],
+            "models": [
+                {
+                    "platform": "groq",
+                    "modelId": "llama-3.3-70b-versatile",
+                    "displayName": "Llama 3.3 70B",
+                    "contextWindow": 131_072,
+                    "supportsVision": false,
+                    "supportsTools": true,
+                    "enabled": true,
+                    "limits": {"rpm": 30, "rpd": 1_000, "tpm": 12_000, "tpd": 100_000},
+                    "monthlyTokenBudget": "~30M",
+                    "quirks": []
+                },
+                {
+                    "platform": "cerebras",
+                    "modelId": "llama3.1-8b",
+                    "displayName": "Llama 3.1 8B",
+                    "contextWindow": 8_192,
+                    "supportsVision": false,
+                    "supportsTools": true,
+                    "enabled": true,
+                    "limits": {"rpm": 30, "rpd": 900, "tpm": 60_000, "tpd": 1_000_000},
+                    "quirks": []
+                }
+            ],
+            "quirks": []
+        })
+    }
+
+    #[test]
+    fn freellmapi_import_takes_only_the_requested_platform() {
+        let export = freellmapi_export();
+        let groq = freellmapi_models(&export, "groq").unwrap();
+        assert_eq!(groq.len(), 1);
+        assert_eq!(groq[0].upstream_id, "llama-3.3-70b-versatile");
+        assert_eq!(groq[0].name.as_deref(), Some("Llama 3.3 70B"));
+
+        let cerebras = freellmapi_models(&export, "cerebras").unwrap();
+        assert_eq!(cerebras[0].upstream_id, "llama3.1-8b");
+    }
+
+    /// The row is kept verbatim. A reviewer has to fill in pricing, compat and
+    /// `max_output_tokens` by hand, and the rate limits and context window are
+    /// the evidence they work from — dropping them would mean going back to the
+    /// export.
+    #[test]
+    fn freellmapi_import_preserves_the_whole_row_as_evidence() {
+        let models = freellmapi_models(&freellmapi_export(), "groq").unwrap();
+        let raw = &models[0].raw;
+        assert_eq!(raw["contextWindow"], json!(131_072));
+        assert_eq!(raw["limits"]["rpd"], json!(1000));
+        assert_eq!(raw["supportsTools"], json!(true));
+    }
+
+    #[test]
+    fn freellmapi_import_rejects_an_unknown_platform_rather_than_importing_nothing() {
+        let error = freellmapi_models(&freellmapi_export(), "nonexistent").unwrap_err();
+        assert!(matches!(error, SyncError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn freellmapi_import_rejects_a_malformed_export() {
+        assert!(freellmapi_models(&json!({}), "groq").is_err());
+        assert!(
+            freellmapi_models(&json!({"models": [{"platform": "groq"}]}), "groq").is_err(),
+            "a row with no modelId is not importable"
+        );
+    }
+
+    #[tokio::test]
+    async fn freellmapi_driver_reads_a_registry_relative_export() {
+        let root = std::env::temp_dir().join(format!(
+            "urouter-freellmapi-{}-{}",
+            std::process::id(),
+            unix_timestamp().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("export.json"),
+            serde_json::to_vec(&freellmapi_export()).unwrap(),
+        )
+        .unwrap();
+        let instance = instance(DiscoveryConfig::FreeLlmApiExport {
+            path: PathBuf::from("export.json"),
+            platform: "groq".to_owned(),
+        });
+        let client = Client::new();
+        let context = DiscoveryContext {
+            client: &client,
+            instance: &instance,
+            base_dir: &root,
+        };
+        let models = FreeLlmApiExportDriver.discover(&context).await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].upstream_id, "llama-3.3-70b-versatile");
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -13,8 +13,9 @@ use urouter_types::ModelId;
 
 pub use urouter_contracts::{FallbackCause, RetryPolicy, UpstreamErrorKind};
 use urouter_contracts::{
-    RuleEvaluation, RuleOutcome, TierCandidate, TierDecisionError, TierDecisionInput,
-    TierSelection, select_tier_with_cascade,
+    CandidateExclusion, ExhaustionSummary, OUTPUT_RESERVE_TOKENS_CAP, QuotaLimit, QuotaLimitSet,
+    RuleEvaluation, RuleOutcome, TierCandidate, TierDecisionError, TierDecisionInput, TierSelection,
+    reserved_output_tokens, select_tier_with_cascade, summarize_exhaustion,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +130,15 @@ pub struct RouteConfig {
     /// distribution channel to keep consistent.
     #[serde(default)]
     pub semantic_rules: Option<SemanticRuleSet>,
+    /// Declarative multi-scope rate and token caps.
+    ///
+    /// `skip_serializing_if` is load-bearing, not cosmetic: `revision()` hashes
+    /// this struct's serialization, so a field that always serialises would
+    /// change the revision of every route already deployed — invalidating
+    /// pinned revisions, artifact bindings and the signed control manifest for
+    /// operators who never opted into quotas. Empty must encode to nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota_limits: Vec<QuotaLimit>,
 }
 
 /// A reviewed set of semantic rules, published with the Route.
@@ -464,10 +474,21 @@ pub enum RouteError {
     AutoCapabilityViolation(String),
     #[error("requested tier does not exist: {0}")]
     UnknownTier(String),
-    #[error("no configured tier is eligible for the request")]
-    NoEligibleTier,
+    #[error("{}", .0.message())]
+    NoEligibleTier(Box<ExhaustionSummary>),
+    /// The model a session is BOUND to can no longer serve this call.
+    ///
+    /// Split out from [`RouteError::NoEligibleTier`] because the two mean
+    /// different things and the gateway already handled them differently
+    /// (`unsafe_task_migration` versus a plain rejection) while matching on one
+    /// variant — a conflation that giving `NoEligibleTier` a payload forced into
+    /// the open.
+    #[error("the model bound to this task is no longer eligible for the request")]
+    BoundModelIneligible,
     #[error("semantic task requires an available host tool: {0}")]
     RequiredToolUnavailable(String),
+    #[error("duplicate quota limit for {0}")]
+    DuplicateQuotaLimit(String),
 }
 
 impl RouteConfig {
@@ -477,9 +498,25 @@ impl RouteConfig {
         format!("sha256:{:x}", Sha256::digest(encoded))
     }
 
+    /// The configured caps, as the ledger's own type.
+    #[must_use]
+    pub fn quota_limit_set(&self) -> QuotaLimitSet {
+        QuotaLimitSet::new(self.quota_limits.clone())
+    }
+
     pub fn validate(&self, catalog: &CatalogSnapshot) -> Result<(), RouteError> {
         if self.id.trim().is_empty() || self.tiers.iter().any(|tier| tier.tier.trim().is_empty()) {
             return Err(RouteError::EmptyName);
+        }
+        // A duplicated (scope, window, dimension) silently loses one of the two
+        // values, which is almost always an editing mistake rather than intent.
+        if let Some(duplicate) = self.quota_limit_set().duplicates().first() {
+            return Err(RouteError::DuplicateQuotaLimit(format!(
+                "{}/{}/{}",
+                duplicate.scope.as_str(),
+                duplicate.window.as_str(),
+                duplicate.dimension.as_str()
+            )));
         }
         if self.tiers.is_empty() {
             return Err(RouteError::EmptyRoute);
@@ -650,7 +687,7 @@ impl RouteConfig {
                 .ok_or_else(|| RouteError::UnknownModel(requested.clone()))?;
             let admission = eligible_models(catalog, &requirement);
             if !admission.eligible.contains(&model.id) {
-                return Err(RouteError::NoEligibleTier);
+                return Err(no_eligible_tier(&admission));
             }
             return Ok(RouteDecision {
                 route_id: self.id.clone(),
@@ -688,7 +725,7 @@ impl RouteConfig {
             .filter(|(_, tier)| admission.eligible.contains(&tier.model))
             .collect::<Vec<_>>();
         if eligible.is_empty() {
-            return Err(RouteError::NoEligibleTier);
+            return Err(no_eligible_tier(&admission));
         }
         let mut selection = select_tier(self, &contract, request, &eligible)?;
         let selected_index = selection.index;
@@ -744,7 +781,7 @@ impl RouteConfig {
         model_id: &ModelId,
     ) -> Result<RouteDecision, RouteError> {
         if !decision.admission.eligible.contains(model_id) {
-            return Err(RouteError::NoEligibleTier);
+            return Err(RouteError::BoundModelIneligible);
         }
         let tier = self
             .tiers
@@ -1014,12 +1051,20 @@ fn analyze_requirement(
             .and_then(Value::as_bool)
             == Some(true);
     let prompt_tokens = characters.div_ceil(4);
-    let output_tokens = request
+    let requested_output = request
         .get("max_tokens")
         .or_else(|| request.get("max_completion_tokens"))
         .or_else(|| request.get("max_output_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+        .and_then(Value::as_u64);
+    // Reserve a capped share of the requested output against the context
+    // window, not the whole thing. A client sending `max_tokens: 32000` for a
+    // reply it will finish in 200 excluded every model whose window was smaller
+    // than the prompt plus 32000 — an empty candidate pool and a bogus
+    // exhaustion error with zero upstream calls. The default of 0 keeps the
+    // historical behaviour for requests that stated no output bound at all, so
+    // only the over-stated case changes.
+    let output_tokens =
+        reserved_output_tokens(requested_output, 0, OUTPUT_RESERVE_TOKENS_CAP);
     requirement.min_context_window = prompt_tokens.saturating_add(output_tokens);
     requirement
 }
@@ -1037,6 +1082,29 @@ fn normalized_user_text(request: &Value) -> String {
             || matches!(character, '!' | '?' | '.' | ',' | '。' | '！' | '？' | '，')
     })
     .to_owned()
+}
+
+#[must_use]
+/// Roll admission evidence into the client-safe summary carried on
+/// [`RouteError::NoEligibleTier`].
+///
+/// The per-model detail stays on `AdmissionResult`, which reaches `/v1/explain`
+/// and the `DecisionRecord`; only counts cross into the error.
+fn no_eligible_tier(admission: &AdmissionResult) -> RouteError {
+    RouteError::NoEligibleTier(Box::new(summarize_admission(admission)))
+}
+
+fn summarize_admission(admission: &AdmissionResult) -> ExhaustionSummary {
+    let exclusions: Vec<CandidateExclusion> = admission
+        .excluded
+        .iter()
+        .map(|excluded| CandidateExclusion {
+            candidate: excluded.model.to_string(),
+            reasons: excluded.reasons.clone(),
+            reset_millis: None,
+        })
+        .collect();
+    summarize_exhaustion(&exclusions)
 }
 
 #[must_use]
@@ -1267,7 +1335,9 @@ fn select_tier(
     })
     .map_err(|error| match error {
         TierDecisionError::UnknownPinnedTier(tier) => RouteError::UnknownTier(tier),
-        TierDecisionError::NoEligibleTier => RouteError::NoEligibleTier,
+        TierDecisionError::NoEligibleTier => {
+            RouteError::NoEligibleTier(Box::new(ExhaustionSummary::empty()))
+        }
     })?;
     if long_context_quality {
         selection.evaluations.insert(
@@ -2011,6 +2081,70 @@ mod tests {
         assert!(matches!(
             route().decide(&catalog(), &incomplete),
             Err(RouteError::InvalidContract(_))
+        ));
+    }
+
+    /// The shipped route's revision is pinned.
+    ///
+    /// `RouteConfig::revision()` hashes this struct's serialization, and that
+    /// revision is what `--control-required-revision`, the signed control
+    /// manifest and every `RouterArtifact` binding are keyed on. A new optional
+    /// field without `skip_serializing_if` would silently invalidate all of them
+    /// for operators who never opted into the feature. This test is the guard;
+    /// if it fails, check that the field you just added skips when empty before
+    /// updating the constant.
+    #[test]
+    fn the_shipped_route_revision_is_pinned() {
+        let route: RouteConfig =
+            serde_json::from_str(include_str!("../../../gateway/route.json")).unwrap();
+        assert_eq!(
+            route.revision(),
+            "sha256:c272ed069b6b4360a9e3cb3d4a1b42799b14a10675a4d11bd4d5d8f021532fe0"
+        );
+    }
+
+    /// An empty quota limit list must not appear in the serialization at all.
+    #[test]
+    fn empty_quota_limits_do_not_move_the_revision() {
+        let mut route: RouteConfig =
+            serde_json::from_str(include_str!("../../../gateway/route.json")).unwrap();
+        let before = route.revision();
+        route.quota_limits = Vec::new();
+        assert_eq!(route.revision(), before);
+        // The field must be absent from the encoding, not merely empty in it:
+        // `"quota_limits":[]` would still be new bytes and a new revision.
+        let encoded = serde_json::to_string(&route).unwrap();
+        assert!(
+            !encoded.contains("quota_limits"),
+            "an empty ledger must not appear in the serialization: {encoded}"
+        );
+
+        // A configured limit MUST move it — the ledger is part of the routing
+        // policy, and a decision made under different caps is a different
+        // decision.
+        route.quota_limits = vec![QuotaLimit {
+            scope: urouter_contracts::QuotaScopeKind::Provider,
+            window: urouter_contracts::QuotaWindow::Day,
+            dimension: urouter_contracts::QuotaDimension::Requests,
+            limit: 100,
+        }];
+        assert_ne!(route.revision(), before);
+    }
+
+    #[test]
+    fn duplicate_quota_limits_are_rejected_at_validation() {
+        let mut route: RouteConfig =
+            serde_json::from_str(include_str!("../../../gateway/route.json")).unwrap();
+        let limit = QuotaLimit {
+            scope: urouter_contracts::QuotaScopeKind::Tenant,
+            window: urouter_contracts::QuotaWindow::Minute,
+            dimension: urouter_contracts::QuotaDimension::Requests,
+            limit: 10,
+        };
+        route.quota_limits = vec![limit, QuotaLimit { limit: 20, ..limit }];
+        assert!(matches!(
+            route.validate(&catalog()),
+            Err(RouteError::DuplicateQuotaLimit(_))
         ));
     }
 }

@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
   "hashes": {
-    "content": "sha256:c044fc98d46c05dbe9f3b401973e4ada06dc34b11fcf4a05b84e4849c92b90c8",
+    "content": "sha256:3741f4700a6ac8cfc00a941e5da17911b7f383fa3895fd695c7fb25943f48efe",
     "pricing": "sha256:cdfe25b5a498344c7ee2adb355f61fc0e5cd23897dab81d5bcb2329474e3eae4",
     "capabilities": "sha256:e5ef42eeb913a3b069f4865f9695839389cd5eb390a2866caedca03eb63cfa6e",
-    "compat": "sha256:cfa6689ba8b64dff0102fecf61860b42dab870dda6abe009bb7a726a7f6c2c1e"
+    "compat": "sha256:827c0737fe59a0581d0229ec1952a0f1ee68ce0ff4df4671258c63b5e6245783"
   },
   "catalog_file": "sha256:57082be065cb068b5d8498d16964e985ee9ee3b951078366aeee51d585cc81fa"
 }

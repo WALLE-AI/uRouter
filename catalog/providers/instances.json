@@ -7,7 +7,9 @@
       "catalog_provider_id": "siliconflow",
       "runtime": {
         "base_url": "https://api.siliconflow.cn/v1",
-        "protocols": ["open_ai_chat"],
+        "protocols": [
+          "open_ai_chat"
+        ],
         "auth_env": "SILICONFLOW_API_KEY"
       },
       "discovery": {
@@ -29,7 +31,9 @@
       "catalog_provider_id": "bailian-cn-beijing-main",
       "runtime": {
         "base_url": "https://${BAILIAN_WORKSPACE_ID}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
-        "protocols": ["open_ai_chat"],
+        "protocols": [
+          "open_ai_chat"
+        ],
         "auth_env": "DASHSCOPE_API_KEY"
       },
       "discovery": {
@@ -53,7 +57,9 @@
       "catalog_provider_id": "ark-cn-beijing-main",
       "runtime": {
         "base_url": "https://ark.cn-beijing.volces.com/api/v3",
-        "protocols": ["open_ai_chat"],
+        "protocols": [
+          "open_ai_chat"
+        ],
         "auth_env": "ARK_API_KEY"
       },
       "discovery": {
@@ -62,6 +68,386 @@
       },
       "credential_scope": "ark-cn-beijing-main",
       "enabled": true
+    },
+    {
+      "id": "deepseek-main",
+      "vendor": "deepseek",
+      "catalog_provider_id": "deepseek",
+      "runtime": {
+        "base_url": "https://api.deepseek.com/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "DEEPSEEK_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://api.deepseek.com/v1/models",
+        "auth_env": "DEEPSEEK_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "deepseek-main",
+      "enabled": false
+    },
+    {
+      "id": "zhipu-main",
+      "vendor": "zhipu",
+      "catalog_provider_id": "zhipu",
+      "runtime": {
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "ZHIPU_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://open.bigmodel.cn/api/paas/v4/models",
+        "auth_env": "ZHIPU_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "zhipu-main",
+      "enabled": false
+    },
+    {
+      "id": "moonshot-main",
+      "vendor": "moonshot",
+      "catalog_provider_id": "moonshot",
+      "runtime": {
+        "base_url": "https://api.moonshot.cn/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "MOONSHOT_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://api.moonshot.cn/v1/models",
+        "auth_env": "MOONSHOT_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "moonshot-main",
+      "enabled": false
+    },
+    {
+      "id": "minimax-main",
+      "vendor": "minimax",
+      "catalog_provider_id": "minimax",
+      "runtime": {
+        "base_url": "https://api.minimax.chat/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "MINIMAX_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://api.minimax.chat/v1/models",
+        "auth_env": "MINIMAX_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "minimax-main",
+      "enabled": false
+    },
+    {
+      "id": "qianfan-main",
+      "vendor": "qianfan",
+      "catalog_provider_id": "qianfan",
+      "runtime": {
+        "base_url": "https://qianfan.baidubce.com/v2",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "QIANFAN_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://qianfan.baidubce.com/v2/models",
+        "auth_env": "QIANFAN_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "qianfan-main",
+      "enabled": false
+    },
+    {
+      "id": "openai-main",
+      "vendor": "openai",
+      "catalog_provider_id": "openai",
+      "runtime": {
+        "base_url": "https://api.openai.com/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "OPENAI_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://api.openai.com/v1/models",
+        "auth_env": "OPENAI_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "openai-main",
+      "enabled": false
+    },
+    {
+      "id": "groq-main",
+      "vendor": "groq",
+      "catalog_provider_id": "groq",
+      "runtime": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "GROQ_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://api.groq.com/openai/v1/models",
+        "auth_env": "GROQ_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "groq-main",
+      "enabled": false
+    },
+    {
+      "id": "cerebras-main",
+      "vendor": "cerebras",
+      "catalog_provider_id": "cerebras",
+      "runtime": {
+        "base_url": "https://api.cerebras.ai/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "CEREBRAS_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://api.cerebras.ai/v1/models",
+        "auth_env": "CEREBRAS_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "cerebras-main",
+      "enabled": false
+    },
+    {
+      "id": "mistral-main",
+      "vendor": "mistral",
+      "catalog_provider_id": "mistral",
+      "runtime": {
+        "base_url": "https://api.mistral.ai/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "MISTRAL_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://api.mistral.ai/v1/models",
+        "auth_env": "MISTRAL_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "mistral-main",
+      "enabled": false
+    },
+    {
+      "id": "openrouter-main",
+      "vendor": "openrouter",
+      "catalog_provider_id": "openrouter",
+      "runtime": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "OPENROUTER_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://openrouter.ai/api/v1/models",
+        "auth_env": "OPENROUTER_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "openrouter-main",
+      "enabled": false
+    },
+    {
+      "id": "together-main",
+      "vendor": "together",
+      "catalog_provider_id": "together",
+      "runtime": {
+        "base_url": "https://api.together.xyz/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "TOGETHER_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://api.together.xyz/v1/models",
+        "auth_env": "TOGETHER_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "together-main",
+      "enabled": false
+    },
+    {
+      "id": "fireworks-main",
+      "vendor": "fireworks",
+      "catalog_provider_id": "fireworks",
+      "runtime": {
+        "base_url": "https://api.fireworks.ai/inference/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "FIREWORKS_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://api.fireworks.ai/inference/v1/models",
+        "auth_env": "FIREWORKS_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "fireworks-main",
+      "enabled": false
+    },
+    {
+      "id": "xai-main",
+      "vendor": "xai",
+      "catalog_provider_id": "xai",
+      "runtime": {
+        "base_url": "https://api.x.ai/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "XAI_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://api.x.ai/v1/models",
+        "auth_env": "XAI_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "xai-main",
+      "enabled": false
+    },
+    {
+      "id": "nvidia-main",
+      "vendor": "nvidia",
+      "catalog_provider_id": "nvidia",
+      "runtime": {
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "NVIDIA_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "https://integrate.api.nvidia.com/v1/models",
+        "auth_env": "NVIDIA_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "nvidia-main",
+      "enabled": false
+    },
+    {
+      "id": "vllm-local",
+      "vendor": "local-vllm",
+      "catalog_provider_id": "local-vllm",
+      "runtime": {
+        "base_url": "http://127.0.0.1:8087/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "VLLM_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "http://127.0.0.1:8087/v1/models",
+        "auth_env": "VLLM_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "vllm-local",
+      "enabled": false
+    },
+    {
+      "id": "sglang-local",
+      "vendor": "local-sglang",
+      "catalog_provider_id": "local-sglang",
+      "runtime": {
+        "base_url": "http://127.0.0.1:30000/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "SGLANG_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "http://127.0.0.1:30000/v1/models",
+        "auth_env": "SGLANG_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "sglang-local",
+      "enabled": false
+    },
+    {
+      "id": "ollama-local",
+      "vendor": "local-ollama",
+      "catalog_provider_id": "local-ollama",
+      "runtime": {
+        "base_url": "http://127.0.0.1:11434/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "OLLAMA_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "http://127.0.0.1:11434/v1/models",
+        "auth_env": "OLLAMA_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "ollama-local",
+      "enabled": false
+    },
+    {
+      "id": "lmstudio-local",
+      "vendor": "local-lmstudio",
+      "catalog_provider_id": "local-lmstudio",
+      "runtime": {
+        "base_url": "http://127.0.0.1:1234/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "LMSTUDIO_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "http://127.0.0.1:1234/v1/models",
+        "auth_env": "LMSTUDIO_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "lmstudio-local",
+      "enabled": false
+    },
+    {
+      "id": "llamacpp-local",
+      "vendor": "local-llamacpp",
+      "catalog_provider_id": "local-llamacpp",
+      "runtime": {
+        "base_url": "http://127.0.0.1:8080/v1",
+        "protocols": [
+          "open_ai_chat"
+        ],
+        "auth_env": "LLAMACPP_API_KEY"
+      },
+      "discovery": {
+        "kind": "open_ai_models",
+        "url": "http://127.0.0.1:8080/v1/models",
+        "auth_env": "LLAMACPP_API_KEY",
+        "min_request_interval_ms": 250
+      },
+      "credential_scope": "llamacpp-local",
+      "enabled": false
     }
   ]
 }

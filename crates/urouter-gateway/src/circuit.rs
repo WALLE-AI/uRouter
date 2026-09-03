@@ -402,6 +402,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use tokio::time::sleep;
+    use urouter_contracts::LATENCY_SAMPLE_CAP_MILLIS;
     use urouter_types::ModelId;
 
     use super::*;
@@ -431,6 +432,7 @@ mod tests {
             cooldown: Duration::from_millis(50),
             window: Duration::from_secs(1),
             failure_threshold_millis: 500,
+            latency_sample_cap_millis: LATENCY_SAMPLE_CAP_MILLIS,
         }
     }
 

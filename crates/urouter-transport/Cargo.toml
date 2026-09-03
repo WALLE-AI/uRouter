@@ -1,0 +1,18 @@
+[package]
+name = "urouter-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+urouter-ai = { version = "0.1.0", path = "../urouter-ai" }
+urouter-protocol = { version = "0.1.0", path = "../urouter-protocol" }
+urouter-types = { version = "0.1.0", path = "../urouter-types" }
+
+[lints]
+workspace = true

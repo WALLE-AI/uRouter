@@ -32,10 +32,15 @@ use tokio::{
     sync::{RwLock, broadcast, mpsc, oneshot},
     time::sleep,
 };
+use crate::scoped_quota::{
+    MemoryScopedQuotaRepository, RedisScopedQuotaRepository, ScopedQuotaLease, ScopedQuotaPermit,
+    ScopedQuotaRepository,
+};
+use urouter_transport::{TransportContext, TransportError, TransportRegistry};
+use urouter_ai::ProviderSpec;
 use urouter_ai::{
     auth::AuthPlan,
     catalog::{CatalogManifest, CatalogSnapshot, ModelSpec},
-    compat::MaxTokensField,
     endpoint::EndpointPlan,
     evidence::CatalogEvidence,
     pricing::{CostBreakdown, PriceSource, calculate_actual_cost},
@@ -46,8 +51,14 @@ use urouter_artifact::{
 };
 use urouter_contracts::{
     CapacitySnapshot, DecisionRecordContext, DeploymentDisposition, DeploymentEvaluation,
-    DeploymentPicker, FEATURE_SCHEMA_VERSION, FallbackTierSpec, FeatureFrame, RetryDirective,
-    RevisionSet, RoutingTrace, RuleEvaluation, RuleOutcome, VectorRef, plan_fallback_tiers,
+    DEFAULT_BODY_SCAN_DEPTH, DeploymentPicker, OUTPUT_RESERVE_TOKENS_CAP, FEATURE_SCHEMA_VERSION, FallbackTierSpec,
+    FeatureFrame, LATENCY_SAMPLE_CAP_MILLIS, RetryDirective, RevisionSet, RoutingTrace,
+    CandidateExclusion, ExhaustionDisposition, ExhaustionSummary, QuotaBreach, QuotaRequest,
+    QuotaScopeKind, QuotaScopeRef, RuleEvaluation, RuleOutcome, UpstreamBackoff,
+    UpstreamResponseFacts, VectorRef,
+    classify_upstream, exhaustion_disposition, extract_backoff, fallback_cause_for,
+    plan_fallback_tiers, plan_quota_charges, quota_usage_millis, reserved_output_tokens,
+    summarize_exhaustion, upstream_error_code,
 };
 use urouter_gateway::{
     CallRole, DataPolicyContract, FallbackCause, MigrationBoundary, RecordingMode, RetryPolicy,
@@ -60,13 +71,14 @@ use urouter_gateway::{
     vector_store::VectorSideStore,
 };
 use urouter_protocol::{
-    LossPolicy, TransportCapabilities, from_anthropic_messages, from_openai_chat,
-    from_openai_responses, to_anthropic_messages, to_openai_chat, to_openai_responses,
+    LossPolicy, TransportCapabilities, from_anthropic_messages, from_gemini_generate_content,
+    from_ollama_chat, from_openai_responses, to_openai_chat,
 };
 use urouter_types::{ModelId, Usage, WireApi};
 
 mod adapter;
 mod binding;
+mod catalog_feed;
 mod budget;
 mod control;
 mod credential;
@@ -78,6 +90,7 @@ mod persistence;
 mod protocol_translation;
 mod quota;
 mod record;
+mod scoped_quota;
 mod shared_state;
 
 use adapter::adapt_agent_request;
@@ -175,6 +188,24 @@ struct Args {
     cooldown_window_ms: u64,
     #[arg(long, default_value_t = 500)]
     cooldown_failure_threshold_millis: u16,
+    /// Ceiling on one attempt's contribution to a deployment's latency EWMA.
+    /// `0` disables capping.
+    #[arg(long, default_value_t = LATENCY_SAMPLE_CAP_MILLIS)]
+    latency_sample_cap_ms: u64,
+    /// Poll a signed remote catalog feed on a schedule.
+    ///
+    /// Off by default: an accepted feed rewrites which models traffic can reach
+    /// and changes the control revision, which is a routing policy change no
+    /// operator should receive without asking for it.
+    #[arg(long, default_value_t = false)]
+    catalog_sync_enabled: bool,
+    #[arg(long)]
+    catalog_sync_url: Option<String>,
+    /// Hex-encoded Ed25519 public key the feed is verified against.
+    #[arg(long)]
+    catalog_sync_public_key: Option<String>,
+    #[arg(long, default_value_t = 12)]
+    catalog_sync_interval_hours: u64,
     #[arg(long, default_value_t = 5)]
     max_fallback_depth: u8,
     #[arg(long, default_value = "weighted")]
@@ -193,6 +224,10 @@ struct Args {
     tenant_tokens_per_minute: u64,
     #[arg(long, default_value_t = 4_096)]
     quota_default_max_output_tokens: u64,
+    /// Ceiling on the output tokens a request reserves against the per-minute
+    /// token quota. `0` disables capping and reserves the full `max_tokens`.
+    #[arg(long, default_value_t = OUTPUT_RESERVE_TOKENS_CAP)]
+    quota_output_reserve_cap_tokens: u64,
     #[arg(long, default_value_t = 86_400)]
     quota_lease_ttl_seconds: u64,
     #[arg(long, default_value_t = 0)]
@@ -271,8 +306,14 @@ struct AppState {
     bindings: Arc<dyn TaskBindingRepository>,
     idempotency: Arc<dyn IdempotencyRepository>,
     idempotency_ttl_seconds: u64,
+    /// Installed outbound wire formats. Shared, stateless, and the single
+    /// place that knows how to talk to an upstream.
+    transports: Arc<TransportRegistry>,
     quota: Arc<dyn QuotaRepository>,
+    /// The declarative multi-scope ledger from `route.quota_limits`.
+    scoped_quota: Arc<dyn ScopedQuotaRepository>,
     quota_default_max_output_tokens: u64,
+    quota_output_reserve_cap_tokens: u64,
     budget: Arc<dyn BudgetRepository>,
     shared_state: Option<RedisSharedState>,
     require_tenant_header: bool,
@@ -531,6 +572,7 @@ struct GatewayMetrics {
     usage_unavailable: Arc<AtomicU64>,
     cache_affinity_hits: Arc<AtomicU64>,
     vector_writes: Arc<AtomicU64>,
+    quota_backend_errors: Arc<AtomicU64>,
     vector_write_errors: Arc<AtomicU64>,
     successes: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
@@ -564,6 +606,7 @@ impl Default for GatewayMetrics {
             usage_unavailable: Arc::default(),
             cache_affinity_hits: Arc::default(),
             vector_writes: Arc::default(),
+            quota_backend_errors: Arc::default(),
             vector_write_errors: Arc::default(),
             successes: Arc::default(),
             errors: Arc::default(),
@@ -737,18 +780,36 @@ struct AttemptRecord {
     latency_ms: u128,
     error_kind: Option<UpstreamErrorKind>,
     retry: bool,
+    /// The machine-readable error code read out of the upstream body, when it
+    /// stated one. This is what separates a 400 "prompt too long" from a 400
+    /// "malformed request" after the fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body_code: Option<String>,
+    /// The fallback chain this failure was routed down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fallback_cause: Option<FallbackCause>,
+    /// The upstream's stated back-off, and where it was read from, so an
+    /// operator can tell a promise from a guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_after_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_after_source: Option<urouter_contracts::BackoffSource>,
     #[serde(default)]
     selection_trace: Vec<DeploymentEvaluation>,
     #[serde(default)]
     capacity_snapshot: CapacitySnapshot,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct AttemptOutcome {
     status: Option<u16>,
     latency_ms: u128,
     error_kind: Option<UpstreamErrorKind>,
     retry: bool,
+    body_code: Option<String>,
+    fallback_cause: Option<FallbackCause>,
+    retry_after_millis: Option<u64>,
+    retry_after_source: Option<urouter_contracts::BackoffSource>,
 }
 
 impl AttemptOutcome {
@@ -758,6 +819,10 @@ impl AttemptOutcome {
             latency_ms,
             error_kind: None,
             retry: false,
+            body_code: None,
+            fallback_cause: None,
+            retry_after_millis: None,
+            retry_after_source: None,
         }
     }
 
@@ -767,6 +832,10 @@ impl AttemptOutcome {
             latency_ms: failure.latency_ms,
             error_kind: Some(failure.kind),
             retry,
+            body_code: failure.body_code.clone(),
+            fallback_cause: Some(failure.cause),
+            retry_after_millis: failure.backoff.map(|hint| hint.backoff_millis),
+            retry_after_source: failure.backoff.map(|hint| hint.source),
         }
     }
 }
@@ -793,6 +862,10 @@ impl AttemptRecord {
             latency_ms: outcome.latency_ms,
             error_kind: outcome.error_kind,
             retry: outcome.retry,
+            body_code: outcome.body_code,
+            fallback_cause: outcome.fallback_cause,
+            retry_after_millis: outcome.retry_after_millis,
+            retry_after_source: outcome.retry_after_source,
             selection_trace,
             capacity_snapshot,
         }
@@ -872,6 +945,10 @@ struct UpstreamExecution {
     tier: String,
     model: ModelSpec,
     fallback_depth: u8,
+    /// Held until the real token count is known, then settled. Dropping it
+    /// without settling leaves the estimate charged until the window rolls,
+    /// which is the safe direction but wastes the provider's budget.
+    scoped_quota: ScopedQuotaLease,
 }
 
 #[derive(Debug)]
@@ -899,6 +976,9 @@ struct TierSuccess {
     response: reqwest::Response,
     lease: ExecutionLease,
     model: ModelSpec,
+    /// The provider/credential/deployment reservation this attempt holds.
+    /// Settled with the real token count once usage is known.
+    scoped_quota: ScopedQuotaLease,
 }
 
 struct PreparedDeployment {
@@ -950,13 +1030,36 @@ impl Drop for ExecutionLease {
 struct TierExhausted {
     error: Option<GatewayError>,
     model: ModelSpec,
+    /// The fallback chain the last upstream failure asked for, when there WAS
+    /// an upstream failure. `None` means the tier died before any upstream was
+    /// reached (no candidate, lease error), in which case the cause has to be
+    /// inferred from the error code instead.
+    cause: Option<FallbackCause>,
+    /// The upstream's own back-off hint, unclamped, for our outbound
+    /// `Retry-After`.
+    advertised_retry_after_millis: Option<u64>,
+    /// When a quota-excluded candidate becomes available again.
+    ///
+    /// Kept separate from `advertised_retry_after_millis` on purpose. That one
+    /// is an upstream's statement about ITS OWN back-off and belongs on any
+    /// error it produced; this one describes a candidate we never called, and
+    /// attaching it to, say, a 404 "model does not exist" would tell a client
+    /// to wait six hours for an error that waiting cannot fix.
+    quota_reset_millis: Option<u64>,
 }
 
 struct AttemptFailure {
     kind: UpstreamErrorKind,
     status: Option<reqwest::StatusCode>,
     detail: String,
-    retry_after_ms: Option<u64>,
+    /// The upstream's own back-off hint, with the source it was read from.
+    backoff: Option<UpstreamBackoff>,
+    /// The machine-readable error code found in the body, if any.
+    body_code: Option<String>,
+    /// The fallback chain this failure should follow. Derived from the kind AND
+    /// the body code, so `context_length_exceeded` can reach a longer-context
+    /// tier instead of dying as a generic `BadRequest`.
+    cause: FallbackCause,
     latency_ms: u128,
 }
 
@@ -1013,6 +1116,19 @@ struct GatewayError {
     message: String,
     request_id: Option<String>,
     decision_id: Option<String>,
+    /// Structured, counts-only detail rendered under `error.details`. Today
+    /// this is an `ExhaustionSummary`; it exists so a client learns WHY the
+    /// pool was empty without a second `/v1/explain` round trip.
+    ///
+    /// Boxed: `GatewayError` is the `Err` half of nearly every `Result` in this
+    /// binary, and an inline `Value` would widen all of them for a field that
+    /// is `None` on almost every error.
+    details: Option<Box<Value>>,
+    /// When set, the response carries a `Retry-After`. This is the upstream's
+    /// full, unclamped hint — not the shorter interval this process was willing
+    /// to sleep for — so a client backs off for the window the provider
+    /// actually asked for.
+    retry_after_millis: Option<u64>,
 }
 
 impl GatewayError {
@@ -1023,6 +1139,8 @@ impl GatewayError {
             message: error.to_string(),
             request_id: None,
             decision_id: None,
+            details: None,
+            retry_after_millis: None,
         }
     }
 
@@ -1033,12 +1151,61 @@ impl GatewayError {
             message: error.to_string(),
             request_id: None,
             decision_id: None,
+            details: None,
+            retry_after_millis: None,
         }
     }
 
     fn with_request_id(mut self, request_id: &str) -> Self {
         self.request_id = Some(request_id.to_owned());
         self
+    }
+
+    /// Advertise an upstream-stated back-off to the client.
+    ///
+    /// Enriches rather than overwrites: `None` means "I have nothing to add",
+    /// not "clear whatever was already known". An exhaustion summary sets a
+    /// reset ETA at construction, and a later call with no upstream hint must
+    /// not silently strip it. `0` is likewise nothing to say — a
+    /// `Retry-After: 0` is noise.
+    fn with_retry_after_millis(mut self, millis: Option<u64>) -> Self {
+        if let Some(millis) = millis.filter(|millis| *millis > 0) {
+            self.retry_after_millis = Some(millis);
+        }
+        self
+    }
+
+    /// Build the client-facing error for an exhausted candidate pool.
+    ///
+    /// The status is chosen by the DOMINANT exclusion bucket, not by a fixed
+    /// code: a pool emptied because every model lacks vision is the caller's
+    /// problem (4xx), one emptied because everything is cooling down is not
+    /// (429), and one emptied by missing credentials is the operator's (503).
+    /// Collapsing all three into one status is what made `route_rejected`
+    /// useless to act on.
+    fn exhausted(summary: &ExhaustionSummary) -> Self {
+        let (status, code) = match summary.dominant().map(exhaustion_disposition) {
+            Some(ExhaustionDisposition::ClientCapability) => {
+                (StatusCode::BAD_REQUEST, "no_eligible_model")
+            }
+            Some(ExhaustionDisposition::RetryLater) => {
+                (StatusCode::TOO_MANY_REQUESTS, "candidates_rate_limited")
+            }
+            _ => (StatusCode::SERVICE_UNAVAILABLE, "capacity_exhausted"),
+        };
+        Self {
+            status,
+            code,
+            message: summary.message(),
+            request_id: None,
+            decision_id: None,
+            details: serde_json::to_value(summary).ok().map(Box::new),
+            // Only meaningful when waiting is the right advice.
+            retry_after_millis: match summary.dominant().map(exhaustion_disposition) {
+                Some(ExhaustionDisposition::RetryLater) => summary.soonest_reset_millis,
+                _ => None,
+            },
+        }
     }
 }
 
@@ -1071,16 +1238,19 @@ impl IntoResponse for GatewayError {
                 "request rejected"
             );
         }
-        let mut response = (
-            self.status,
-            Json(json!({
-                "error": {
-                    "code": self.code,
-                    "message": self.message,
-                    "type": "urouter_error"
-                }
-            })),
-        )
+        let mut body = json!({
+            "error": {
+                "code": self.code,
+                "message": self.message,
+                "type": "urouter_error"
+            }
+        });
+        if let Some(details) = self.details
+            && let Some(error) = body.get_mut("error").and_then(Value::as_object_mut)
+        {
+            error.insert("details".to_owned(), *details);
+        }
+        let mut response = (self.status, Json(body))
             .into_response();
         if let Some(request_id) = self.request_id
             && let Ok(value) = HeaderValue::from_str(&request_id)
@@ -1096,6 +1266,16 @@ impl IntoResponse for GatewayError {
                 .headers_mut()
                 .insert(HeaderName::from_static("x-urouter-decision-id"), value);
         }
+        // RFC 7231 states Retry-After in whole seconds. Round UP: rounding a
+        // 1500 ms hint down to 1 s invites the client back before the upstream
+        // is ready, which is the failure this header exists to prevent.
+        if let Some(millis) = self.retry_after_millis
+            && let Ok(value) = HeaderValue::from_str(&millis.div_ceil(1_000).to_string())
+        {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("retry-after"), value);
+        }
         response
     }
 }
@@ -1107,6 +1287,7 @@ impl From<RouteError> for GatewayError {
                 "missing_required_tool",
                 format!("the Agent Host must provide the required {tool} tool"),
             ),
+            RouteError::NoEligibleTier(summary) => Self::exhausted(&summary),
             error => Self::bad_request("route_rejected", error),
         }
     }
@@ -1142,6 +1323,8 @@ impl From<ManagementAuthError> for GatewayError {
             message: message.to_owned(),
             request_id: None,
             decision_id: None,
+            details: None,
+            retry_after_millis: None,
         }
     }
 }
@@ -1157,6 +1340,8 @@ fn state_backend_unavailable(error: impl std::fmt::Display) -> GatewayError {
         message: "the shared state backend is temporarily unavailable".to_owned(),
         request_id: None,
         decision_id: None,
+        details: None,
+        retry_after_millis: None,
     }
 }
 
@@ -1208,6 +1393,7 @@ async fn main() -> Result<(), BoxError> {
     let shared_state = build_shared_state(&args).await?;
     let idempotency = build_idempotency_repository(&args, shared_state.as_ref());
     let quota = build_quota_repository(&args).await?;
+    let scoped_quota = build_scoped_quota_repository(&args).await?;
     let budget = build_budget_repository(&args).await?;
     let management_auth = ManagementAuth::open(
         args.management_keyring.clone(),
@@ -1268,7 +1454,10 @@ async fn main() -> Result<(), BoxError> {
         idempotency,
         idempotency_ttl_seconds: args.idempotency_ttl_seconds,
         quota,
+        transports: Arc::new(TransportRegistry::with_builtins()),
+        scoped_quota,
         quota_default_max_output_tokens: args.quota_default_max_output_tokens,
+        quota_output_reserve_cap_tokens: args.quota_output_reserve_cap_tokens,
         budget,
         shared_state,
         require_tenant_header: args.require_tenant_header,
@@ -1286,6 +1475,30 @@ async fn main() -> Result<(), BoxError> {
     };
     spawn_retention_sweeper(state.records.clone(), state.vector_store.clone());
     spawn_control_reloader(&args, &state, loaded_control.signing_key);
+    if args.catalog_sync_enabled {
+        let (Some(url), Some(public_key)) = (
+            args.catalog_sync_url.clone(),
+            args.catalog_sync_public_key.clone(),
+        ) else {
+            return Err("catalog sync requires --catalog-sync-url and --catalog-sync-public-key".into());
+        };
+        // The install identity is what makes the poll jitter stable across
+        // restarts rather than re-randomising into a new thundering herd.
+        let install_id = format!("{}:{}", args.bind, state.control.status().revision);
+        tokio::spawn(run_catalog_feed_sync(
+            state.control.clone(),
+            state.client.clone(),
+            Arc::clone(&state.transports),
+            url,
+            public_key,
+            Duration::from_secs(args.catalog_sync_interval_hours.saturating_mul(3_600)),
+            install_id,
+        ));
+        tracing::info!(
+            interval_hours = args.catalog_sync_interval_hours,
+            "catalog feed sync enabled"
+        );
+    }
     let app = app_router(state.clone());
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(
@@ -1478,6 +1691,13 @@ fn app_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(openai_responses))
         .route("/v1/messages", post(anthropic_messages))
+        // Gemini's native wire. The model id is a PATH segment and the verb is
+        // suffixed to it (`:generateContent`), which is why this cannot be a
+        // plain `/v1beta/models/{model}` route.
+        .route("/v1beta/models/{model_action}", post(gemini_generate))
+        // Ollama emulation, for clients that only speak it (Zed, JetBrains AI).
+        .route("/api/chat", post(ollama_chat))
+        .route("/api/tags", get(ollama_tags))
         .route("/v1/artifacts", get(artifact_status))
         .route("/v1/artifacts/promote", post(promote_artifact))
         .route("/v1/artifacts/rollback", post(rollback_artifact))
@@ -1515,6 +1735,31 @@ fn app_router(state: AppState) -> Router {
             get(session_binding).delete(delete_session_binding),
         )
         .with_state(state)
+}
+
+/// Catch a catalog-sync misconfiguration at startup rather than on every poll.
+///
+/// A malformed public key would otherwise fail verification forever, which
+/// looks identical to "the feed has published nothing" — a permanent, silent
+/// no-op instead of a config error.
+fn validate_catalog_sync_args(args: &Args) -> Result<(), BoxError> {
+    if !args.catalog_sync_enabled {
+        return Ok(());
+    }
+    if args.catalog_sync_url.is_none() || args.catalog_sync_public_key.is_none() {
+        return Err("catalog sync requires --catalog-sync-url and --catalog-sync-public-key".into());
+    }
+    if args.catalog_sync_interval_hours == 0 {
+        return Err("catalog sync interval must be greater than zero".into());
+    }
+    if !args
+        .catalog_sync_public_key
+        .as_deref()
+        .is_some_and(|key| hex::decode(key.trim()).is_ok_and(|bytes| bytes.len() == 32))
+    {
+        return Err("catalog sync public key must be 32 hex-encoded bytes".into());
+    }
+    Ok(())
 }
 
 fn validate_args(args: &Args) -> Result<(), BoxError> {
@@ -1555,6 +1800,7 @@ fn validate_args(args: &Args) -> Result<(), BoxError> {
     if args.quota_default_max_output_tokens == 0 {
         return Err("quota default max output tokens must be greater than zero".into());
     }
+    validate_catalog_sync_args(args)?;
     if args.budget_period_seconds == 0 {
         return Err("budget period must be greater than zero".into());
     }
@@ -1701,6 +1947,7 @@ fn configured_cooldown_policy(args: &Args) -> CooldownPolicy {
         cooldown: Duration::from_millis(args.cooldown_ms),
         window: Duration::from_millis(args.cooldown_window_ms),
         failure_threshold_millis: args.cooldown_failure_threshold_millis,
+        latency_sample_cap_millis: args.latency_sample_cap_ms,
     }
 }
 
@@ -1763,6 +2010,128 @@ async fn build_quota_repository(args: &Args) -> Result<Arc<dyn QuotaRepository>,
         args.tenant_requests_per_minute,
         args.tenant_tokens_per_minute,
     ))
+}
+
+/// Poll a signed catalog feed until shutdown.
+///
+/// Every acceptance gate runs before anything is staged: signature, then
+/// anti-rollback, then transport support, then a full `RouteConfig::validate`
+/// against the candidate. A failure at any gate leaves the live snapshot exactly
+/// as it was and records the reason — the existing `last_good` behaviour, not a
+/// second rejection path.
+///
+/// ## What a successful swap costs, and why it is safe
+///
+/// A new catalog is a new control revision. Three things already handle that,
+/// which is why this can be a swap rather than a restart:
+///
+/// * A `RouterArtifact` bound to the old revision falls back to rule decisions
+///   and records `control_revision_changed`, rather than inferring against a
+///   catalog it was not trained on.
+/// * A live session bound to a model keeps it for as long as
+///   `RouteDeployment::binding_grace_until_unix` allows.
+/// * Both revisions are logged on the swap, so a `DecisionRecord` from either
+///   side of it can still be explained.
+async fn run_catalog_feed_sync(
+    control: ControlPlane,
+    client: reqwest::Client,
+    transports: Arc<TransportRegistry>,
+    url: String,
+    public_key: String,
+    interval: Duration,
+    install_id: String,
+) {
+    let mut active_published_at: Option<u64> = None;
+    loop {
+        sleep(catalog_feed::next_poll_delay(interval, &install_id)).await;
+        match poll_catalog_feed(
+            &client,
+            &transports,
+            &url,
+            &public_key,
+            active_published_at,
+            &control,
+        )
+        .await
+        {
+            Ok(Some((published_at, from, to))) => {
+                active_published_at = Some(published_at);
+                tracing::info!(
+                    previous_revision = %from,
+                    revision = %to,
+                    published_at,
+                    "catalog feed applied"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // Fail to last_good, loudly. A feed outage must never take
+                // routing down with it.
+                tracing::warn!(error = %error, "catalog feed rejected; keeping the live catalog");
+                control.reject(error);
+            }
+        }
+    }
+}
+
+/// One poll. `Ok(None)` means "nothing new"; `Ok(Some(..))` means a swap happened.
+async fn poll_catalog_feed(
+    client: &reqwest::Client,
+    transports: &TransportRegistry,
+    url: &str,
+    public_key: &str,
+    active_published_at: Option<u64>,
+    control: &ControlPlane,
+) -> Result<Option<(u64, String, String)>, catalog_feed::FeedError> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| catalog_feed::FeedError::MalformedDocument(error.to_string()))?;
+    let feed: catalog_feed::SignedCatalogFeed = response
+        .json()
+        .await
+        .map_err(|error| catalog_feed::FeedError::MalformedDocument(error.to_string()))?;
+
+    let (document, snapshot) = match catalog_feed::accept_feed(
+        &feed,
+        public_key,
+        catalog_feed::BUNDLED_CATALOG_PUBLISHED_AT,
+        active_published_at,
+        transports,
+    ) {
+        Ok(accepted) => accepted,
+        // A feed that is not newer is the steady state, not an error: it is what
+        // every poll between publications returns.
+        Err(catalog_feed::FeedError::Rollback { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+
+    let active = control.snapshot();
+    let route = Arc::clone(&active.route);
+    // The live Route must still be valid against the candidate catalog. A feed
+    // that retires a model a tier points at is a feed that would break routing.
+    route
+        .validate(&snapshot)
+        .map_err(|error| catalog_feed::FeedError::InvalidCatalog(error.to_string()))?;
+
+    let candidate = ControlSnapshot::from_validated(Arc::new(snapshot), route);
+    let to = candidate.revision.clone();
+    let from = active.revision;
+    control.publish(candidate);
+    Ok(Some((document.published_at_unix, from, to)))
+}
+
+async fn build_scoped_quota_repository(
+    args: &Args,
+) -> Result<Arc<dyn ScopedQuotaRepository>, BoxError> {
+    let ttl = Duration::from_secs(args.quota_lease_ttl_seconds);
+    if let Some(url) = &args.redis_url {
+        return Ok(
+            RedisScopedQuotaRepository::connect(url, args.redis_prefix.clone(), ttl).await?,
+        );
+    }
+    Ok(MemoryScopedQuotaRepository::new(ttl))
 }
 
 async fn build_budget_repository(args: &Args) -> Result<Arc<dyn BudgetRepository>, BoxError> {
@@ -1916,6 +2285,8 @@ async fn task_binding(
             message: "task binding was not found".to_owned(),
             request_id: None,
             decision_id: None,
+            details: None,
+            retry_after_millis: None,
         })
 }
 
@@ -1978,6 +2349,8 @@ async fn session_binding(
             message: "session binding was not found".to_owned(),
             request_id: None,
             decision_id: None,
+            details: None,
+            retry_after_millis: None,
         })
 }
 
@@ -2221,6 +2594,10 @@ async fn models(State(state): State<AppState>) -> Result<Json<Value>, GatewayErr
                 "tenant_max_in_flight": state.quota.max_in_flight(),
                 "tenant_requests_per_minute": state.quota.requests_per_minute(),
                 "tenant_tokens_per_minute": state.quota.tokens_per_minute(),
+                "scoped_quota_backend": state.scoped_quota.backend_name(),
+                "quota_limits": state.route.quota_limits,
+                "quota_output_reserve_cap_tokens": state.quota_output_reserve_cap_tokens,
+                "latency_sample_cap_ms": state.capacity.latency_sample_cap_millis(),
                 "budget_backend": state.budget.backend_name(),
                 "tenant_budget_nano_usd": state.budget.limit_nano_usd(),
                 "deployment_picker": state.capacity.picker(),
@@ -2311,6 +2688,8 @@ async fn refresh_catalog(
         message: "Gateway was not started with --control-manifest".to_owned(),
         request_id: None,
         decision_id: None,
+        details: None,
+        retry_after_millis: None,
     })?;
     let candidate = ControlSnapshot::load(
         &source.catalog,
@@ -2326,6 +2705,8 @@ async fn refresh_catalog(
             message: error.to_string(),
             request_id: None,
             decision_id: None,
+            details: None,
+            retry_after_millis: None,
         }
     })?;
     for tier in &candidate.route.tiers {
@@ -2358,6 +2739,8 @@ async fn rollback_catalog(
             message: "no previous control revision is available".to_owned(),
             request_id: None,
             decision_id: None,
+            details: None,
+            retry_after_millis: None,
         });
     }
     Ok(Json(
@@ -2405,6 +2788,22 @@ async fn explain(
         "alternatives": decision.alternatives,
         "requirement": decision.requirement,
         "admission": decision.admission,
+        // The same counts-only rollup a failing request would receive, so an
+        // operator can see the shape of an exhaustion without provoking one.
+        // The per-model detail sits next to it in `admission`, which is
+        // tenant-authenticated; only the rollup is safe to hand to a client.
+        "exhaustion": summarize_exhaustion(
+            &decision
+                .admission
+                .excluded
+                .iter()
+                .map(|excluded| CandidateExclusion {
+                    candidate: excluded.model.to_string(),
+                    reasons: excluded.reasons.clone(),
+                    reset_millis: None,
+                })
+                .collect::<Vec<_>>(),
+        ),
         "compatibility_mode": governance.compatibility_mode,
         "task_binding_applied": decision.reason == "task_binding",
         "data_policy": {
@@ -2436,6 +2835,8 @@ async fn artifact_status(
         message: "gateway was not started with an artifact".to_owned(),
         request_id: None,
         decision_id: None,
+        details: None,
+        retry_after_millis: None,
     })?;
     let current_catalog = state
         .control
@@ -2504,6 +2905,8 @@ async fn promote_artifact(
             message: "no candidate artifact is available for promotion".to_owned(),
             request_id: None,
             decision_id: None,
+            details: None,
+            retry_after_millis: None,
         });
     }
     Ok(Json(
@@ -2525,6 +2928,8 @@ async fn rollback_artifact(
             message: "no last-good artifact is available".to_owned(),
             request_id: None,
             decision_id: None,
+            details: None,
+            retry_after_millis: None,
         });
     }
     Ok(Json(
@@ -2587,6 +2992,8 @@ fn configured_artifact(state: &AppState) -> Result<&ArtifactRuntime, GatewayErro
         message: "gateway was not started with an artifact".to_owned(),
         request_id: None,
         decision_id: None,
+        details: None,
+        retry_after_millis: None,
     })
 }
 
@@ -2969,6 +3376,8 @@ async fn decision_by_id(
             message: format!("decision {id} was not found in retained records"),
             request_id: None,
             decision_id: None,
+            details: None,
+            retry_after_millis: None,
         })
 }
 
@@ -3229,6 +3638,8 @@ async fn feedback_by_turn(
             message: format!("feedback for turn {turn} was not found"),
             request_id: None,
             decision_id: None,
+            details: None,
+            retry_after_millis: None,
         })?;
     Ok(Json(json!({
         "turn": turn,
@@ -3539,6 +3950,8 @@ async fn resolve_request_id(
             message: "Idempotency-Key was already used with a different request".to_owned(),
             request_id: None,
             decision_id: None,
+            details: None,
+            retry_after_millis: None,
         }),
     }
 }
@@ -3631,10 +4044,115 @@ async fn anthropic_messages(
     }
 }
 
-#[derive(Clone, Copy)]
+/// Gemini's native `generateContent`.
+///
+/// The path carries `{model}:{verb}`, so both are parsed off one segment.
+/// Anything other than `urouter/auto` is honoured as an explicit model, exactly
+/// as it would be on `/v1/chat/completions`.
+async fn gemini_generate(
+    State(state): State<AppState>,
+    Path(model_action): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Result<Response, GatewayError> {
+    let (model, action) = model_action.split_once(':').ok_or_else(|| {
+        GatewayError::bad_request(
+            "invalid_gemini_path",
+            "path must be models/{model}:generateContent or :streamGenerateContent",
+        )
+    })?;
+    let streaming = match action {
+        "generateContent" => false,
+        "streamGenerateContent" => true,
+        other => {
+            return Err(GatewayError::bad_request(
+                "unsupported_gemini_action",
+                format!("unsupported Gemini action: {other}"),
+            ));
+        }
+    };
+    if streaming {
+        // The response translator has no Gemini SSE encoder yet. Refusing is
+        // better than emitting OpenAI-shaped chunks a Gemini client cannot read.
+        return Err(GatewayError::bad_request(
+            "unsupported_provider_streaming",
+            "streamGenerateContent is not yet supported; use generateContent",
+        ));
+    }
+    let normalized = from_gemini_generate_content(&request, model, streaming)
+        .map_err(|error| GatewayError::bad_request("invalid_gemini_request", error))?;
+    let (chat, loss) = to_openai_chat(
+        &normalized,
+        &internal_chat_capabilities(),
+        LossPolicy::Reject,
+    )
+    .map_err(|error| GatewayError::bad_request("protocol_semantic_loss", error))?;
+    debug_assert!(loss.losses.is_empty());
+    let response = Box::pin(chat_completions(State(state), headers, Json(chat))).await?;
+    translate_chat_response(response, ProtocolResponse::Gemini).await
+}
+
+/// Ollama's native chat endpoint.
+async fn ollama_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> Result<Response, GatewayError> {
+    let normalized = from_ollama_chat(&request)
+        .map_err(|error| GatewayError::bad_request("invalid_ollama_request", error))?;
+    if normalized.stream {
+        return Err(GatewayError::bad_request(
+            "unsupported_provider_streaming",
+            "Ollama streaming is not yet supported; send \"stream\": false",
+        ));
+    }
+    let model = normalized.model.clone();
+    let (chat, loss) = to_openai_chat(
+        &normalized,
+        &internal_chat_capabilities(),
+        LossPolicy::Reject,
+    )
+    .map_err(|error| GatewayError::bad_request("protocol_semantic_loss", error))?;
+    debug_assert!(loss.losses.is_empty());
+    let response = Box::pin(chat_completions(State(state), headers, Json(chat))).await?;
+    translate_chat_response(response, ProtocolResponse::Ollama { model }).await
+}
+
+/// Ollama's model list, which its clients call before anything else.
+async fn ollama_tags(State(state): State<AppState>) -> Json<Value> {
+    let control = state.control.snapshot();
+    let models: Vec<Value> = control
+        .catalog
+        .models()
+        .map(|model| {
+            json!({
+                "name": model.id.to_string(),
+                "model": model.id.to_string(),
+                "modified_at": "1970-01-01T00:00:00Z",
+                "size": 0,
+                "digest": "",
+                "details": {
+                    "family": model.provider.to_string(),
+                    "parameter_size": "",
+                    "quantization_level": ""
+                }
+            })
+        })
+        .collect();
+    Json(json!({"models": models}))
+}
+
+#[derive(Clone)]
 enum ProtocolResponse {
     Responses,
     Anthropic,
+    Gemini,
+    /// Ollama echoes the requested model name back; the chat response carries
+    /// the RESOLVED upstream model, which is not what an Ollama client asked
+    /// for and would break its own bookkeeping.
+    Ollama {
+        model: String,
+    },
 }
 
 type ProtocolBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, axum::Error>> + Send>>;
@@ -4024,6 +4542,8 @@ async fn acquire_tenant_quota(
                 message: message.to_owned(),
                 request_id: None,
                 decision_id: None,
+                details: None,
+                retry_after_millis: None,
             })
         }
     }
@@ -4038,6 +4558,7 @@ async fn acquire_request_quota(
         request,
         state.quota_default_max_output_tokens,
         state.retry_policy.max_retries,
+        state.quota_output_reserve_cap_tokens,
     );
     let lease = acquire_tenant_quota(state, tenant_key, reserved_tokens).await?;
     Ok((lease, input_tokens))
@@ -4047,8 +4568,18 @@ fn estimate_quota_tokens(
     request: &Value,
     default_max_output_tokens: u64,
     max_retries: u8,
+    output_reserve_cap: u64,
 ) -> (u64, u64) {
-    let (input_tokens, output_tokens) = estimate_request_tokens(request, default_max_output_tokens);
+    let (input_tokens, stated_output) =
+        estimate_request_tokens(request, default_max_output_tokens);
+    // The TOKEN QUOTA reserves a capped share of the stated output; the cost
+    // budget above deliberately does not. The two want opposite errors: an
+    // over-reserved token quota falsely rejects requests the provider would
+    // have served, while an under-reserved cost budget lets a tenant overspend.
+    // So the quota under-reserves and lets the upstream's own 429 correct it,
+    // and the budget reserves in full.
+    let output_tokens =
+        reserved_output_tokens(Some(stated_output), default_max_output_tokens, output_reserve_cap);
     let attempts = u64::from(max_retries).saturating_add(1);
     (
         input_tokens,
@@ -4099,6 +4630,8 @@ async fn acquire_request_budget(
                 message: "the tenant has reached its hard budget limit".to_owned(),
                 request_id: None,
                 decision_id: None,
+                details: None,
+                retry_after_millis: None,
             })
         }
     }
@@ -4193,6 +4726,24 @@ async fn settle_quota_usage(
     }
 }
 
+/// Replace the scoped reservation with the real token count.
+///
+/// Same accounting as the tenant ledger, on the provider / credential /
+/// deployment counters. Without it a request that reserved for the worst case
+/// keeps that reservation charged for the rest of the window, and a busy
+/// provider looks exhausted long before it is.
+async fn settle_scoped_quota_usage(
+    scoped: &ScopedQuotaLease,
+    usage: Option<Usage>,
+    estimated_input_tokens: u64,
+    attempts: usize,
+) {
+    if let Some(actual_usage) = usage {
+        let actual_tokens = usage_token_count(actual_usage, estimated_input_tokens, attempts);
+        let _ = scoped.settle(actual_tokens).await;
+    }
+}
+
 async fn settle_budget_usage(
     state: &AppState,
     budget: &BudgetLease,
@@ -4248,6 +4799,8 @@ fn resolve_tenant(state: &AppState, headers: &HeaderMap) -> Result<(String, bool
             message: "x-urouter-tenant-id must be injected by the authentication layer".to_owned(),
             request_id: None,
             decision_id: None,
+            details: None,
+            retry_after_millis: None,
         });
     }
     let tenant = tenant.unwrap_or("local");
@@ -4573,11 +5126,11 @@ async fn apply_task_binding_inner(
             }
             Ok(())
         }
-        Err(RouteError::NoEligibleTier) if decision.migration_boundary.is_some() => {
+        Err(RouteError::BoundModelIneligible) if decision.migration_boundary.is_some() => {
             "capability_migration".clone_into(&mut decision.reason);
             Ok(())
         }
-        Err(RouteError::NoEligibleTier) => Err(GatewayError::bad_request(
+        Err(RouteError::BoundModelIneligible) => Err(GatewayError::bad_request(
             "unsafe_task_migration",
             "bound model cannot satisfy this call; declare a safe migration boundary",
         )),
@@ -4781,6 +5334,8 @@ async fn execute_routed_upstream(
     let mut attempts = Vec::new();
     let mut runtime_filter_trace = Vec::new();
     let mut last_error = None;
+    let mut last_advertised_retry_after_millis: Option<u64> = None;
+    let mut soonest_quota_reset: Option<u64> = None;
     let mut last_model = state
         .catalog
         .model(&decision.model)
@@ -4830,15 +5385,18 @@ async fn execute_routed_upstream(
                     tier: tier.tier.clone(),
                     model: success.model,
                     fallback_depth: depth,
+                    scoped_quota: success.scoped_quota,
                 });
             }
             Err(exhausted) => {
                 last_model = exhausted.model;
-                if exhausted
-                    .error
-                    .as_ref()
-                    .is_some_and(|error| error.code == "upstream_bad_request")
-                {
+                // Prefer the cause the upstream failure itself derived (which
+                // knows the error BODY) over one re-inferred from our own error
+                // code (which only knows the status).
+                let cause = exhausted
+                    .cause
+                    .unwrap_or_else(|| fallback_cause(exhausted.error.as_ref()));
+                if is_terminal_bad_request(exhausted.error.as_ref(), cause) {
                     return Err(RoutedFailure {
                         error: exhausted.error.expect("bad request error exists"),
                         attempts,
@@ -4848,33 +5406,234 @@ async fn execute_routed_upstream(
                         runtime_filter_trace,
                     });
                 }
-                let cause = fallback_cause(exhausted.error.as_ref());
-                if decision.reason != "explicit_model" {
-                    for fallback in typed_fallbacks(state, &tier.tier, cause) {
-                        if !visited.contains(&fallback) {
-                            pending.push_back(fallback);
-                        }
-                    }
-                }
+                last_advertised_retry_after_millis = exhausted
+                    .advertised_retry_after_millis
+                    .or(last_advertised_retry_after_millis);
+                soonest_quota_reset = soonest_reset(soonest_quota_reset, exhausted.quota_reset_millis);
+                enqueue_fallbacks(state, decision, &tier.tier, cause, &visited, &mut pending);
                 last_error = exhausted.error;
             }
         }
     }
 
     Err(RoutedFailure {
-        error: last_error.unwrap_or_else(|| GatewayError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "capacity_exhausted",
-            message: "all configured deployments and fallback tiers are unavailable".to_owned(),
-            request_id: None,
-            decision_id: None,
-        }),
+        error: routed_exhaustion_error(
+            last_error,
+            &runtime_filter_trace,
+            soonest_quota_reset,
+            last_advertised_retry_after_millis,
+        ),
         attempts,
         tier: last_tier,
         model: last_model,
         fallback_depth: last_depth,
         runtime_filter_trace,
     })
+}
+
+/// The runtime pool was emptied without a single upstream call. Report WHY,
+/// bucketed, instead of the fixed "all configured deployments and fallback
+/// tiers are unavailable" that told a caller nothing actionable.
+/// Queue the tiers this failure should fall over to, skipping any already tried.
+///
+/// An explicitly pinned model has no fallbacks by definition: the caller asked
+/// for that model, and silently answering with a different one is a
+/// substitution, not a recovery.
+fn enqueue_fallbacks(
+    state: &AppState,
+    decision: &RouteDecision,
+    tier: &str,
+    cause: FallbackCause,
+    visited: &BTreeSet<String>,
+    pending: &mut VecDeque<String>,
+) {
+    if decision.reason == "explicit_model" {
+        return;
+    }
+    for fallback in typed_fallbacks(state, tier, cause) {
+        if !visited.contains(&fallback) {
+            pending.push_back(fallback);
+        }
+    }
+}
+
+/// The error a fully exhausted route returns.
+///
+/// A real upstream error wins over a synthesised exhaustion — the client is
+/// better served by what the provider actually said. Only the synthesised case
+/// carries the quota ETA, because only there is "come back later" the right
+/// advice.
+fn routed_exhaustion_error(
+    last_error: Option<GatewayError>,
+    runtime_filter_trace: &[DeploymentEvaluation],
+    soonest_quota_reset: Option<u64>,
+    advertised_retry_after_millis: Option<u64>,
+) -> GatewayError {
+    last_error
+        .unwrap_or_else(|| {
+            capacity_exhausted_error(
+                runtime_filter_trace,
+                soonest_reset(soonest_quota_reset, advertised_retry_after_millis),
+            )
+        })
+        .with_retry_after_millis(advertised_retry_after_millis)
+}
+
+/// The earlier of two optional resets, treating `None` as "no opinion".
+const fn soonest_reset(current: Option<u64>, next: Option<u64>) -> Option<u64> {
+    match (current, next) {
+        (Some(current), Some(next)) => Some(if current < next { current } else { next }),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn capacity_exhausted_error(
+    runtime_filter_trace: &[DeploymentEvaluation],
+    soonest_reset_millis: Option<u64>,
+) -> GatewayError {
+    let mut summary = summarize_runtime_filters(runtime_filter_trace);
+    summary.soonest_reset_millis = soonest_reset_millis;
+    GatewayError::exhausted(&summary)
+}
+
+/// Charge the provider / credential / deployment counters for one attempt.
+///
+/// Returns the lease on success; on refusal the caller excludes the deployment
+/// and moves on. The observed utilisation is fed straight back into the capacity
+/// manager, which is what turns `DeploymentPicker::LowestQuotaUsage` from a
+/// ranking over an operator-typed constant into one over live consumption.
+async fn reserve_scoped_quota(
+    state: &AppState,
+    deployment: &RouteDeployment,
+    identity: &RequestExecutionIdentity<'_>,
+    request: &Value,
+) -> Result<ScopedQuotaLease, QuotaBreach> {
+    let limits = state.route.quota_limit_set();
+    if limits.limits.is_empty() {
+        return Ok(ScopedQuotaLease::new(
+            Arc::clone(&state.scoped_quota),
+            ScopedQuotaPermit::empty(),
+        ));
+    }
+    let (_, reserved_tokens) = estimate_quota_tokens(
+        request,
+        state.quota_default_max_output_tokens,
+        state.retry_policy.max_retries,
+        state.quota_output_reserve_cap_tokens,
+    );
+    let mut scopes = vec![
+        QuotaScopeRef {
+            kind: QuotaScopeKind::Tenant,
+            id: identity.tenant_key.to_owned(),
+        },
+        QuotaScopeRef {
+            kind: QuotaScopeKind::Deployment,
+            id: deployment.id.clone(),
+        },
+    ];
+    // The provider identity defaults to the MODEL's provider. `provider_scope`
+    // is an override for the case where several catalog providers share one
+    // real upstream budget; without the fallback, a provider-scoped limit would
+    // silently do nothing on any deployment that did not opt in by hand — and
+    // `TierConfig::effective_deployments` synthesises deployments with no scope
+    // at all, so that is the DEFAULT shape.
+    let provider_scope = deployment.provider_scope.clone().or_else(|| {
+        state
+            .catalog
+            .model(&deployment.model)
+            .map(|model| model.provider.to_string())
+    });
+    if let Some(provider) = provider_scope {
+        scopes.push(QuotaScopeRef {
+            kind: QuotaScopeKind::Provider,
+            id: provider,
+        });
+    }
+    // Credentials have no such natural default: sharing a key is an explicit
+    // operator statement, and guessing one would merge budgets that are not
+    // actually shared.
+    if let Some(credential) = &deployment.credential_scope {
+        scopes.push(QuotaScopeRef {
+            kind: QuotaScopeKind::Credential,
+            id: credential.clone(),
+        });
+    }
+    let plan = Arc::new(plan_quota_charges(
+        &limits,
+        &QuotaRequest {
+            scopes,
+            estimated_tokens: reserved_tokens,
+        },
+        now_unix_millis(),
+    ));
+    let outcome = match state.scoped_quota.reserve(plan).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // A ledger backend failure must not take routing down with it: the
+            // caps are a guard, not a correctness invariant. Fail open, loudly.
+            tracing::error!(error = %error, "scoped quota backend unavailable; admitting without accounting");
+            state
+                .metrics
+                .quota_backend_errors
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(ScopedQuotaLease::new(
+                Arc::clone(&state.scoped_quota),
+                ScopedQuotaPermit::empty(),
+            ));
+        }
+    };
+    if let Some(observed) = quota_usage_millis(&outcome.observation) {
+        state
+            .capacity
+            .observe_quota_usage(&deployment.id, observed);
+    }
+    match outcome.result {
+        Ok(permit) => Ok(ScopedQuotaLease::new(
+            Arc::clone(&state.scoped_quota),
+            permit,
+        )),
+        Err(breach) => Err(breach),
+    }
+}
+
+/// Bridge the runtime filter trace into the shared, counts-only summary.
+///
+/// One candidate can appear more than once across tiers and retries, so reasons
+/// are merged per deployment: `checked` counts DEPLOYMENTS, not trace entries,
+/// and therefore matches what an operator sees in `/v1/explain`.
+fn summarize_runtime_filters(trace: &[DeploymentEvaluation]) -> ExhaustionSummary {
+    let mut merged: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for evaluation in trace {
+        if evaluation.disposition != DeploymentDisposition::Excluded {
+            continue;
+        }
+        merged
+            .entry(evaluation.deployment.as_str())
+            .or_default()
+            .extend(evaluation.reasons.iter().cloned());
+    }
+    let exclusions: Vec<CandidateExclusion> = merged
+        .into_iter()
+        .map(|(deployment, reasons)| CandidateExclusion {
+            candidate: deployment.to_owned(),
+            reasons,
+            reset_millis: None,
+        })
+        .collect();
+    summarize_exhaustion(&exclusions)
+}
+
+/// Whether a 4xx should end the request instead of falling over.
+///
+/// A deterministic 4xx normally ends it: no fallback tier answers a malformed
+/// body any differently. But a prompt that is too long, or one a content filter
+/// rejected, is a routing problem wearing a 400 — those DO have somewhere else
+/// to go, so only a genuine `BadRequest` short-circuits. Before the upstream
+/// body was parsed every one of them looked identical here.
+fn is_terminal_bad_request(error: Option<&GatewayError>, cause: FallbackCause) -> bool {
+    cause == FallbackCause::BadRequest
+        && error.is_some_and(|error| error.code == "upstream_bad_request")
 }
 
 fn fallback_cause(error: Option<&GatewayError>) -> FallbackCause {
@@ -4924,6 +5683,9 @@ async fn execute_tier(
     let mut last_error = None;
     let mut excluded = BTreeSet::new();
     let mut retries_used = 0_u8;
+    let mut last_cause: Option<FallbackCause> = None;
+    let mut last_advertised_retry_after_millis: Option<u64> = None;
+    let mut soonest_quota_reset_millis: Option<u64> = None;
 
     loop {
         let Some(lease) = next_lease(
@@ -4938,9 +5700,55 @@ async fn execute_tier(
             break;
         };
         let deployment = lease.deployment.clone();
-        let prepared = prepare_deployment_request(state, &deployment, request)
-            .await
-            .map_err(|error| *error)?;
+
+        // Provider / credential / deployment quota is charged HERE, after a
+        // deployment has been chosen — it is the first point at which those
+        // identities are known. A refusal is not a request failure: the
+        // deployment is excluded like any other unavailable candidate and the
+        // loop tries the next one.
+        //
+        // Care is required on the refusal path. A capacity lease and a shared
+        // circuit permit are already held, and `continue`ing without giving
+        // them back leaks an `in_flight` count that only a restart clears.
+        let scoped = match reserve_scoped_quota(state, &deployment, identity, request).await {
+            Ok(scoped) => scoped,
+            Err(breach) => {
+                let reason = breach.reason();
+                soonest_quota_reset_millis = Some(
+                    soonest_quota_reset_millis
+                        .map_or(breach.reset_millis, |current: u64| {
+                            current.min(breach.reset_millis)
+                        }),
+                );
+                excluded.insert(deployment.id.clone());
+                runtime_filter_trace.push(DeploymentEvaluation {
+                    deployment: deployment.id.clone(),
+                    disposition: DeploymentDisposition::Excluded,
+                    reasons: vec![reason.clone()],
+                });
+                state
+                    .metrics
+                    .filter_rejections
+                    .lock()
+                    .expect("filter metric lock poisoned")
+                    .entry(reason)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                // Abandon rather than complete: this was not an upstream
+                // outcome, so it must not be counted as a success or a failure
+                // against the deployment's circuit.
+                drop(lease);
+                continue;
+            }
+        };
+
+        let prepared = match prepare_deployment_request(state, &deployment, request).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                scoped.release().await.ok();
+                return Err(*error);
+            }
+        };
         let model = prepared.model;
         let url = prepared.url;
         let headers = prepared.headers;
@@ -4949,7 +5757,8 @@ async fn execute_tier(
 
         match send_deployment_request(state, &url, &headers, &upstream_request).await {
             Ok((response, latency_ms)) => {
-                let attempt = observe_attempt(state, &deployment.id, latency_ms, attempts.len());
+                let attempt =
+                    observe_attempt(state, &deployment.id, Ok(()), latency_ms, attempts.len());
                 let selection_trace = record_cache_affinity_success(
                     state,
                     decision,
@@ -4970,25 +5779,40 @@ async fn execute_tier(
                     response,
                     lease,
                     model,
+                    scoped_quota: scoped,
                 });
             }
             Err(failure) => {
-                let attempt =
-                    observe_attempt(state, &deployment.id, failure.latency_ms, attempts.len());
+                scoped.release().await.ok();
+                let attempt = observe_attempt(
+                    state,
+                    &deployment.id,
+                    Err(failure.kind),
+                    failure.latency_ms,
+                    attempts.len(),
+                );
                 let selection_trace = lease.selection_trace.clone();
                 let capacity_snapshot = lease.capacity_snapshot.clone();
                 if let Err(error) = lease.complete(Err(failure.kind)).await {
                     return Err(TierExhausted {
                         error: Some(error),
                         model,
+                        cause: Some(failure.cause),
+                        advertised_retry_after_millis: failure
+                            .backoff
+                            .map(|hint| hint.backoff_millis),
+                        quota_reset_millis: soonest_quota_reset_millis,
                     });
                 }
-                let directive = state.retry_policy.directive(
+                let plan = state.retry_policy.plan_retry(
                     failure.kind,
                     retries_used,
                     candidates.len(),
-                    failure.retry_after_ms,
+                    failure.backoff,
                 );
+                let directive = plan.directive;
+                last_cause = Some(failure.cause);
+                last_advertised_retry_after_millis = plan.advertised_retry_after_millis;
                 let retry = directive != RetryDirective::Stop;
                 attempts.push(AttemptRecord::new(
                     identity.request_id,
@@ -5020,7 +5844,15 @@ async fn execute_tier(
             }
         }
     }
-    Err(tier_exhausted(last_error, last_model))
+    Err(tier_exhausted(
+        last_error,
+        last_model,
+        last_cause,
+        last_advertised_retry_after_millis,
+        // A quota refusal is the only exclusion that knows exactly when it
+        // lifts; surfacing it is what turns "try later" into "try in 20m".
+        soonest_quota_reset_millis,
+    ))
 }
 
 fn record_cache_affinity_success(
@@ -5059,18 +5891,38 @@ fn record_cache_affinity_success(
     trace
 }
 
-const fn tier_exhausted(error: Option<GatewayError>, model: ModelSpec) -> TierExhausted {
-    TierExhausted { error, model }
+const fn tier_exhausted(
+    error: Option<GatewayError>,
+    model: ModelSpec,
+    cause: Option<FallbackCause>,
+    advertised_retry_after_millis: Option<u64>,
+    quota_reset_millis: Option<u64>,
+) -> TierExhausted {
+    TierExhausted {
+        error,
+        model,
+        cause,
+        advertised_retry_after_millis,
+        quota_reset_millis,
+    }
 }
 
-fn observe_attempt(state: &AppState, deployment: &str, latency_ms: u128, attempts: usize) -> u8 {
+fn observe_attempt(
+    state: &AppState,
+    deployment: &str,
+    outcome: Result<(), UpstreamErrorKind>,
+    latency_ms: u128,
+    attempts: usize,
+) -> u8 {
     state
         .metrics
         .upstream_attempts
         .fetch_add(1, Ordering::Relaxed);
-    state
-        .capacity
-        .observe_latency(deployment, u64::try_from(latency_ms).unwrap_or(u64::MAX));
+    state.capacity.observe_outcome(
+        deployment,
+        outcome,
+        u64::try_from(latency_ms).unwrap_or(u64::MAX),
+    );
     attempt_number(attempts)
 }
 
@@ -5080,24 +5932,48 @@ async fn prepare_deployment_request(
     request: &Value,
 ) -> Result<PreparedDeployment, Box<TierExhausted>> {
     let model = state.catalog.model(&deployment.model).unwrap().clone();
-    let (endpoint, url) = endpoint_for_deployment(state, deployment, &model).map_err(|error| {
-        Box::new(TierExhausted {
-            error: Some(error),
-            model: model.clone(),
-        })
-    })?;
+    let provider = state
+        .catalog
+        .provider(&model.provider)
+        .ok_or_else(|| {
+            Box::new(TierExhausted {
+                error: Some(GatewayError::internal("selected provider disappeared")),
+                model: model.clone(),
+                cause: None,
+                advertised_retry_after_millis: None,
+                quota_reset_millis: None,
+            })
+        })?
+        .clone();
+    let streaming = urouter_transport::is_streaming(request);
+    let (endpoint, url) =
+        endpoint_for_deployment(state, deployment, &model, streaming).map_err(|error| {
+            Box::new(TierExhausted {
+                error: Some(error),
+                model: model.clone(),
+                cause: None,
+                advertised_retry_after_millis: None,
+                quota_reset_millis: None,
+            })
+        })?;
     let headers = resolve_headers(&state.credentials, &endpoint)
         .await
         .map_err(|error| {
             Box::new(TierExhausted {
                 error: Some(error),
                 model: model.clone(),
+                cause: None,
+                advertised_retry_after_millis: None,
+                quota_reset_millis: None,
             })
         })?;
-    let request = provider_request(request, &model).map_err(|error| {
+    let request = provider_request(state, request, &provider, &model).map_err(|error| {
         Box::new(TierExhausted {
             error: Some(error),
             model: model.clone(),
+            cause: None,
+            advertised_retry_after_millis: None,
+            quota_reset_millis: None,
         })
     })?;
     Ok(PreparedDeployment {
@@ -5123,13 +5999,21 @@ async fn apply_retry_directive(
     *retries_used = retries_used.saturating_add(1);
     match directive {
         RetryDirective::Stop => unreachable!("stop returned before retry execution"),
-        RetryDirective::ReselectDeployment => {
+        RetryDirective::ReselectDeployment { backoff_ms } => {
             tracing::info!(
                 deployment = deployment_id,
                 retries_used = *retries_used,
+                backoff_ms,
                 "retrying on a different deployment"
             );
             excluded.insert(deployment_id.to_owned());
+            // Non-zero only when the upstream stated a back-off. Sibling
+            // deployments usually sit behind the same provider budget, so
+            // reselecting instantly after a provider-wide 429 just burns the
+            // next candidate too.
+            if backoff_ms > 0 {
+                sleep(Duration::from_millis(backoff_ms)).await;
+            }
         }
         RetryDirective::RetrySameDeployment { backoff_ms } => {
             tracing::info!(
@@ -5255,7 +6139,7 @@ fn deployment_filter_reasons(
         reasons.push("tenant_not_allowed".to_owned());
     }
     match state.catalog.model(&deployment.model) {
-        Some(model) => match endpoint_for_deployment(state, deployment, model) {
+        Some(model) => match endpoint_for_deployment(state, deployment, model, false) {
             Ok((endpoint, _))
                 if deployment.credential_available
                     && !credential_source_configured(&endpoint.auth) =>
@@ -5295,6 +6179,19 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
+/// The gateway reads the clock so `urouter-contracts` does not have to: an
+/// HTTP-date `Retry-After` is an instant, and turning it into a delay is the
+/// only place the pure extractor needs "now".
+fn now_unix_millis() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
 fn fallback_model(
     state: &AppState,
     candidates: &[RouteDeployment],
@@ -5319,6 +6216,9 @@ async fn next_lease(
         .map_err(|error| TierExhausted {
             error: Some(error),
             model: model.clone(),
+            cause: None,
+            advertised_retry_after_millis: None,
+            quota_reset_millis: None,
         })
 }
 
@@ -5433,9 +6333,33 @@ async fn send_deployment_request(
         }
         Ok(response) => {
             let status = response.status();
-            let retry_after_ms = parse_retry_after_ms(response.headers());
-            let kind = classify_status(status);
             let latency_ms = started.elapsed().as_millis();
+            // Header pairs are snapshotted before the body is consumed.
+            let header_pairs = lowercased_header_pairs(response.headers());
+            // The body is read BEFORE classification, not after: the status code
+            // alone cannot tell a 400 that means "prompt too long" (which should
+            // fall over to a longer-context tier) from a 400 that means
+            // "malformed JSON" (which should not).
+            let detail = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "upstream response unavailable".to_owned());
+            let borrowed: Vec<(&str, &str)> = header_pairs
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            let backoff = extract_backoff(&UpstreamResponseFacts {
+                status: status.as_u16(),
+                headers: &borrowed,
+                body: Some(&detail),
+                now_unix_millis: now_unix_millis(),
+                body_scan_depth: DEFAULT_BODY_SCAN_DEPTH,
+            });
+            let body_code = serde_json::from_str::<Value>(&detail)
+                .ok()
+                .and_then(|body| upstream_error_code(&body, DEFAULT_BODY_SCAN_DEPTH));
+            let kind = classify_upstream(status.as_u16(), body_code.as_deref());
+            let cause = fallback_cause_for(kind, body_code.as_deref());
             // The upstream body is deliberately not a log field: it is provider
             // text of unbounded size and unknown sensitivity. It stays on the
             // DecisionRecord, which is governed by the tenant data policy.
@@ -5443,19 +6367,20 @@ async fn send_deployment_request(
                 url,
                 status = status.as_u16(),
                 kind = ?kind,
-                retry_after_ms,
+                cause = ?cause,
+                body_code = body_code.as_deref().unwrap_or("-"),
+                retry_after_ms = backoff.map(|hint| hint.backoff_millis),
+                retry_after_source = ?backoff.map(|hint| hint.source),
                 latency_ms = duration_metric_value(latency_ms),
                 "upstream returned an error status"
             );
-            let detail = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "upstream response unavailable".to_owned());
             Err(AttemptFailure {
                 kind,
                 status: Some(status),
                 detail,
-                retry_after_ms,
+                backoff,
+                body_code,
+                cause,
                 latency_ms,
             })
         }
@@ -5476,7 +6401,9 @@ async fn send_deployment_request(
                 kind,
                 status: error.status(),
                 detail: error.to_string(),
-                retry_after_ms: None,
+                backoff: None,
+                body_code: None,
+                cause: FallbackCause::from(kind),
                 latency_ms,
             })
         }
@@ -5600,6 +6527,7 @@ fn endpoint_for_deployment(
     state: &AppState,
     deployment: &RouteDeployment,
     model: &ModelSpec,
+    streaming: bool,
 ) -> Result<(EndpointPlan, String), GatewayError> {
     let provider = state
         .catalog
@@ -5623,185 +6551,110 @@ fn endpoint_for_deployment(
         }
         endpoint.url = override_url;
     }
-    let path = match model.api {
-        WireApi::OpenAiChat => "chat/completions",
-        WireApi::OpenAiResponses => "responses",
-        WireApi::AnthropicMessages => "messages",
-        _ => {
-            return Err(GatewayError::bad_request(
-                "unsupported_wire_api",
-                "custom provider APIs require an installed transport adapter",
-            ));
-        }
-    };
-    let url = format!("{}/{path}", endpoint.url.as_str().trim_end_matches('/'));
+    // The path is derived by the transport, not by a fixed suffix table: a
+    // provider whose chat path interpolates the model id (Gemini) or switches
+    // verb for streaming has no constant suffix to append.
+    let base = endpoint.url.as_str().to_owned();
+    let transport = state
+        .transports
+        .resolve(&model.api)
+        .map_err(transport_error)?;
+    let url = transport
+        .endpoint(
+            &TransportContext {
+                provider,
+                model,
+                base_url: &base,
+            },
+            streaming,
+        )
+        .map_err(transport_error)?;
     Ok((endpoint, url))
 }
 
-fn provider_request(request: &Value, model: &ModelSpec) -> Result<Value, GatewayError> {
-    match model.api {
-        WireApi::OpenAiChat => {
-            let mut request = request.clone();
-            rewrite_request(&mut request, model);
-            Ok(request)
+/// Map a transport failure onto the client-facing error, preserving which of
+/// the four distinct causes it was rather than flattening them.
+/// Lowercased header name/value pairs, snapshotted before the body is consumed.
+///
+/// `extract_backoff` matches header names exactly, and HTTP header casing is
+/// whatever the upstream felt like sending.
+fn lowercased_header_pairs(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_owned()))
+        })
+        .collect()
+}
+
+fn transport_error(error: TransportError) -> GatewayError {
+    match error {
+        TransportError::UnsupportedWireApi(_) => {
+            GatewayError::bad_request("unsupported_wire_api", error)
         }
-        WireApi::OpenAiResponses => {
-            reject_non_chat_stream(request, "open_ai_responses")?;
-            let normalized = from_openai_chat(request)
-                .map_err(|error| GatewayError::bad_request("protocol_conversion_failed", error))?;
-            let (mut request, _) = to_openai_responses(&normalized, LossPolicy::Reject)
-                .map_err(|error| GatewayError::bad_request("protocol_semantic_loss", error))?;
-            request["model"] = model.upstream_id.clone().into();
-            Ok(request)
+        TransportError::Conversion(_) => {
+            GatewayError::bad_request("protocol_conversion_failed", error)
         }
-        WireApi::AnthropicMessages => {
-            reject_non_chat_stream(request, "anthropic_messages")?;
-            let normalized = from_openai_chat(request)
-                .map_err(|error| GatewayError::bad_request("protocol_conversion_failed", error))?;
-            let (mut request, _) = to_anthropic_messages(&normalized, LossPolicy::Reject)
-                .map_err(|error| GatewayError::bad_request("protocol_semantic_loss", error))?;
-            request["model"] = model.upstream_id.clone().into();
-            Ok(request)
+        TransportError::SemanticLoss(_) => {
+            GatewayError::bad_request("protocol_semantic_loss", error)
         }
-        _ => Err(GatewayError::bad_request(
-            "unsupported_wire_api",
-            "custom provider APIs require an installed transport adapter",
-        )),
+        TransportError::StreamingUnsupported { .. } => {
+            GatewayError::bad_request("unsupported_provider_streaming", error)
+        }
+        TransportError::Response(_) => GatewayError::internal(error),
     }
 }
 
-fn reject_non_chat_stream(request: &Value, api: &str) -> Result<(), GatewayError> {
-    if request.get("stream").and_then(Value::as_bool) == Some(true) {
-        return Err(GatewayError::bad_request(
-            "unsupported_provider_streaming",
-            format!("{api} transport does not support streaming handoff"),
-        ));
-    }
-    Ok(())
+fn provider_request(
+    state: &AppState,
+    request: &Value,
+    provider: &ProviderSpec,
+    model: &ModelSpec,
+) -> Result<Value, GatewayError> {
+    let transport = state
+        .transports
+        .resolve(&model.api)
+        .map_err(transport_error)?;
+    transport
+        .build_request(
+            &TransportContext {
+                provider,
+                model,
+                base_url: "",
+            },
+            request,
+        )
+        .map_err(transport_error)
 }
 
-fn provider_response_to_chat(body: Value, api: &WireApi) -> Result<Value, GatewayError> {
-    match api {
-        WireApi::OpenAiChat => Ok(body),
-        WireApi::OpenAiResponses => Ok(responses_provider_to_chat(&body)),
-        WireApi::AnthropicMessages => Ok(anthropic_provider_to_chat(&body)),
-        _ => Err(GatewayError::internal(
-            "custom provider response has no transport adapter",
-        )),
-    }
-}
-
-fn responses_provider_to_chat(body: &Value) -> Value {
-    let mut text = String::new();
-    let mut reasoning = String::new();
-    let mut tool_calls = Vec::new();
-    if let Some(output) = body.get("output").and_then(Value::as_array) {
-        for item in output {
-            match item.get("type").and_then(Value::as_str) {
-                Some("message") => {
-                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
-                        for part in parts {
-                            if part.get("type").and_then(Value::as_str) == Some("output_text")
-                                && let Some(value) = part.get("text").and_then(Value::as_str)
-                            {
-                                text.push_str(value);
-                            }
-                        }
-                    }
-                }
-                Some("reasoning") => {
-                    if let Some(parts) = item.get("summary").and_then(Value::as_array) {
-                        for part in parts {
-                            if let Some(value) = part.get("text").and_then(Value::as_str) {
-                                reasoning.push_str(value);
-                            }
-                        }
-                    }
-                }
-                Some("function_call") => tool_calls.push(json!({
-                    "id": item.get("call_id").cloned().unwrap_or(Value::Null),
-                    "type": "function",
-                    "function": {
-                        "name": item.get("name").cloned().unwrap_or(Value::Null),
-                        "arguments": item.get("arguments").cloned().unwrap_or_else(|| "{}".into())
-                    }
-                })),
-                _ => {}
-            }
-        }
-    }
-    let finish_reason = if tool_calls.is_empty() {
-        "stop"
-    } else {
-        "tool_calls"
-    };
-    let mut message = json!({"role": "assistant", "content": text});
-    if !reasoning.is_empty() {
-        message["reasoning_content"] = reasoning.into();
-    }
-    if !tool_calls.is_empty() {
-        message["tool_calls"] = tool_calls.into();
-    }
-    json!({
-        "id": body.get("id").cloned().unwrap_or(Value::Null),
-        "object": "chat.completion",
-        "model": body.get("model").cloned().unwrap_or(Value::Null),
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": {
-            "prompt_tokens": body.pointer("/usage/input_tokens").cloned().unwrap_or(json!(0)),
-            "completion_tokens": body.pointer("/usage/output_tokens").cloned().unwrap_or(json!(0)),
-            "total_tokens": body.pointer("/usage/total_tokens").cloned().unwrap_or(json!(0))
-        }
-    })
-}
-
-fn anthropic_provider_to_chat(body: &Value) -> Value {
-    let mut text = String::new();
-    let mut tool_calls = Vec::new();
-    if let Some(content) = body.get("content").and_then(Value::as_array) {
-        for part in content {
-            match part.get("type").and_then(Value::as_str) {
-                Some("text") => text.push_str(part.get("text").and_then(Value::as_str).unwrap_or("")),
-                Some("tool_use") => tool_calls.push(json!({
-                    "id": part.get("id").cloned().unwrap_or(Value::Null),
-                    "type": "function",
-                    "function": {
-                        "name": part.get("name").cloned().unwrap_or(Value::Null),
-                        "arguments": part.get("input").cloned().unwrap_or_else(|| json!({})).to_string()
-                    }
-                })),
-                _ => {}
-            }
-        }
-    }
-    let finish_reason = if tool_calls.is_empty() {
-        "stop"
-    } else {
-        "tool_calls"
-    };
-    let mut message = json!({"role": "assistant", "content": text});
-    if !tool_calls.is_empty() {
-        message["tool_calls"] = tool_calls.into();
-    }
-    let input = body
-        .pointer("/usage/input_tokens")
-        .cloned()
-        .unwrap_or(json!(0));
-    let output = body
-        .pointer("/usage/output_tokens")
-        .cloned()
-        .unwrap_or(json!(0));
-    let total = input
-        .as_u64()
-        .unwrap_or(0)
-        .saturating_add(output.as_u64().unwrap_or(0));
-    json!({
-        "id": body.get("id").cloned().unwrap_or(Value::Null),
-        "object": "chat.completion",
-        "model": body.get("model").cloned().unwrap_or(Value::Null),
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": {"prompt_tokens": input, "completion_tokens": output, "total_tokens": total}
-    })
+/// Map a successful upstream body back to the `OpenAI` Chat shape via the
+/// transport that produced the request.
+fn provider_response_to_chat(
+    state: &AppState,
+    body: Value,
+    model: &ModelSpec,
+) -> Result<Value, GatewayError> {
+    let provider = state
+        .catalog
+        .provider(&model.provider)
+        .ok_or_else(|| GatewayError::internal("selected provider disappeared"))?;
+    let transport = state
+        .transports
+        .resolve(&model.api)
+        .map_err(transport_error)?;
+    transport
+        .parse_response(
+            &TransportContext {
+                provider,
+                model,
+                base_url: "",
+            },
+            body,
+        )
+        .map_err(transport_error)
 }
 
 fn routed_setup_failure(
@@ -5825,27 +6678,6 @@ fn routed_setup_failure(
 
 fn attempt_number(existing: usize) -> u8 {
     u8::try_from(existing.saturating_add(1)).unwrap_or(u8::MAX)
-}
-
-fn classify_status(status: reqwest::StatusCode) -> UpstreamErrorKind {
-    match status.as_u16() {
-        401 | 403 => UpstreamErrorKind::Unauthorized,
-        404 => UpstreamErrorKind::NotFound,
-        429 => UpstreamErrorKind::RateLimited,
-        502..=504 => UpstreamErrorKind::ProviderUnavailable,
-        500..=599 => UpstreamErrorKind::ServerError,
-        _ => UpstreamErrorKind::BadRequest,
-    }
-}
-
-fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .parse::<u64>()
-        .ok()
-        .map(|seconds| seconds.saturating_mul(1_000))
 }
 
 fn upstream_error(
@@ -5881,41 +6713,9 @@ fn upstream_error(
         ),
         request_id: None,
         decision_id: None,
+        details: None,
+        retry_after_millis: None,
     }
-}
-
-fn rewrite_request(request: &mut Value, model: &ModelSpec) {
-    let Some(object) = request.as_object_mut() else {
-        return;
-    };
-    object.remove("urouter");
-    object.insert("model".to_owned(), Value::String(model.upstream_id.clone()));
-    if model.compat.supports_developer_role == Some(false)
-        && let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut)
-    {
-        for message in messages {
-            if message.get("role").and_then(Value::as_str) == Some("developer") {
-                message["role"] = Value::String("system".to_owned());
-            }
-        }
-    }
-    normalize_max_tokens(object, model);
-}
-
-fn normalize_max_tokens(object: &mut serde_json::Map<String, Value>, model: &ModelSpec) {
-    let value = object
-        .remove("max_tokens")
-        .or_else(|| object.remove("max_completion_tokens"))
-        .or_else(|| object.remove("max_output_tokens"));
-    let Some(value) = value else {
-        return;
-    };
-    let field = match model.compat.max_tokens_field {
-        Some(MaxTokensField::MaxCompletionTokens) => "max_completion_tokens",
-        Some(MaxTokensField::MaxOutputTokens) => "max_output_tokens",
-        _ => "max_tokens",
-    };
-    object.insert(field.to_owned(), value);
 }
 
 async fn resolve_headers(
@@ -5955,6 +6755,7 @@ async fn non_stream_response(
         lease,
         model,
         fallback_depth,
+        scoped_quota: scoped_quota_lease,
         tier: _,
     } = execution;
     let deployment = lease.deployment.id.clone();
@@ -5965,7 +6766,7 @@ async fn non_stream_response(
             return Err(GatewayError::internal(error));
         }
     };
-    body = match provider_response_to_chat(body, &model.api) {
+    body = match provider_response_to_chat(&state, body, &model) {
         Ok(body) => body,
         Err(error) => {
             lease.complete(Err(UpstreamErrorKind::ServerError)).await?;
@@ -5981,6 +6782,8 @@ async fn non_stream_response(
             .fetch_add(1, Ordering::Relaxed);
     }
     settle_quota_usage(&quota, usage, quota_input_tokens, attempts.len()).await;
+    settle_scoped_quota_usage(&scoped_quota_lease, usage, quota_input_tokens, attempts.len())
+        .await;
     let cost = calculate_cost(&model, usage)?;
     observe_execution_metrics(
         &state.metrics,
@@ -6052,6 +6855,7 @@ fn stream_response(
         lease,
         model,
         fallback_depth,
+        scoped_quota: scoped_quota_lease,
         tier: _,
     } = execution;
     let deployment = lease.deployment.id.clone();
@@ -6092,6 +6896,8 @@ fn stream_response(
                 .fetch_add(1, Ordering::Relaxed);
         }
         settle_quota_usage(&quota, usage, quota_input_tokens, attempts.len()).await;
+        settle_scoped_quota_usage(&scoped_quota_lease, usage, quota_input_tokens, attempts.len())
+        .await;
         let cost = calculate_cost(&model, usage).ok().flatten();
         observe_stream_execution_metrics(
             &state.metrics,
@@ -6332,7 +7138,13 @@ fn build_record(
             catalog: evidence.content_hash.to_string(),
             route: record.route_revision.clone(),
             feature_schema: FEATURE_SCHEMA_VERSION,
-            policy: "current_gateway:v1".to_owned(),
+            // v2: admission now reserves a CAPPED share of a request's stated
+            // `max_tokens` against the context window (see
+            // `reserved_output_tokens`). That changes which models are eligible
+            // for the same route revision, so replayed records must carry the
+            // policy version that produced them or offline evaluation will
+            // compare decisions made under different rules.
+            policy: "current_gateway:v2".to_owned(),
         },
         record.features.clone(),
         routing_trace,

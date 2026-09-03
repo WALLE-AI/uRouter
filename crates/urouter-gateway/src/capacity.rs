@@ -11,8 +11,9 @@ use serde::Serialize;
 use thiserror::Error;
 use urouter_contracts::{
     CapacityCandidateSnapshot, CapacityLeasePlanError, CapacitySnapshot, CooldownDirective,
-    DeploymentEvaluation, DeploymentPicker, FailureWindow, LocalCircuitAvailability,
-    cooldown_directive, plan_capacity_lease_with_picker,
+    DeploymentEvaluation, DeploymentPicker, FailureWindow, LATENCY_SAMPLE_CAP_MILLIS,
+    LocalCircuitAvailability, cooldown_directive, effective_quota_usage_millis,
+    latency_sample_millis, plan_capacity_lease_with_picker,
 };
 
 use crate::{RouteDeployment, UpstreamErrorKind};
@@ -22,6 +23,9 @@ pub struct CooldownPolicy {
     pub cooldown: Duration,
     pub window: Duration,
     pub failure_threshold_millis: u16,
+    /// Ceiling on a single attempt's contribution to the latency EWMA; `0`
+    /// disables capping. See [`latency_sample_millis`].
+    pub latency_sample_cap_millis: u64,
 }
 
 impl Default for CooldownPolicy {
@@ -30,6 +34,7 @@ impl Default for CooldownPolicy {
             cooldown: Duration::from_secs(5),
             window: Duration::from_secs(60),
             failure_threshold_millis: 500,
+            latency_sample_cap_millis: LATENCY_SAMPLE_CAP_MILLIS,
         }
     }
 }
@@ -69,6 +74,13 @@ struct DeploymentHealth {
     half_open_probe: bool,
     in_flight: u64,
     latency_ewma_ms: Option<u64>,
+    /// Live utilisation from the quota ledger, in per mille.
+    ///
+    /// `RouteDeployment::quota_usage_millis` is an operator-typed constant that
+    /// nothing ever wrote at runtime, so `DeploymentPicker::LowestQuotaUsage`
+    /// ranked on a value that could not change. This is the observed number
+    /// that supersedes it.
+    observed_quota_usage_millis: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -191,12 +203,41 @@ impl CapacityManager {
         self.picker
     }
 
-    pub fn observe_latency(&self, deployment: &str, latency_ms: u64) {
+    #[must_use]
+    pub const fn latency_sample_cap_millis(&self) -> u64 {
+        self.policy.latency_sample_cap_millis
+    }
+
+    /// Fold an attempt's wall-clock latency into the deployment's EWMA, but only
+    /// when the outcome is actually evidence of speed.
+    ///
+    /// The gating lives in [`latency_sample_millis`] so the "is this a speed
+    /// signal" question has exactly one answer, testable without a manager.
+    pub fn observe_outcome(
+        &self,
+        deployment: &str,
+        outcome: Result<(), UpstreamErrorKind>,
+        latency_ms: u64,
+    ) {
+        let Some(sample) =
+            latency_sample_millis(outcome, latency_ms, self.policy.latency_sample_cap_millis)
+        else {
+            return;
+        };
         let mut health = self.health.lock().expect("capacity lock poisoned");
         let state = health.entry(deployment.to_owned()).or_default();
-        state.latency_ewma_ms = Some(state.latency_ewma_ms.map_or(latency_ms, |previous| {
-            previous.saturating_mul(4).saturating_add(latency_ms) / 5
+        state.latency_ewma_ms = Some(state.latency_ewma_ms.map_or(sample, |previous| {
+            previous.saturating_mul(4).saturating_add(sample) / 5
         }));
+    }
+
+    /// Record live quota utilisation for a deployment.
+    pub fn observe_quota_usage(&self, deployment: &str, used_millis: u16) {
+        let mut health = self.health.lock().expect("capacity lock poisoned");
+        health
+            .entry(deployment.to_owned())
+            .or_default()
+            .observed_quota_usage_millis = Some(used_millis);
     }
 
     #[must_use]
@@ -313,7 +354,13 @@ fn snapshot_locked(
                     circuit: local_circuit_availability(state, now),
                     in_flight: state.in_flight,
                     latency_ewma_ms: state.latency_ewma_ms,
-                    quota_usage_millis: deployment.quota_usage_millis,
+                    // Observed utilisation supersedes the configured constant;
+                    // the constant remains the cold-start value so a fresh
+                    // process still has something to rank on.
+                    quota_usage_millis: effective_quota_usage_millis(
+                        deployment.quota_usage_millis,
+                        state.observed_quota_usage_millis,
+                    ),
                     unavailable_reasons: Vec::new(),
                 }
             })
@@ -519,8 +566,8 @@ mod tests {
             CooldownPolicy::default(),
             DeploymentPicker::LowestLatency,
         );
-        latency.observe_latency("a", 50);
-        latency.observe_latency("b", 10);
+        latency.observe_outcome("a", Ok(()), 50);
+        latency.observe_outcome("b", Ok(()), 10);
         assert_eq!(
             latency
                 .select(&deployments, &BTreeSet::new())
@@ -545,5 +592,70 @@ mod tests {
                 .id,
             "b"
         );
+    }
+
+    /// A deployment that rejects every call in 5 ms is not fast, it is broken.
+    /// Before the outcome gate those 5 ms rejections fed the EWMA, so a
+    /// deployment could *lower* its latency score by failing harder and win
+    /// `LowestLatency` over a healthy peer — the picker steered traffic at the
+    /// deployment least able to serve it.
+    #[test]
+    fn fast_failures_do_not_drag_the_latency_ewma_down() {
+        let manager = CapacityManager::with_picker(
+            CooldownPolicy::default(),
+            DeploymentPicker::LowestLatency,
+        );
+        // One honest, slow-ish success establishes the baseline.
+        manager.observe_outcome("broken", Ok(()), 200);
+        let baseline = ewma(&manager, "broken");
+        assert_eq!(baseline, Some(200));
+
+        for kind in [
+            UpstreamErrorKind::Unauthorized,
+            UpstreamErrorKind::NotFound,
+            UpstreamErrorKind::BadRequest,
+            UpstreamErrorKind::RateLimited,
+            UpstreamErrorKind::ServerError,
+            UpstreamErrorKind::ProviderUnavailable,
+            UpstreamErrorKind::Transport,
+        ] {
+            manager.observe_outcome("broken", Err(kind), 5);
+        }
+        assert_eq!(
+            ewma(&manager, "broken"),
+            baseline,
+            "non-speed failures must leave the EWMA untouched"
+        );
+
+        // A timeout, by contrast, IS the deployment being slow and must count.
+        manager.observe_outcome("broken", Err(UpstreamErrorKind::Timeout), 5_000);
+        assert!(
+            ewma(&manager, "broken") > baseline,
+            "a timeout must raise the latency EWMA"
+        );
+    }
+
+    fn ewma(manager: &CapacityManager, deployment: &str) -> Option<u64> {
+        manager
+            .health
+            .lock()
+            .expect("capacity lock poisoned")
+            .get(deployment)
+            .and_then(|state| state.latency_ewma_ms)
+    }
+
+    /// A hang contributes the cap, not its unbounded wall-clock cost, so one
+    /// stuck socket cannot flatten the axis for every other sample.
+    #[test]
+    fn timeout_latency_is_capped_in_the_ewma() {
+        let manager = CapacityManager::with_picker(
+            CooldownPolicy {
+                latency_sample_cap_millis: 1_000,
+                ..CooldownPolicy::default()
+            },
+            DeploymentPicker::LowestLatency,
+        );
+        manager.observe_outcome("slow", Err(UpstreamErrorKind::Timeout), 1_200_000);
+        assert_eq!(ewma(&manager, "slow"), Some(1_000));
     }
 }

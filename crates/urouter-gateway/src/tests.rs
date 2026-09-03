@@ -193,8 +193,15 @@ fn configuration_dry_run_report_pins_revisions_without_credentials() {
             .unwrap()
             .starts_with("sha256:")
     );
-    assert_eq!(report.checks.len(), 16);
-    assert_eq!(report.checks[12].status, DryRunStatus::Pass);
+    assert_eq!(report.checks.len(), 18);
+    // Look the check up by id: positional indexing silently retargets whenever
+    // a check is added to an earlier group.
+    let manifest = report
+        .checks
+        .iter()
+        .find(|check| check.id == "catalog_manifest")
+        .expect("the catalog manifest check is always reported");
+    assert_eq!(manifest.status, DryRunStatus::Pass);
 }
 
 #[test]
@@ -265,7 +272,7 @@ fn configuration_dry_run_returns_structured_failure() {
     ]);
     let report = configuration_dry_run(&args);
     assert!(!report.valid);
-    assert_eq!(report.checks.len(), 16);
+    assert_eq!(report.checks.len(), 18);
     assert_eq!(report.errors[0].code, "catalog_read_failed");
     assert!(
         report
@@ -353,7 +360,7 @@ fn protocol_stream_event_matrix_preserves_text_reasoning_tools_and_disclosure() 
     for protocol in [ProtocolResponse::Responses, ProtocolResponse::Anthropic] {
         let mut state = ProtocolTranslationState::default();
         let output =
-            String::from_utf8(translate_chat_sse_event(chunk, protocol, &mut state)).unwrap();
+            String::from_utf8(translate_chat_sse_event(chunk, &protocol, &mut state)).unwrap();
         match protocol {
             ProtocolResponse::Responses => {
                 assert!(output.contains("response.output_text.delta"));
@@ -365,23 +372,27 @@ fn protocol_stream_event_matrix_preserves_text_reasoning_tools_and_disclosure() 
                 assert!(output.contains("thinking_delta"));
                 assert!(output.contains("input_json_delta"));
             }
+            // Gemini and Ollama refuse a streaming request before a stream is
+            // created, so they never reach this translator.
+            ProtocolResponse::Gemini | ProtocolResponse::Ollama { .. } => unreachable!(),
         }
         let disclosure = String::from_utf8(translate_chat_sse_event(
             b"event: urouter.decision\ndata: {\"tier\":\"capable\"}",
-            protocol,
+            &protocol,
             &mut state,
         ))
         .unwrap();
         assert!(disclosure.contains("urouter"));
         let done = String::from_utf8(translate_chat_sse_event(
             b"data: [DONE]",
-            protocol,
+            &protocol,
             &mut state,
         ))
         .unwrap();
         assert!(done.contains(match protocol {
             ProtocolResponse::Responses => "response.completed",
             ProtocolResponse::Anthropic => "message_stop",
+            ProtocolResponse::Gemini | ProtocolResponse::Ollama { .. } => unreachable!(),
         }));
     }
 }
@@ -403,6 +414,32 @@ async fn protocol_stream_translation_handles_fragmented_sse_chunks() {
     assert!(output.contains("response.completed"));
 }
 
+/// Shape a request through the installed transport, as the gateway does, and
+/// map the failure the way the gateway maps it.
+///
+/// The conversions themselves are unit-tested in `urouter-transport`; what
+/// these gateway tests still pin is the CLIENT-FACING error code each failure
+/// mode produces, which is a gateway decision.
+fn provider_request(request: &Value, model: &ModelSpec) -> Result<Value, GatewayError> {
+    let catalog =
+        CatalogSnapshot::from_json_str(include_str!("../../../catalog/catalog.json")).unwrap();
+    let provider = catalog.provider(&model.provider).unwrap();
+    let registry = urouter_transport::TransportRegistry::with_builtins();
+    registry
+        .resolve(&model.api)
+        .and_then(|transport| {
+            transport.build_request(
+                &urouter_transport::TransportContext {
+                    provider,
+                    model,
+                    base_url: "",
+                },
+                request,
+            )
+        })
+        .map_err(transport_error)
+}
+
 #[test]
 fn provider_transports_convert_non_stream_requests_and_responses_without_guessing() {
     let catalog =
@@ -419,7 +456,7 @@ fn provider_transports_convert_non_stream_requests_and_responses_without_guessin
     let responses_request = provider_request(&request, &model).unwrap();
     assert_eq!(responses_request["model"], "provider-model");
     assert!(responses_request["input"].is_array());
-    let responses = responses_provider_to_chat(&json!({
+    let responses = urouter_transport::responses_to_chat(&json!({
         "id": "resp-1",
         "model": "provider-model",
         "output": [
@@ -435,7 +472,7 @@ fn provider_transports_convert_non_stream_requests_and_responses_without_guessin
     let anthropic_request = provider_request(&request, &model).unwrap();
     assert_eq!(anthropic_request["model"], "provider-model");
     assert!(anthropic_request["messages"].is_array());
-    let anthropic = anthropic_provider_to_chat(&json!({
+    let anthropic = urouter_transport::anthropic_to_chat(&json!({
         "id": "msg-1",
         "model": "provider-model",
         "content": [{"type": "text", "text": "done"}],
@@ -2244,7 +2281,12 @@ async fn test_state_with_route(route: RouteConfig) -> AppState {
         idempotency: MemoryIdempotencyRepository::new(100),
         idempotency_ttl_seconds: 86_400,
         quota: MemoryQuotaRepository::new(0, 0, 0),
+        transports: Arc::new(urouter_transport::TransportRegistry::with_builtins()),
+        scoped_quota: crate::scoped_quota::MemoryScopedQuotaRepository::new(
+            Duration::from_secs(60),
+        ),
         quota_default_max_output_tokens: 4_096,
+        quota_output_reserve_cap_tokens: OUTPUT_RESERVE_TOKENS_CAP,
         budget: MemoryBudgetRepository::new(0, 2_592_000),
         shared_state: None,
         require_tenant_header: false,
@@ -2384,13 +2426,13 @@ async fn commit_decision_binding(
 
 #[test]
 fn rewrites_model_contract_role_and_token_field() {
-    let mut request = json!({
+    let request = json!({
         "model": "urouter/auto",
         "messages": [{"role": "developer", "content": "rules"}],
         "max_output_tokens": 12,
         "urouter": {"contract_version": 1}
     });
-    rewrite_request(&mut request, &model());
+    let request = provider_request(&request, &model()).unwrap();
     assert_eq!(request["model"], "Qwen3.5-4B");
     assert_eq!(request["messages"][0]["role"], "system");
     assert_eq!(request["max_tokens"], 12);
@@ -3694,8 +3736,29 @@ fn quota_estimate_reserves_retry_input_and_requested_output() {
     let serialized = u64::try_from(serde_json::to_vec(&request).unwrap().len()).unwrap();
     let expected_input = serialized.div_ceil(4);
     assert_eq!(
-        estimate_quota_tokens(&request, 4_096, 1),
+        estimate_quota_tokens(&request, 4_096, 1, OUTPUT_RESERVE_TOKENS_CAP),
         (expected_input, expected_input * 2 + 12)
+    );
+}
+
+/// The bug this cap exists for: a client stating an output bound it will never
+/// reach must not reserve the whole thing against the token quota.
+#[test]
+fn quota_estimate_caps_an_overstated_output_bound() {
+    let request = json!({
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 32_000
+    });
+    let serialized = u64::try_from(serde_json::to_vec(&request).unwrap().len()).unwrap();
+    let expected_input = serialized.div_ceil(4);
+    assert_eq!(
+        estimate_quota_tokens(&request, 4_096, 1, OUTPUT_RESERVE_TOKENS_CAP),
+        (expected_input, expected_input * 2 + OUTPUT_RESERVE_TOKENS_CAP)
+    );
+    // A zero cap opts back out and reserves the full stated bound.
+    assert_eq!(
+        estimate_quota_tokens(&request, 4_096, 1, 0),
+        (expected_input, expected_input * 2 + 32_000)
     );
 }
 

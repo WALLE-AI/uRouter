@@ -23,11 +23,14 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
 urouter-ai = { path = "../urouter-ai" }
 urouter-artifact = { path = "../urouter-artifact" }
 urouter-contracts = { path = "../urouter-contracts" }
 urouter-core = { path = "../urouter-core" }
 urouter-protocol = { path = "../urouter-protocol" }
+urouter-transport = { path = "../urouter-transport" }
 urouter-types = { path = "../urouter-types" }
 url.workspace = true
 

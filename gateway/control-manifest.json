@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "revision": "sha256:18f50278e6c71af5573172e83532e79ae0380ae072d26168f80e990186a6e9d1",
-  "catalog_sha256": "sha256:9d12a09b9dafb56e2b4f0a08a2cb2a1adb2beb4b67d04823a4f950aee353f513",
-  "route_sha256": "sha256:861f38dcdea311277535af9dfab64d9e5584633f0061b11a597f6e29cfc5a083",
+  "revision": "sha256:254ed68f20a17698de7cdd77c74ae0f663efd9ead0a9d08167daf00065d15b94",
+  "catalog_sha256": "sha256:57082be065cb068b5d8498d16964e985ee9ee3b951078366aeee51d585cc81fa",
+  "route_sha256": "sha256:ca4464219d35a9dd8a968f3d1455dcb4498a4e54ea1d3fe6ff489e4481447ceb",
   "signature": null
 }
