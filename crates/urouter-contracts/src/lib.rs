@@ -420,6 +420,47 @@ mod tests {
         assert_eq!(selection.reason, "cost_preference");
     }
 
+    /// `high_quality` steps up one tier from the floor, it does not jump to the
+    /// most expensive tier. Both properties are asserted here because the
+    /// two-tier case is what makes the change safe to ship today, and the
+    /// three-tier case is the behaviour it exists for.
+    #[test]
+    fn quality_steps_up_one_tier_and_is_unchanged_for_two_tiers() {
+        // Two tiers: stepping up one and taking the last are the same element,
+        // so every shipped route keeps its current behaviour.
+        let mut input = tier_input();
+        input.high_quality = true;
+        let selection = select_tier_with_cascade(&input).unwrap();
+        assert_eq!(selection.index, 1);
+        assert_eq!(selection.reason, "quality_guard");
+
+        // Three tiers: the middle one must be reachable. Taking `last()` here
+        // would buy the most expensive deployment for any quality signal,
+        // however weak.
+        let mut input = tier_input();
+        input.candidates.push(TierCandidate {
+            index: 2,
+            tier: "frontier".to_owned(),
+        });
+        input.high_quality = true;
+        let selection = select_tier_with_cascade(&input).unwrap();
+        assert_eq!(selection.index, 1, "quality must not jump to the top tier");
+        assert_eq!(selection.reason, "quality_guard");
+
+        // The step is measured from the floor, not from index 0.
+        input.floor_index = 1;
+        assert_eq!(select_tier_with_cascade(&input).unwrap().index, 2);
+
+        // A single candidate above the floor still resolves.
+        input.floor_index = 2;
+        assert_eq!(select_tier_with_cascade(&input).unwrap().index, 2);
+
+        // Auxiliary calls still bypass the quality guard entirely.
+        input.floor_index = 0;
+        input.auxiliary = true;
+        assert_eq!(select_tier_with_cascade(&input).unwrap().index, 0);
+    }
+
     #[test]
     fn tier_cascade_rejects_unknown_pin_and_empty_floor() {
         let mut input = tier_input();

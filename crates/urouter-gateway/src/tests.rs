@@ -193,7 +193,7 @@ fn configuration_dry_run_report_pins_revisions_without_credentials() {
             .unwrap()
             .starts_with("sha256:")
     );
-    assert_eq!(report.checks.len(), 18);
+    assert_eq!(report.checks.len(), 19);
     // Look the check up by id: positional indexing silently retargets whenever
     // a check is added to an earlier group.
     let manifest = report
@@ -202,6 +202,64 @@ fn configuration_dry_run_report_pins_revisions_without_credentials() {
         .find(|check| check.id == "catalog_manifest")
         .expect("the catalog manifest check is always reported");
     assert_eq!(manifest.status, DryRunStatus::Pass);
+}
+
+use urouter_gateway::{
+    INTELLIGENCE_SCHEMA_VERSION, IntelligenceConfig, SignalMode, SignalSourceConfig,
+};
+
+/// An enabled-but-inert signal source must be reported, not pass silently.
+///
+/// `shadow` and `on` currently produce nothing — the producers land later — and
+/// that is invisible in the response body. If dry-run said "pass" here, an
+/// operator would read "configured" as "working" and wait for data that never
+/// arrives.
+#[test]
+fn dry_run_reports_intelligence_sources_that_are_enabled_but_inert() {
+    let catalog =
+        CatalogSnapshot::from_json_str(include_str!("../../../catalog/catalog.json")).unwrap();
+    let mut args = Args::parse_from(["urouter-gateway", "--dry-run"]);
+    args.catalog = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../catalog/catalog.json");
+    let status_for = |route: &RouteConfig| {
+        let report = dry_run_report(
+            &args,
+            include_bytes!("../../../catalog/catalog.json"),
+            &catalog,
+            route,
+        );
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "intelligence_signal_sources")
+            .expect("the intelligence check is always reported");
+        (check.status, check.message.clone(), report.valid)
+    };
+
+    let (status, _, valid) = status_for(&route());
+    assert_eq!(status, DryRunStatus::NotApplicable);
+    assert!(valid);
+
+    let mut all_off = route();
+    all_off.intelligence = Some(IntelligenceConfig {
+        schema_version: INTELLIGENCE_SCHEMA_VERSION,
+        ..IntelligenceConfig::default()
+    });
+    assert_eq!(status_for(&all_off).0, DryRunStatus::Pass);
+
+    let mut shadow = route();
+    shadow.intelligence = Some(IntelligenceConfig {
+        schema_version: INTELLIGENCE_SCHEMA_VERSION,
+        trajectory: SignalSourceConfig {
+            mode: SignalMode::Shadow,
+        },
+        intent: SignalSourceConfig::default(),
+    });
+    let (status, message, valid) = status_for(&shadow);
+    assert_eq!(status, DryRunStatus::Warning);
+    assert!(message.contains("trajectory=shadow"), "{message}");
+    assert!(!message.contains("intent"), "{message}");
+    // A warning must not fail the run: the config is legal, just not yet useful.
+    assert!(valid);
 }
 
 #[test]
@@ -272,7 +330,7 @@ fn configuration_dry_run_returns_structured_failure() {
     ]);
     let report = configuration_dry_run(&args);
     assert!(!report.valid);
-    assert_eq!(report.checks.len(), 18);
+    assert_eq!(report.checks.len(), 19);
     assert_eq!(report.errors[0].code, "catalog_read_failed");
     assert!(
         report

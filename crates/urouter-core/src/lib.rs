@@ -139,6 +139,90 @@ pub struct RouteConfig {
     /// operators who never opted into quotas. Empty must encode to nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quota_limits: Vec<QuotaLimit>,
+    /// Opt-in switches for the routing-intelligence signal sources.
+    ///
+    /// Absent — the shipped default — means neither source runs and `decide()`
+    /// behaves exactly as it did before this field existed. `skip_serializing_if`
+    /// is load-bearing for the same reason as [`Self::quota_limits`]: `revision()`
+    /// hashes this struct's serialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intelligence: Option<IntelligenceConfig>,
+}
+
+/// The only `IntelligenceConfig.schema_version` this build understands.
+pub const INTELLIGENCE_SCHEMA_VERSION: u16 = 1;
+
+/// Which routing-intelligence signal sources run, and whether their output is
+/// allowed to change the decision.
+///
+/// The two sources answer different questions and are switched independently
+/// because the evidence for enabling them arrives separately: intent labels
+/// answer "what kind of task is this" and set the tier floor, trajectory
+/// signals answer "how is this run going" and pick a direction within it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntelligenceConfig {
+    pub schema_version: u16,
+    #[serde(default, skip_serializing_if = "SignalSourceConfig::is_off")]
+    pub trajectory: SignalSourceConfig,
+    #[serde(default, skip_serializing_if = "SignalSourceConfig::is_off")]
+    pub intent: SignalSourceConfig,
+}
+
+/// One signal source's switch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignalSourceConfig {
+    #[serde(default)]
+    pub mode: SignalMode,
+}
+
+impl SignalSourceConfig {
+    #[must_use]
+    pub fn is_off(&self) -> bool {
+        self.mode == SignalMode::Off
+    }
+}
+
+/// How far a signal source is allowed to go.
+///
+/// `Shadow` exists because a routing change cannot be evaluated until there is
+/// enough model depth to compare tiers against. It lets the producer run and be
+/// recorded — building the dataset the eventual decision needs — while leaving
+/// the decision itself untouched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalMode {
+    /// The source does not run.
+    #[default]
+    Off,
+    /// The source runs and is recorded, but cannot change the decision.
+    Shadow,
+    /// The source runs, is recorded, and feeds tier selection.
+    On,
+}
+
+impl SignalMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::On => "on",
+        }
+    }
+
+    /// Whether the source should produce output at all.
+    #[must_use]
+    pub const fn produces(self) -> bool {
+        matches!(self, Self::Shadow | Self::On)
+    }
+
+    /// Whether the source's output may change the decision.
+    #[must_use]
+    pub const fn decides(self) -> bool {
+        matches!(self, Self::On)
+    }
 }
 
 /// A reviewed set of semantic rules, published with the Route.
@@ -393,6 +477,59 @@ pub struct RouteDecision {
     pub policy: RoutingPolicyContract,
     pub compatibility_mode: bool,
     pub signals: Vec<SignalContract>,
+    pub intelligence: IntelligenceTrace,
+}
+
+/// What each routing-intelligence source contributed to one decision.
+///
+/// Carries the mode it ran under and, per signal kind, where the value came
+/// from. Recording the *source* is what makes a wrong route diagnosable: it
+/// separates "the gateway inferred this badly" from "the caller declared this
+/// badly", which are different bugs with different owners.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IntelligenceTrace {
+    pub trajectory_mode: SignalMode,
+    pub intent_mode: SignalMode,
+    /// Signal kind to origin. Ordered so the trace is byte-stable across runs.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub signal_sources: BTreeMap<String, SignalOrigin>,
+}
+
+/// Where one signal value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalOrigin {
+    /// The caller sent it in `urouter.signals[]`.
+    Declared,
+    /// Derived from the request by the gateway.
+    Inferred,
+}
+
+impl IntelligenceTrace {
+    /// Opens a trace for one decision.
+    ///
+    /// Called from `RouteConfig::decide` rather than from the Gateway so that
+    /// `urouter-embed`, which goes through the same entry point, cannot drift
+    /// from the Gateway. Parity holds by construction, not by test.
+    #[must_use]
+    fn for_config(config: Option<&IntelligenceConfig>) -> Self {
+        let Some(config) = config else {
+            return Self::default();
+        };
+        Self {
+            trajectory_mode: config.trajectory.mode,
+            intent_mode: config.intent.mode,
+            signal_sources: BTreeMap::new(),
+        }
+    }
+
+    /// Whether any source ran. Used to keep the trace out of the wire format
+    /// entirely when the feature is off.
+    #[must_use]
+    pub fn is_inactive(&self) -> bool {
+        !self.trajectory_mode.produces() && !self.intent_mode.produces()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -422,6 +559,8 @@ pub struct SemanticClassification {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum RouteError {
+    #[error("intelligence schema_version must be 1")]
+    UnsupportedIntelligenceSchema(u16),
     #[error("semantic rule set schema_version must be 1")]
     UnsupportedSemanticRuleSchema(u16),
     #[error("semantic rule id must not be empty")]
@@ -504,10 +643,20 @@ impl RouteConfig {
         QuotaLimitSet::new(self.quota_limits.clone())
     }
 
+    fn validate_intelligence(&self) -> Result<(), RouteError> {
+        match self.intelligence.as_ref() {
+            Some(config) if config.schema_version != INTELLIGENCE_SCHEMA_VERSION => Err(
+                RouteError::UnsupportedIntelligenceSchema(config.schema_version),
+            ),
+            _ => Ok(()),
+        }
+    }
+
     pub fn validate(&self, catalog: &CatalogSnapshot) -> Result<(), RouteError> {
         if self.id.trim().is_empty() || self.tiers.iter().any(|tier| tier.tier.trim().is_empty()) {
             return Err(RouteError::EmptyName);
         }
+        self.validate_intelligence()?;
         // A duplicated (scope, window, dimension) silently loses one of the two
         // values, which is almost always an editing mistake rather than intent.
         if let Some(duplicate) = self.quota_limit_set().duplicates().first() {
@@ -666,6 +815,11 @@ impl RouteConfig {
         Ok(result)
     }
 
+    // Kept as one function on purpose: every step reads state established by
+    // the one before it, so splitting it would mean threading eight borrowed
+    // values through a helper and cloning the contract to satisfy the borrow
+    // checker — strictly worse than the length it would buy back.
+    #[allow(clippy::too_many_lines)]
     pub fn decide(
         &self,
         catalog: &CatalogSnapshot,
@@ -678,6 +832,7 @@ impl RouteConfig {
             .ok_or(RouteError::InvalidRequestModel)?;
         let contract = parse_contract(request)?;
         let compatibility_mode = contract.compatibility_mode();
+        let intelligence = IntelligenceTrace::for_config(self.intelligence.as_ref());
         let (semantic, requirement) = semantic_requirement(request, self.semantic_rules.as_ref())?;
         if requested_model != self.id {
             let requested =
@@ -714,6 +869,7 @@ impl RouteConfig {
                 policy: contract.policy,
                 compatibility_mode,
                 signals: contract.signals,
+                intelligence,
             });
         }
 
@@ -771,6 +927,7 @@ impl RouteConfig {
             policy: contract.policy,
             compatibility_mode,
             signals: contract.signals,
+            intelligence,
         })
     }
 
@@ -1300,11 +1457,16 @@ fn select_tier(
         .transpose()?
         .unwrap_or(0);
     let auxiliary = contract.call.role == Some(CallRole::Auxiliary);
-    let signal_quality = signal_score(
+    // Distress signals: the run is erroring, stalled or searching without
+    // producing. `production_intensity` is deliberately NOT here — it measures
+    // the opposite (writes and edits are landing), so it belongs with the
+    // cost-preference signals below. Keeping it here would send an agent that
+    // is working *well* to the most expensive tier.
+    let signal_quality = signal_score(contract, &["severity", "spinning", "exploring"]) > 500;
+    let signal_low_cost = signal_score(
         contract,
-        &["severity", "spinning", "exploring", "production_intensity"],
+        &["cost_sensitive", "disposable", "production_intensity"],
     ) > 500;
-    let signal_low_cost = signal_score(contract, &["cost_sensitive", "disposable"]) > 500;
     let long_context_quality = route.long_context_quality_threshold_tokens > 0
         && estimated_input_tokens(request) >= route.long_context_quality_threshold_tokens;
     let high_quality = contract.hint.difficulty.as_deref() == Some("hard")
@@ -1914,6 +2076,46 @@ mod tests {
         assert_eq!(decision.cascade_trace[0].reason, "signal_quality");
     }
 
+    /// `production_intensity` measures writes and edits landing — the agent is
+    /// working *well*. It must lower cost, never raise quality.
+    ///
+    /// The four trajectory dimensions are named after Switchyard's stage
+    /// router, where `production_intensity` carries a minus sign in the score.
+    /// It was once grouped with the distress signals here, which inverted it:
+    /// the better an agent was doing, the more expensive a tier it bought.
+    /// This test exists to keep the sign from being lost again.
+    #[test]
+    fn production_intensity_lowers_cost_and_never_raises_quality() {
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "analyze this"}],
+            "urouter": {
+                "signals": [{"kind": "production_intensity", "strength": 0.9}]
+            }
+        });
+        let decision = route().decide(&catalog(), &request).unwrap();
+        assert_eq!(decision.tier, "efficient");
+        assert_eq!(decision.reason, "cost_preference");
+        assert_eq!(decision.cascade_trace[0].rule, "signal_decider");
+        assert_eq!(decision.cascade_trace[0].reason, "signal_low_cost");
+
+        // Distress alongside production still escalates: the quality signal is
+        // evaluated first, so a failing run is not masked by a productive one.
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "analyze this"}],
+            "urouter": {
+                "signals": [
+                    {"kind": "production_intensity", "strength": 0.9},
+                    {"kind": "severity", "strength": 0.9}
+                ]
+            }
+        });
+        let decision = route().decide(&catalog(), &request).unwrap();
+        assert_eq!(decision.tier, "capable");
+        assert_eq!(decision.reason, "quality_guard");
+    }
+
     #[test]
     fn m0_ignores_reserved_and_future_contract_fields() {
         let decision = route()
@@ -2101,6 +2303,91 @@ mod tests {
             route.revision(),
             "sha256:b4518c2fb41ceba05eac7d23520c74d99aee40f1288a2159dcf42cfaf87ac3ec"
         );
+    }
+
+    /// An absent intelligence block must not appear in the serialization, and
+    /// enabling a source must move the revision.
+    ///
+    /// The first half is what lets this field ship without invalidating every
+    /// deployed route; the second is what makes a routing policy change visible
+    /// to revision pinning and the signed manifest.
+    #[test]
+    fn intelligence_config_is_revision_neutral_until_it_is_used() {
+        let mut route: RouteConfig =
+            serde_json::from_str(include_str!("../../../gateway/route.json")).unwrap();
+        let before = route.revision();
+        assert!(route.intelligence.is_none());
+        let encoded = serde_json::to_string(&route).unwrap();
+        assert!(
+            !encoded.contains("intelligence"),
+            "an unused intelligence block must not appear in the serialization: {encoded}"
+        );
+
+        // An all-off block is still an operator statement, but it changes no
+        // behaviour, so it must encode to the schema version alone.
+        route.intelligence = Some(IntelligenceConfig {
+            schema_version: INTELLIGENCE_SCHEMA_VERSION,
+            ..IntelligenceConfig::default()
+        });
+        let all_off = serde_json::to_value(&route).unwrap();
+        assert_eq!(
+            all_off["intelligence"],
+            json!({"schema_version": INTELLIGENCE_SCHEMA_VERSION})
+        );
+        assert_ne!(route.revision(), before);
+
+        // Turning a source on must move it again.
+        let off_revision = route.revision();
+        route.intelligence.as_mut().unwrap().trajectory.mode = SignalMode::Shadow;
+        assert_ne!(route.revision(), off_revision);
+    }
+
+    /// An unknown schema version must be rejected at validation, not silently
+    /// treated as version 1 and interpreted with the wrong semantics.
+    #[test]
+    fn intelligence_schema_version_is_validated() {
+        let mut route = route();
+        route.intelligence = Some(IntelligenceConfig {
+            schema_version: 2,
+            ..IntelligenceConfig::default()
+        });
+        assert_eq!(
+            route.validate(&catalog()),
+            Err(RouteError::UnsupportedIntelligenceSchema(2))
+        );
+        route.intelligence.as_mut().unwrap().schema_version = INTELLIGENCE_SCHEMA_VERSION;
+        assert!(route.validate(&catalog()).is_ok());
+    }
+
+    /// Every mode must leave the decision untouched while no producer exists,
+    /// and the trace must report the configured modes either way.
+    #[test]
+    fn intelligence_modes_do_not_yet_change_the_decision() {
+        let request = json!({
+            "model": "urouter/auto",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let baseline = route().decide(&catalog(), &request).unwrap();
+        assert!(baseline.intelligence.is_inactive());
+
+        for mode in [SignalMode::Off, SignalMode::Shadow, SignalMode::On] {
+            let mut route = route();
+            route.intelligence = Some(IntelligenceConfig {
+                schema_version: INTELLIGENCE_SCHEMA_VERSION,
+                trajectory: SignalSourceConfig { mode },
+                intent: SignalSourceConfig { mode },
+            });
+            let decision = route.decide(&catalog(), &request).unwrap();
+            assert_eq!(decision.tier, baseline.tier, "mode {mode:?} changed the tier");
+            assert_eq!(decision.reason, baseline.reason);
+            assert_eq!(decision.intelligence.trajectory_mode, mode);
+            assert_eq!(decision.intelligence.intent_mode, mode);
+            assert!(
+                decision.intelligence.signal_sources.is_empty(),
+                "no producer is wired up yet"
+            );
+            assert_eq!(decision.intelligence.is_inactive(), mode == SignalMode::Off);
+        }
     }
 
     /// An empty quota limit list must not appear in the serialization at all.

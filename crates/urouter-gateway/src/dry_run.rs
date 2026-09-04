@@ -70,7 +70,7 @@ pub(crate) struct DryRunReport {
     pub(crate) errors: Vec<DryRunError>,
 }
 
-pub(crate) const DRY_RUN_CHECK_IDS: [&str; 18] = [
+pub(crate) const DRY_RUN_CHECK_IDS: [&str; 19] = [
     "cascade_cost_class_order",
     "filter_cost_class_order",
     "artifact_feature_schema",
@@ -89,6 +89,7 @@ pub(crate) const DRY_RUN_CHECK_IDS: [&str; 18] = [
     "cost_override_reason",
     "quota_limit_consistency",
     "quota_scope_topology",
+    "intelligence_signal_sources",
 ];
 
 pub(crate) fn check(
@@ -446,6 +447,7 @@ pub(crate) fn route_dry_run_checks(
         // own number.
         quota_limit_consistency_check(route),
         quota_scope_topology_check(args, route),
+        intelligence_signal_sources_check(route),
     ]
 }
 
@@ -559,6 +561,51 @@ fn quota_scope_topology_check(args: &Args, route: &RouteConfig) -> DryRunCheck {
         DRY_RUN_CHECK_IDS[17],
         DryRunStatus::Pass,
         "cross-tenant quota scopes are served by a single-slot Redis endpoint".to_owned(),
+    )
+}
+
+/// Reports which intelligence signal sources are switched on.
+///
+/// The point of this check is that `shadow` and `on` are indistinguishable from
+/// `off` in the response body — a source with no producer wired up silently
+/// contributes nothing. Without this check an operator who enabled one would
+/// have no way to tell whether it was running, and "configured" would read as
+/// "working". It states plainly what is armed and what is still inert.
+fn intelligence_signal_sources_check(route: &RouteConfig) -> DryRunCheck {
+    let Some(config) = route.intelligence.as_ref() else {
+        return check(
+            19,
+            DRY_RUN_CHECK_IDS[18],
+            DryRunStatus::NotApplicable,
+            "no intelligence signal sources are configured".to_owned(),
+        );
+    };
+    let sources = [
+        ("trajectory", config.trajectory.mode),
+        ("intent", config.intent.mode),
+    ];
+    // Producers land in a later change; until then every non-off mode is inert.
+    let inert: Vec<String> = sources
+        .iter()
+        .filter(|(_, mode)| mode.produces())
+        .map(|(name, mode)| format!("{name}={}", mode.as_str()))
+        .collect();
+    if inert.is_empty() {
+        return check(
+            19,
+            DRY_RUN_CHECK_IDS[18],
+            DryRunStatus::Pass,
+            "all intelligence signal sources are off".to_owned(),
+        );
+    }
+    check(
+        19,
+        DRY_RUN_CHECK_IDS[18],
+        DryRunStatus::Warning,
+        format!(
+            "{} enabled but no producer is wired up yet; these sources contribute nothing",
+            inert.join(", ")
+        ),
     )
 }
 

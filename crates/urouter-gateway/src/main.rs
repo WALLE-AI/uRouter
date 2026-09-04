@@ -61,9 +61,9 @@ use urouter_contracts::{
     summarize_exhaustion, upstream_error_code,
 };
 use urouter_gateway::{
-    CallRole, DataPolicyContract, FallbackCause, MigrationBoundary, RecordingMode, RetryPolicy,
-    RouteConfig, RouteDecision, RouteDeployment, RouteError, SignalContract, TierConfig,
-    UpstreamErrorKind,
+    CallRole, DataPolicyContract, FallbackCause, IntelligenceTrace, MigrationBoundary,
+    RecordingMode, RetryPolicy, RouteConfig, RouteDecision, RouteDeployment, RouteError,
+    SignalContract, TierConfig, UpstreamErrorKind,
     capacity::{CapacityError, CapacityLease, CapacityManager, CooldownPolicy},
     circuit::{
         CircuitPermit, LocalCircuitRepository, RedisCircuitRepository, SharedCircuitRepository,
@@ -467,6 +467,13 @@ struct DecisionRecord {
     vector_ref: Option<VectorRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     exploration: Option<ExplorationRecord>,
+    /// Which intelligence sources ran and where each signal came from.
+    ///
+    /// `None` while both are off, so records written by a deployment that never
+    /// opted in stay byte-identical to the ones written before this field
+    /// existed — replay and the offline pipeline see no change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intelligence: Option<IntelligenceTrace>,
     route_id: String,
     tier: String,
     reason: String,
@@ -2806,6 +2813,9 @@ async fn explain(
                 })
                 .collect::<Vec<_>>(),
         ),
+        // Omitted entirely while both signal sources are off, so an operator who
+        // never opted in sees no new field and no ambiguity about whether it ran.
+        "intelligence": (!decision.intelligence.is_inactive()).then(|| decision.intelligence.clone()),
         "compatibility_mode": governance.compatibility_mode,
         "task_binding_applied": decision.reason == "task_binding",
         "data_policy": {
@@ -7185,6 +7195,7 @@ fn build_record(
         semantic_task,
         vector_ref: record.vector_ref.clone(),
         exploration: record.exploration.clone(),
+        intelligence: (!decision.intelligence.is_inactive()).then(|| decision.intelligence.clone()),
         route_id: decision.route_id,
         tier: decision.tier,
         reason: decision.reason,

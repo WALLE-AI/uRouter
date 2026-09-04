@@ -174,6 +174,18 @@ impl TierRule for QualityRule {
         "quality"
     }
 
+    /// `high_quality` means "the tier we would otherwise take is not enough",
+    /// so this steps up one tier from the floor rather than jumping to the top.
+    ///
+    /// [`DefaultRule`] takes `candidates.first()` — the floor — so the tier
+    /// above it is `candidates.get(1)`. Jumping to `last()` would make every
+    /// middle tier unreachable: any quality signal, however weak, would buy the
+    /// most expensive deployment in the route. That is the opposite of routing
+    /// to the cheapest tier that still clears the bar.
+    ///
+    /// With only two tiers configured `get(1)` and `last()` are the same
+    /// element, so this is behaviour-preserving until a third tier exists; see
+    /// `quality_steps_up_one_tier_and_is_unchanged_for_two_tiers`.
     fn evaluate(
         &self,
         input: &TierDecisionInput,
@@ -182,7 +194,8 @@ impl TierRule for QualityRule {
         Ok((input.high_quality && !input.auxiliary).then(|| {
             (
                 candidates
-                    .last()
+                    .get(1)
+                    .or_else(|| candidates.last())
                     .expect("cascade receives eligible candidates")
                     .index,
                 "quality_guard".to_owned(),
