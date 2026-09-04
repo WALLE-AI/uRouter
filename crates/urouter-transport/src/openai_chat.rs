@@ -40,7 +40,7 @@ impl ProviderTransport for OpenAiChatTransport {
             Value::String(ctx.model.upstream_id.clone()),
         );
         rewrite_compat(object, ctx.model);
-        apply_param_policy(object, &ctx.model.compat.param_policy);
+        apply_param_policy(object, &ctx.param_policy());
         Ok(request)
     }
 

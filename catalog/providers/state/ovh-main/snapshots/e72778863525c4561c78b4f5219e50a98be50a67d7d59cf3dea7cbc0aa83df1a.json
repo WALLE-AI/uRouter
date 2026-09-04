@@ -1,0 +1,512 @@
+{
+  "schema_version": 1,
+  "instance_id": "ovh-main",
+  "vendor": "ovh",
+  "driver": "open_ai_models",
+  "source": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/models",
+  "first_fetched_at_unix": 1788461718,
+  "complete": true,
+  "content_hash": "sha256:e72778863525c4561c78b4f5219e50a98be50a67d7d59cf3dea7cbc0aa83df1a",
+  "models": [
+    {
+      "upstream_id": "Meta-Llama-3_3-70B-Instruct",
+      "raw": {
+        "context_length": 131072,
+        "created": 1743520231,
+        "id": "Meta-Llama-3_3-70B-Instruct",
+        "max_completion_tokens": 131072,
+        "object": "model",
+        "owned_by": "meta-llama",
+        "pricing": {
+          "completion": "0.00000074",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.00000074",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "Mistral-7B-Instruct-v0.3",
+      "raw": {
+        "context_length": 65536,
+        "created": 1743520231,
+        "id": "Mistral-7B-Instruct-v0.3",
+        "max_completion_tokens": 65536,
+        "object": "model",
+        "owned_by": "mistralai",
+        "pricing": {
+          "completion": "0.00000011",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.00000011",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "Mistral-Nemo-Instruct-2407",
+      "raw": {
+        "context_length": 65536,
+        "created": 1732101359,
+        "id": "Mistral-Nemo-Instruct-2407",
+        "max_completion_tokens": 65536,
+        "object": "model",
+        "owned_by": "mistralai",
+        "pricing": {
+          "completion": "0.00000014",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.00000014",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "Mistral-Small-3.2-24B-Instruct-2506",
+      "raw": {
+        "context_length": 131072,
+        "created": 1752655627,
+        "id": "Mistral-Small-3.2-24B-Instruct-2506",
+        "max_completion_tokens": 131072,
+        "object": "model",
+        "owned_by": "mistralai",
+        "pricing": {
+          "completion": "0.00000031",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.0000001",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "Qwen2.5-VL-72B-Instruct",
+      "raw": {
+        "context_length": 32768,
+        "created": 1743423983,
+        "id": "Qwen2.5-VL-72B-Instruct",
+        "max_completion_tokens": 32768,
+        "object": "model",
+        "owned_by": "Qwen",
+        "pricing": {
+          "completion": "0.00000101",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.00000101",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "Qwen3-32B",
+      "raw": {
+        "context_length": 32768,
+        "created": 1752655628,
+        "id": "Qwen3-32B",
+        "max_completion_tokens": 32768,
+        "object": "model",
+        "owned_by": "Qwen",
+        "pricing": {
+          "completion": "0.00000025",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.00000009",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "Qwen3-Coder-30B-A3B-Instruct",
+      "raw": {
+        "context_length": 262144,
+        "created": 1761659893,
+        "id": "Qwen3-Coder-30B-A3B-Instruct",
+        "max_completion_tokens": 262144,
+        "object": "model",
+        "owned_by": "Qwen",
+        "pricing": {
+          "completion": "0.00000026",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.00000007",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "Qwen3-Embedding-8B",
+      "raw": {
+        "context_length": 32768,
+        "created": 1774533326,
+        "id": "Qwen3-Embedding-8B",
+        "max_completion_tokens": 0,
+        "object": "model",
+        "owned_by": "Qwen",
+        "pricing": {
+          "completion": "0",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.00000012",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "Qwen3.5-397B-A17B",
+      "raw": {
+        "context_length": 262144,
+        "created": 1779113482,
+        "id": "Qwen3.5-397B-A17B",
+        "max_completion_tokens": 262144,
+        "object": "model",
+        "owned_by": "Qwen",
+        "pricing": {
+          "completion": "0.00000425",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.00000071",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "Qwen3.5-9B",
+      "raw": {
+        "context_length": 262144,
+        "created": 1776853448,
+        "id": "Qwen3.5-9B",
+        "max_completion_tokens": 262144,
+        "object": "model",
+        "owned_by": "Qwen",
+        "pricing": {
+          "completion": "0.00000018",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.00000012",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "Qwen3.6-27B",
+      "raw": {
+        "context_length": 262144,
+        "created": 1780302734,
+        "id": "Qwen3.6-27B",
+        "max_completion_tokens": 262144,
+        "object": "model",
+        "owned_by": "Qwen",
+        "pricing": {
+          "completion": "0.00000319",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.00000047",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "Qwen3.8-27B",
+      "raw": {
+        "context_length": 262144,
+        "created": 1788356485,
+        "id": "Qwen3.8-27B",
+        "max_completion_tokens": 262144,
+        "object": "model",
+        "owned_by": "Qwen",
+        "pricing": {
+          "completion": "0",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "Qwen3Guard-Gen-0.6B",
+      "raw": {
+        "context_length": 32768,
+        "created": 1769078772,
+        "id": "Qwen3Guard-Gen-0.6B",
+        "max_completion_tokens": 16384,
+        "object": "model",
+        "owned_by": "qwen3guard",
+        "pricing": {
+          "completion": "0",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "Qwen3Guard-Gen-8B",
+      "raw": {
+        "context_length": 32768,
+        "created": 1769078773,
+        "id": "Qwen3Guard-Gen-8B",
+        "max_completion_tokens": 16384,
+        "object": "model",
+        "owned_by": "qwen3guard",
+        "pricing": {
+          "completion": "0",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "bge-m3",
+      "raw": {
+        "context_length": 8192,
+        "created": 1731944050,
+        "id": "bge-m3",
+        "max_completion_tokens": 0,
+        "object": "model",
+        "owned_by": "BAAI",
+        "pricing": {
+          "completion": "0",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.00000001",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "bge-multilingual-gemma2",
+      "raw": {
+        "context_length": 8192,
+        "created": 1742826442,
+        "id": "bge-multilingual-gemma2",
+        "max_completion_tokens": 0,
+        "object": "model",
+        "owned_by": "BAAI",
+        "pricing": {
+          "completion": "0",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.00000001",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "gpt-oss-120b",
+      "raw": {
+        "context_length": 131072,
+        "created": 1756386145,
+        "id": "gpt-oss-120b",
+        "max_completion_tokens": 131072,
+        "object": "model",
+        "owned_by": "OpenAI",
+        "pricing": {
+          "completion": "0.00000047",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.00000009",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "gpt-oss-20b",
+      "raw": {
+        "context_length": 131072,
+        "created": 1756386145,
+        "id": "gpt-oss-20b",
+        "max_completion_tokens": 131072,
+        "object": "model",
+        "owned_by": "OpenAI",
+        "pricing": {
+          "completion": "0.00000018",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0.00000005",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "nvr-tts-de-de",
+      "raw": {
+        "context_length": 0,
+        "created": 1729515876,
+        "id": "nvr-tts-de-de",
+        "max_completion_tokens": 0,
+        "object": "model",
+        "owned_by": "NVIDIA Riva",
+        "pricing": {
+          "completion": "0",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "nvr-tts-en-us",
+      "raw": {
+        "context_length": 0,
+        "created": 1729515876,
+        "id": "nvr-tts-en-us",
+        "max_completion_tokens": 0,
+        "object": "model",
+        "owned_by": "NVIDIA Riva",
+        "pricing": {
+          "completion": "0",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "nvr-tts-es-es",
+      "raw": {
+        "context_length": 0,
+        "created": 1729515876,
+        "id": "nvr-tts-es-es",
+        "max_completion_tokens": 0,
+        "object": "model",
+        "owned_by": "NVIDIA Riva",
+        "pricing": {
+          "completion": "0",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "nvr-tts-it-it",
+      "raw": {
+        "context_length": 0,
+        "created": 1729515876,
+        "id": "nvr-tts-it-it",
+        "max_completion_tokens": 0,
+        "object": "model",
+        "owned_by": "NVIDIA Riva",
+        "pricing": {
+          "completion": "0",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "stable-diffusion-xl-base-v10",
+      "raw": {
+        "context_length": 0,
+        "created": 1730297598,
+        "id": "stable-diffusion-xl-base-v10",
+        "max_completion_tokens": 0,
+        "object": "model",
+        "owned_by": "stabilityai",
+        "pricing": {
+          "completion": "0",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "whisper-large-v3",
+      "raw": {
+        "context_length": 0,
+        "created": 1754992184,
+        "id": "whisper-large-v3",
+        "max_completion_tokens": 0,
+        "object": "model",
+        "owned_by": "OpenAi",
+        "pricing": {
+          "completion": "0",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0",
+          "request": "0"
+        }
+      }
+    },
+    {
+      "upstream_id": "whisper-large-v3-turbo",
+      "raw": {
+        "context_length": 0,
+        "created": 1754992184,
+        "id": "whisper-large-v3-turbo",
+        "max_completion_tokens": 0,
+        "object": "model",
+        "owned_by": "OpenAi",
+        "pricing": {
+          "completion": "0",
+          "currency_unit": "USD",
+          "image": "0",
+          "input_cache_reads": "0",
+          "input_cache_writes": "0",
+          "prompt": "0",
+          "request": "0"
+        }
+      }
+    }
+  ]
+}

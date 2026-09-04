@@ -1,0 +1,25 @@
+{
+  "id": "urouter/auto",
+  "tiers": [
+    {
+      "tier": "free",
+      "model": "aihorde/angelic-eclipse-12b",
+      "fallbacks": [
+        "free-fast"
+      ]
+    },
+    {
+      "tier": "free-fast",
+      "model": "ovh/mistral-7b-instruct-v0.3"
+    }
+  ],
+  "default_preference_bias_millis": 0,
+  "quota_limits": [
+    {
+      "scope": "provider",
+      "window": "minute",
+      "dimension": "requests",
+      "limit": 2
+    }
+  ]
+}

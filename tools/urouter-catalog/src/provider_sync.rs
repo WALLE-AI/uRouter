@@ -49,6 +49,9 @@ pub enum SyncCommand {
         state_dir: PathBuf,
         #[arg(long, default_value_t = 30)]
         timeout_seconds: u64,
+        /// Outbound proxy. Environment proxies are deliberately not inherited.
+        #[arg(long)]
+        proxy: Option<String>,
     },
     /// Compare the latest discovered inventory with the published catalog.
     Status {
@@ -94,6 +97,9 @@ pub enum SyncCommand {
         timeout_seconds: u64,
         #[arg(long, default_value = "catalog/providers/probes")]
         output_dir: PathBuf,
+        /// Outbound proxy. Environment proxies are deliberately not inherited.
+        #[arg(long)]
+        proxy: Option<String>,
     },
     /// Atomically publish a complete reviewed candidate; control manifest commits last.
     Publish {
@@ -506,8 +512,17 @@ pub async fn run_sync(command: SyncCommand, json: bool) -> Result<(), BoxError> 
             instance,
             state_dir,
             timeout_seconds,
+            proxy,
         } => {
-            run_discover(&registry, &instance, &state_dir, timeout_seconds, json).await?;
+            run_discover(
+                &registry,
+                &instance,
+                &state_dir,
+                timeout_seconds,
+                json,
+                proxy.as_deref(),
+            )
+            .await?;
         }
         SyncCommand::Status {
             registry,
@@ -540,6 +555,7 @@ pub async fn run_sync(command: SyncCommand, json: bool) -> Result<(), BoxError> 
             max_output_tokens,
             timeout_seconds,
             output_dir,
+            proxy,
         } => {
             run_probe(
                 &registry,
@@ -551,6 +567,7 @@ pub async fn run_sync(command: SyncCommand, json: bool) -> Result<(), BoxError> 
                 timeout_seconds,
                 &output_dir,
                 json,
+                proxy.as_deref(),
             )
             .await?;
         }
@@ -591,6 +608,7 @@ async fn run_discover(
     state_dir: &Path,
     timeout_seconds: u64,
     json: bool,
+    proxy: Option<&str>,
 ) -> Result<(), BoxError> {
     if timeout_seconds == 0 {
         return Err("timeout_seconds must be greater than zero".into());
@@ -600,10 +618,7 @@ async fn run_discover(
     if !instance.enabled {
         return Err(SyncError::InstanceDisabled(instance.id.clone()).into());
     }
-    let client = Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(timeout_seconds))
-        .build()?;
+    let client = sync_client(timeout_seconds, proxy)?;
     let context = DiscoveryContext {
         client: &client,
         instance,
@@ -854,6 +869,7 @@ async fn run_probe(
     timeout_seconds: u64,
     output_dir: &Path,
     json_output: bool,
+    proxy: Option<&str>,
 ) -> Result<(), BoxError> {
     const PROBE_COUNT: u64 = 4;
     if estimated_request_nano_usd == 0 || max_output_tokens == 0 || timeout_seconds == 0 {
@@ -879,10 +895,7 @@ async fn run_probe(
             env::var(variable).map_err(|_| SyncError::MissingCredential(variable.clone()))
         })
         .transpose()?;
-    let client = Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(timeout_seconds))
-        .build()?;
+    let client = sync_client(timeout_seconds, proxy)?;
     let payloads = probe_payloads(model, max_output_tokens);
     let mut probes = Vec::with_capacity(payloads.len());
     for (capability, payload) in payloads {
@@ -1687,6 +1700,22 @@ fn freellmapi_models(export: &Value, platform: &str) -> Result<Vec<RawProviderMo
         )));
     }
     Ok(out)
+}
+
+/// The HTTP client used for discovery and probing.
+///
+/// Environment proxies are NOT inherited: an operator running behind a proxy
+/// has to say so, the same way the gateway requires `--upstream-proxy`. A tool
+/// that silently routes provider traffic through whatever `https_proxy` happens
+/// to be exported is a tool that can leak a credential to an unexpected hop.
+fn sync_client(timeout_seconds: u64, proxy: Option<&str>) -> Result<Client, SyncError> {
+    let mut builder = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(timeout_seconds));
+    if let Some(url) = proxy {
+        builder = builder.proxy(reqwest::Proxy::all(url)?);
+    }
+    Ok(builder.build()?)
 }
 
 fn endpoint_url(template: &str, query: &BTreeMap<String, String>) -> Result<Url, SyncError> {

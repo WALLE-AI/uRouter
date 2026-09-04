@@ -36,7 +36,7 @@ impl ProviderTransport for OpenAiResponsesTransport {
             .map_err(|error| TransportError::SemanticLoss(error.to_string()))?;
         converted["model"] = ctx.model.upstream_id.clone().into();
         if let Some(object) = converted.as_object_mut() {
-            apply_param_policy(object, &ctx.model.compat.param_policy);
+            apply_param_policy(object, &ctx.param_policy());
         }
         Ok(converted)
     }

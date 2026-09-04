@@ -17,6 +17,8 @@ use urouter_types::{CatalogHash, ModelId, Usage};
 
 mod provider_sync;
 
+mod freellmapi_import;
+
 use provider_sync::{ProviderCommand, SyncCommand};
 
 #[derive(Debug, Parser)]
@@ -124,6 +126,33 @@ enum Command {
         #[command(subcommand)]
         command: ProviderCommand,
     },
+    /// Import a `FreeLLMAPI` provider registry as uRouter catalog providers.
+    ///
+    /// Emits provider entries only. Models are NOT imported: they arrive
+    /// through `sync discover` against each provider's own `/v1/models`, so
+    /// every model fact in the catalog keeps its own provenance.
+    ImportFreellmapi {
+        /// Path to `server/src/providers/index.ts`.
+        #[arg(long)]
+        registry: PathBuf,
+        /// Additional provider source files to scan for `super({ ... })`
+        /// registrations, i.e. the dedicated adapter subclasses.
+        #[arg(long)]
+        adapter_source: Vec<PathBuf>,
+        /// Path to `server/src/lib/sampling-params.ts`.
+        #[arg(long)]
+        policies: Option<PathBuf>,
+        /// Date recorded as `source.checked_at`.
+        #[arg(long)]
+        checked_at: String,
+        /// Merge into this catalog instead of printing the provider array.
+        #[arg(long)]
+        merge_into: Option<PathBuf>,
+        /// Also register discovery instances here, so `sync discover` can fill
+        /// the model pool once credentials exist.
+        #[arg(long)]
+        merge_instances: Option<PathBuf>,
+    },
     /// Discover provider inventories without changing the production catalog.
     Sync {
         #[command(subcommand)]
@@ -140,6 +169,94 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// List catalog models, optionally narrowed by provider or capability.
+fn run_list(
+    path: &std::path::Path,
+    provider: Option<&str>,
+    capability: Option<&str>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = path.to_path_buf();
+    let provider = provider.map(ToOwned::to_owned);
+    let capability = capability.map(ToOwned::to_owned);
+
+            let catalog = load(&path, json)?;
+            let requirement = capability
+                .as_deref()
+                .map(parse_capability)
+                .transpose()?
+                .unwrap_or_default();
+            let admitted = eligible_models(&catalog, &requirement);
+            let models = admitted
+                .eligible
+                .into_iter()
+                .filter(|id| {
+                    let model = catalog.model(id).expect("admission returned a known model");
+                    provider
+                        .as_deref()
+                        .is_none_or(|expected| model.provider.as_str() == expected)
+                })
+                .collect::<Vec<_>>();
+            if json {
+                println!("{}", serde_json::to_string(&models)?);
+            } else {
+                for id in models {
+                    println!("{id}");
+                }
+            }
+    Ok(())
+}
+
+/// Transcribe a `FreeLLMAPI` provider registry into catalog providers and, when
+/// asked, discovery instances.
+fn run_freellmapi_import(
+    registry: &std::path::Path,
+    adapter_sources: &[PathBuf],
+    policies: Option<&std::path::Path>,
+    checked_at: &str,
+    merge_into: Option<&std::path::Path>,
+    merge_instances: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut sources = vec![fs::read_to_string(registry)?];
+    for path in adapter_sources {
+        sources.push(fs::read_to_string(path)?);
+    }
+    let borrowed: Vec<&str> = sources.iter().map(String::as_str).collect();
+    let platforms = freellmapi_import::parse_sources(&borrowed)?;
+    let policy_table = policies
+        .map(fs::read_to_string)
+        .transpose()?
+        .map(|source| freellmapi_import::parse_policies(&source))
+        .unwrap_or_default();
+    let entries = freellmapi_import::to_provider_entries(
+        &platforms,
+        &policy_table,
+        checked_at,
+        &registry.display().to_string(),
+    );
+    match merge_into {
+        Some(path) => {
+            let added = freellmapi_import::merge_into_catalog(path, &entries)?;
+            println!(
+                "imported {} provider(s), {added} new, into {}",
+                entries.len(),
+                path.display()
+            );
+        }
+        None => println!("{}", serde_json::to_string_pretty(&entries)?),
+    }
+    if let Some(path) = merge_instances {
+        let instances = freellmapi_import::to_instance_entries(&platforms);
+        let added = freellmapi_import::merge_into_instances(path, &instances)?;
+        println!(
+            "registered {} discovery instance(s), {added} new, into {}",
+            instances.len(),
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -184,32 +301,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             path,
             provider,
             capability,
-        } => {
-            let catalog = load(&path, json)?;
-            let requirement = capability
-                .as_deref()
-                .map(parse_capability)
-                .transpose()?
-                .unwrap_or_default();
-            let admitted = eligible_models(&catalog, &requirement);
-            let models = admitted
-                .eligible
-                .into_iter()
-                .filter(|id| {
-                    let model = catalog.model(id).expect("admission returned a known model");
-                    provider
-                        .as_deref()
-                        .is_none_or(|expected| model.provider.as_str() == expected)
-                })
-                .collect::<Vec<_>>();
-            if json {
-                println!("{}", serde_json::to_string(&models)?);
-            } else {
-                for id in models {
-                    println!("{id}");
-                }
-            }
-        }
+        } => run_list(&path, provider.as_deref(), capability.as_deref(), json)?,
         Command::Cost { path, model, usage } => {
             let catalog = load(&path, json)?;
             let id = ModelId::new(model)?;
@@ -235,6 +327,21 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&manifest)?);
         }
         Command::Providers { command } => provider_sync::run_provider(command, json)?,
+        Command::ImportFreellmapi {
+            registry,
+            adapter_source,
+            policies,
+            checked_at,
+            merge_into,
+            merge_instances,
+        } => run_freellmapi_import(
+            &registry,
+            &adapter_source,
+            policies.as_deref(),
+            &checked_at,
+            merge_into.as_deref(),
+            merge_instances.as_deref(),
+        )?,
         Command::Sync { command } => provider_sync::run_sync(command, json).await?,
     }
     Ok(())

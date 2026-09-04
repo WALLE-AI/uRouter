@@ -59,73 +59,103 @@
   },
   {
     "model": "openai/gpt-5.6-terra",
-    "usage": { "input": 1 },
+    "usage": {
+      "input": 1
+    },
     "expected_total_nano_usd": 2000,
     "expected_tier_above": null
   },
   {
     "model": "openai/gpt-5.6-terra",
-    "usage": { "output": 1 },
+    "usage": {
+      "output": 1
+    },
     "expected_total_nano_usd": 12000,
     "expected_tier_above": null
   },
   {
     "model": "openai/gpt-5.6-terra",
-    "usage": { "cache_read": 1 },
+    "usage": {
+      "cache_read": 1
+    },
     "expected_total_nano_usd": 200,
     "expected_tier_above": null
   },
   {
     "model": "openai/gpt-5.6-terra",
-    "usage": { "cache_write": 1 },
+    "usage": {
+      "cache_write": 1
+    },
     "expected_total_nano_usd": 2500,
     "expected_tier_above": null
   },
   {
     "model": "openai/gpt-5.6-terra",
-    "usage": { "input": 1000 },
+    "usage": {
+      "input": 1000
+    },
     "expected_total_nano_usd": 2000000,
     "expected_tier_above": null
   },
   {
     "model": "openai/gpt-5.6-terra",
-    "usage": { "output": 1000 },
+    "usage": {
+      "output": 1000
+    },
     "expected_total_nano_usd": 12000000,
     "expected_tier_above": null
   },
   {
     "model": "openai/gpt-5.6-terra",
-    "usage": { "cache_read": 1000 },
+    "usage": {
+      "cache_read": 1000
+    },
     "expected_total_nano_usd": 200000,
     "expected_tier_above": null
   },
   {
     "model": "openai/gpt-5.6-terra",
-    "usage": { "cache_write": 1000 },
+    "usage": {
+      "cache_write": 1000
+    },
     "expected_total_nano_usd": 2500000,
     "expected_tier_above": null
   },
   {
     "model": "openai/gpt-5.6-terra",
-    "usage": { "input": 100, "output": 20, "cache_read": 30, "cache_write": 40 },
+    "usage": {
+      "input": 100,
+      "output": 20,
+      "cache_read": 30,
+      "cache_write": 40
+    },
     "expected_total_nano_usd": 546000,
     "expected_tier_above": null
   },
   {
     "model": "openai/gpt-5.6-terra",
-    "usage": { "cache_read": 272000 },
+    "usage": {
+      "cache_read": 272000
+    },
     "expected_total_nano_usd": 54400000,
     "expected_tier_above": null
   },
   {
     "model": "openai/gpt-5.6-terra",
-    "usage": { "cache_read": 272001 },
+    "usage": {
+      "cache_read": 272001
+    },
     "expected_total_nano_usd": 108800400,
     "expected_tier_above": 272000
   },
   {
     "model": "openai/gpt-5.6-terra",
-    "usage": { "input": 100000, "output": 10000, "cache_read": 100000, "cache_write": 100001 },
+    "usage": {
+      "input": 100000,
+      "output": 10000,
+      "cache_read": 100000,
+      "cache_write": 100001
+    },
     "expected_total_nano_usd": 1120005000,
     "expected_tier_above": 272000
   },
@@ -137,91 +167,132 @@
   },
   {
     "model": "anthropic/claude-sonnet-4-6",
-    "usage": { "input": 1 },
+    "usage": {
+      "input": 1
+    },
     "expected_total_nano_usd": 3000,
     "expected_tier_above": null
   },
   {
     "model": "anthropic/claude-sonnet-4-6",
-    "usage": { "output": 1 },
+    "usage": {
+      "output": 1
+    },
     "expected_total_nano_usd": 15000,
     "expected_tier_above": null
   },
   {
     "model": "anthropic/claude-sonnet-4-6",
-    "usage": { "cache_read": 1 },
+    "usage": {
+      "cache_read": 1
+    },
     "expected_total_nano_usd": 300,
     "expected_tier_above": null
   },
   {
     "model": "anthropic/claude-sonnet-4-6",
-    "usage": { "cache_write": 1 },
+    "usage": {
+      "cache_write": 1
+    },
     "expected_total_nano_usd": 3750,
     "expected_tier_above": null
   },
   {
     "model": "anthropic/claude-sonnet-4-6",
-    "usage": { "cache_write": 1, "cache_write_long": 1 },
+    "usage": {
+      "cache_write": 1,
+      "cache_write_long": 1
+    },
     "expected_total_nano_usd": 6000,
     "expected_tier_above": null
   },
   {
     "model": "anthropic/claude-sonnet-4-6",
-    "usage": { "cache_write": 2, "cache_write_long": 1 },
+    "usage": {
+      "cache_write": 2,
+      "cache_write_long": 1
+    },
     "expected_total_nano_usd": 9750,
     "expected_tier_above": null
   },
   {
     "model": "anthropic/claude-sonnet-4-6",
-    "usage": { "input": 1000 },
+    "usage": {
+      "input": 1000
+    },
     "expected_total_nano_usd": 3000000,
     "expected_tier_above": null
   },
   {
     "model": "anthropic/claude-sonnet-4-6",
-    "usage": { "output": 1000 },
+    "usage": {
+      "output": 1000
+    },
     "expected_total_nano_usd": 15000000,
     "expected_tier_above": null
   },
   {
     "model": "anthropic/claude-sonnet-4-6",
-    "usage": { "cache_read": 1000 },
+    "usage": {
+      "cache_read": 1000
+    },
     "expected_total_nano_usd": 300000,
     "expected_tier_above": null
   },
   {
     "model": "anthropic/claude-sonnet-4-6",
-    "usage": { "cache_write": 1000 },
+    "usage": {
+      "cache_write": 1000
+    },
     "expected_total_nano_usd": 3750000,
     "expected_tier_above": null
   },
   {
     "model": "anthropic/claude-sonnet-4-6",
-    "usage": { "cache_write": 1000, "cache_write_long": 1000 },
+    "usage": {
+      "cache_write": 1000,
+      "cache_write_long": 1000
+    },
     "expected_total_nano_usd": 6000000,
     "expected_tier_above": null
   },
   {
     "model": "anthropic/claude-sonnet-4-6",
-    "usage": { "input": 100, "output": 20, "cache_read": 30, "cache_write": 40, "cache_write_long": 10 },
+    "usage": {
+      "input": 100,
+      "output": 20,
+      "cache_read": 30,
+      "cache_write": 40,
+      "cache_write_long": 10
+    },
     "expected_total_nano_usd": 781500,
     "expected_tier_above": null
   },
   {
     "model": "anthropic/claude-sonnet-4-6",
-    "usage": { "reasoning": 1000 },
+    "usage": {
+      "reasoning": 1000
+    },
     "expected_total_nano_usd": 0,
     "expected_tier_above": null
   },
   {
     "model": "local-vllm/qwen3.5-4b",
-    "usage": { "input": 1000000, "output": 1000000 },
+    "usage": {
+      "input": 1000000,
+      "output": 1000000
+    },
     "expected_total_nano_usd": 0,
     "expected_tier_above": null
   },
   {
-    "model": "local-vllm-qwen38/qwen3.8-27b",
-    "usage": { "input": 262000, "output": 144, "cache_read": 0, "cache_write": 0 },
+    "model": "local-vllm-qwen36/qwen3.6-35b-a3b",
+    "usage": {
+      "input": 262000,
+      "output": 144,
+      "cache_read": 0,
+      "cache_write": 0
+    },
     "expected_total_nano_usd": 0,
     "expected_tier_above": null
   }

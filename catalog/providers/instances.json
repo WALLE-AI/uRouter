@@ -1,453 +1,1067 @@
 {
-  "schema_version": 1,
   "instances": [
     {
-      "id": "siliconflow-main",
-      "vendor": "siliconflow",
       "catalog_provider_id": "siliconflow",
-      "runtime": {
-        "base_url": "https://api.siliconflow.cn/v1",
-        "protocols": [
-          "open_ai_chat"
-        ],
-        "auth_env": "SILICONFLOW_API_KEY"
-      },
+      "credential_scope": "siliconflow-main",
       "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://api.siliconflow.cn/v1/models",
         "auth_env": "SILICONFLOW_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
         "query": {
           "sub_type": "chat",
           "type": "text"
         },
-        "min_request_interval_ms": 250
+        "url": "https://api.siliconflow.cn/v1/models"
       },
-      "credential_scope": "siliconflow-main",
-      "enabled": true
-    },
-    {
-      "id": "bailian-cn-beijing-main",
-      "vendor": "aliyun-bailian",
-      "catalog_provider_id": "bailian-cn-beijing-main",
+      "enabled": true,
+      "id": "siliconflow-main",
       "runtime": {
-        "base_url": "https://${BAILIAN_WORKSPACE_ID}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        "auth_env": "SILICONFLOW_API_KEY",
+        "base_url": "https://api.siliconflow.cn/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "DASHSCOPE_API_KEY"
+        ]
       },
+      "vendor": "siliconflow"
+    },
+    {
+      "catalog_provider_id": "bailian-cn-beijing-main",
+      "credential_scope": "bailian-cn-beijing-main",
       "discovery": {
-        "kind": "bailian_catalog",
-        "url": "https://${BAILIAN_WORKSPACE_ID}.cn-beijing.maas.aliyuncs.com/api/v1/models",
         "auth_env": "DASHSCOPE_API_KEY",
-        "page_size": 100,
+        "kind": "bailian_catalog",
         "max_pages": 100,
+        "min_request_interval_ms": 500,
+        "page_size": 100,
         "query": {
           "language": "zh-CN",
           "supports": "inference"
         },
-        "min_request_interval_ms": 500
+        "url": "https://${BAILIAN_WORKSPACE_ID}.cn-beijing.maas.aliyuncs.com/api/v1/models"
       },
-      "credential_scope": "bailian-cn-beijing-main",
-      "enabled": true
-    },
-    {
-      "id": "ark-cn-beijing-main",
-      "vendor": "volcengine-ark",
-      "catalog_provider_id": "ark-cn-beijing-main",
+      "enabled": true,
+      "id": "bailian-cn-beijing-main",
       "runtime": {
-        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "auth_env": "DASHSCOPE_API_KEY",
+        "base_url": "https://${BAILIAN_WORKSPACE_ID}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "ARK_API_KEY"
+        ]
       },
+      "vendor": "aliyun-bailian"
+    },
+    {
+      "catalog_provider_id": "ark-cn-beijing-main",
+      "credential_scope": "ark-cn-beijing-main",
       "discovery": {
         "kind": "reviewed_static",
         "path": "volcengine-ark/reviewed-models.json"
       },
-      "credential_scope": "ark-cn-beijing-main",
-      "enabled": true
+      "enabled": true,
+      "id": "ark-cn-beijing-main",
+      "runtime": {
+        "auth_env": "ARK_API_KEY",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "volcengine-ark"
     },
     {
-      "id": "deepseek-main",
-      "vendor": "deepseek",
       "catalog_provider_id": "deepseek",
+      "credential_scope": "deepseek-main",
+      "discovery": {
+        "auth_env": "DEEPSEEK_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.deepseek.com/v1/models"
+      },
+      "enabled": false,
+      "id": "deepseek-main",
       "runtime": {
+        "auth_env": "DEEPSEEK_API_KEY",
         "base_url": "https://api.deepseek.com/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "DEEPSEEK_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://api.deepseek.com/v1/models",
-        "auth_env": "DEEPSEEK_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "deepseek-main",
-      "enabled": false
+      "vendor": "deepseek"
     },
     {
-      "id": "zhipu-main",
-      "vendor": "zhipu",
       "catalog_provider_id": "zhipu",
+      "credential_scope": "zhipu-main",
+      "discovery": {
+        "auth_env": "ZHIPU_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://open.bigmodel.cn/api/paas/v4/models"
+      },
+      "enabled": false,
+      "id": "zhipu-main",
       "runtime": {
+        "auth_env": "ZHIPU_API_KEY",
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "ZHIPU_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://open.bigmodel.cn/api/paas/v4/models",
-        "auth_env": "ZHIPU_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "zhipu-main",
-      "enabled": false
+      "vendor": "zhipu"
     },
     {
-      "id": "moonshot-main",
-      "vendor": "moonshot",
       "catalog_provider_id": "moonshot",
+      "credential_scope": "moonshot-main",
+      "discovery": {
+        "auth_env": "MOONSHOT_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.moonshot.cn/v1/models"
+      },
+      "enabled": false,
+      "id": "moonshot-main",
       "runtime": {
+        "auth_env": "MOONSHOT_API_KEY",
         "base_url": "https://api.moonshot.cn/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "MOONSHOT_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://api.moonshot.cn/v1/models",
-        "auth_env": "MOONSHOT_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "moonshot-main",
-      "enabled": false
+      "vendor": "moonshot"
     },
     {
-      "id": "minimax-main",
-      "vendor": "minimax",
       "catalog_provider_id": "minimax",
+      "credential_scope": "minimax-main",
+      "discovery": {
+        "auth_env": "MINIMAX_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.minimax.chat/v1/models"
+      },
+      "enabled": false,
+      "id": "minimax-main",
       "runtime": {
+        "auth_env": "MINIMAX_API_KEY",
         "base_url": "https://api.minimax.chat/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "MINIMAX_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://api.minimax.chat/v1/models",
-        "auth_env": "MINIMAX_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "minimax-main",
-      "enabled": false
+      "vendor": "minimax"
     },
     {
-      "id": "qianfan-main",
-      "vendor": "qianfan",
       "catalog_provider_id": "qianfan",
+      "credential_scope": "qianfan-main",
+      "discovery": {
+        "auth_env": "QIANFAN_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://qianfan.baidubce.com/v2/models"
+      },
+      "enabled": false,
+      "id": "qianfan-main",
       "runtime": {
+        "auth_env": "QIANFAN_API_KEY",
         "base_url": "https://qianfan.baidubce.com/v2",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "QIANFAN_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://qianfan.baidubce.com/v2/models",
-        "auth_env": "QIANFAN_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "qianfan-main",
-      "enabled": false
+      "vendor": "qianfan"
     },
     {
-      "id": "openai-main",
-      "vendor": "openai",
       "catalog_provider_id": "openai",
+      "credential_scope": "openai-main",
+      "discovery": {
+        "auth_env": "OPENAI_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.openai.com/v1/models"
+      },
+      "enabled": false,
+      "id": "openai-main",
       "runtime": {
+        "auth_env": "OPENAI_API_KEY",
         "base_url": "https://api.openai.com/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "OPENAI_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://api.openai.com/v1/models",
-        "auth_env": "OPENAI_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "openai-main",
-      "enabled": false
+      "vendor": "openai"
     },
     {
-      "id": "groq-main",
-      "vendor": "groq",
       "catalog_provider_id": "groq",
+      "credential_scope": "groq-main",
+      "discovery": {
+        "auth_env": "GROQ_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.groq.com/openai/v1/models"
+      },
+      "enabled": false,
+      "id": "groq-main",
       "runtime": {
+        "auth_env": "GROQ_API_KEY",
         "base_url": "https://api.groq.com/openai/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "GROQ_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://api.groq.com/openai/v1/models",
-        "auth_env": "GROQ_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "groq-main",
-      "enabled": false
+      "vendor": "groq"
     },
     {
-      "id": "cerebras-main",
-      "vendor": "cerebras",
       "catalog_provider_id": "cerebras",
+      "credential_scope": "cerebras-main",
+      "discovery": {
+        "auth_env": "CEREBRAS_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.cerebras.ai/v1/models"
+      },
+      "enabled": false,
+      "id": "cerebras-main",
       "runtime": {
+        "auth_env": "CEREBRAS_API_KEY",
         "base_url": "https://api.cerebras.ai/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "CEREBRAS_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://api.cerebras.ai/v1/models",
-        "auth_env": "CEREBRAS_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "cerebras-main",
-      "enabled": false
+      "vendor": "cerebras"
     },
     {
-      "id": "mistral-main",
-      "vendor": "mistral",
       "catalog_provider_id": "mistral",
+      "credential_scope": "mistral-main",
+      "discovery": {
+        "auth_env": "MISTRAL_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.mistral.ai/v1/models"
+      },
+      "enabled": false,
+      "id": "mistral-main",
       "runtime": {
+        "auth_env": "MISTRAL_API_KEY",
         "base_url": "https://api.mistral.ai/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "MISTRAL_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://api.mistral.ai/v1/models",
-        "auth_env": "MISTRAL_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "mistral-main",
-      "enabled": false
+      "vendor": "mistral"
     },
     {
-      "id": "openrouter-main",
-      "vendor": "openrouter",
       "catalog_provider_id": "openrouter",
+      "credential_scope": "openrouter-main",
+      "discovery": {
+        "auth_env": "OPENROUTER_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://openrouter.ai/api/v1/models"
+      },
+      "enabled": false,
+      "id": "openrouter-main",
       "runtime": {
+        "auth_env": "OPENROUTER_API_KEY",
         "base_url": "https://openrouter.ai/api/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "OPENROUTER_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://openrouter.ai/api/v1/models",
-        "auth_env": "OPENROUTER_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "openrouter-main",
-      "enabled": false
+      "vendor": "openrouter"
     },
     {
-      "id": "together-main",
-      "vendor": "together",
       "catalog_provider_id": "together",
+      "credential_scope": "together-main",
+      "discovery": {
+        "auth_env": "TOGETHER_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.together.xyz/v1/models"
+      },
+      "enabled": false,
+      "id": "together-main",
       "runtime": {
+        "auth_env": "TOGETHER_API_KEY",
         "base_url": "https://api.together.xyz/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "TOGETHER_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://api.together.xyz/v1/models",
-        "auth_env": "TOGETHER_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "together-main",
-      "enabled": false
+      "vendor": "together"
     },
     {
-      "id": "fireworks-main",
-      "vendor": "fireworks",
       "catalog_provider_id": "fireworks",
+      "credential_scope": "fireworks-main",
+      "discovery": {
+        "auth_env": "FIREWORKS_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.fireworks.ai/inference/v1/models"
+      },
+      "enabled": false,
+      "id": "fireworks-main",
       "runtime": {
+        "auth_env": "FIREWORKS_API_KEY",
         "base_url": "https://api.fireworks.ai/inference/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "FIREWORKS_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://api.fireworks.ai/inference/v1/models",
-        "auth_env": "FIREWORKS_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "fireworks-main",
-      "enabled": false
+      "vendor": "fireworks"
     },
     {
-      "id": "xai-main",
-      "vendor": "xai",
       "catalog_provider_id": "xai",
+      "credential_scope": "xai-main",
+      "discovery": {
+        "auth_env": "XAI_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.x.ai/v1/models"
+      },
+      "enabled": false,
+      "id": "xai-main",
       "runtime": {
+        "auth_env": "XAI_API_KEY",
         "base_url": "https://api.x.ai/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "XAI_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://api.x.ai/v1/models",
-        "auth_env": "XAI_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "xai-main",
-      "enabled": false
+      "vendor": "xai"
     },
     {
-      "id": "nvidia-main",
-      "vendor": "nvidia",
       "catalog_provider_id": "nvidia",
+      "credential_scope": "nvidia-main",
+      "discovery": {
+        "auth_env": "NVIDIA_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://integrate.api.nvidia.com/v1/models"
+      },
+      "enabled": false,
+      "id": "nvidia-main",
       "runtime": {
+        "auth_env": "NVIDIA_API_KEY",
         "base_url": "https://integrate.api.nvidia.com/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "NVIDIA_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "https://integrate.api.nvidia.com/v1/models",
-        "auth_env": "NVIDIA_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "nvidia-main",
-      "enabled": false
+      "vendor": "nvidia"
     },
     {
-      "id": "vllm-local",
-      "vendor": "local-vllm",
       "catalog_provider_id": "local-vllm",
+      "credential_scope": "vllm-local",
+      "discovery": {
+        "auth_env": "VLLM_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "http://127.0.0.1:8087/v1/models"
+      },
+      "enabled": false,
+      "id": "vllm-local",
       "runtime": {
+        "auth_env": "VLLM_API_KEY",
         "base_url": "http://127.0.0.1:8087/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "VLLM_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "http://127.0.0.1:8087/v1/models",
-        "auth_env": "VLLM_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "vllm-local",
-      "enabled": false
+      "vendor": "local-vllm"
     },
     {
-      "id": "sglang-local",
-      "vendor": "local-sglang",
       "catalog_provider_id": "local-sglang",
+      "credential_scope": "sglang-local",
+      "discovery": {
+        "auth_env": "SGLANG_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "http://127.0.0.1:30000/v1/models"
+      },
+      "enabled": false,
+      "id": "sglang-local",
       "runtime": {
+        "auth_env": "SGLANG_API_KEY",
         "base_url": "http://127.0.0.1:30000/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "SGLANG_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "http://127.0.0.1:30000/v1/models",
-        "auth_env": "SGLANG_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "sglang-local",
-      "enabled": false
+      "vendor": "local-sglang"
     },
     {
-      "id": "ollama-local",
-      "vendor": "local-ollama",
       "catalog_provider_id": "local-ollama",
+      "credential_scope": "ollama-local",
+      "discovery": {
+        "auth_env": "OLLAMA_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "http://127.0.0.1:11434/v1/models"
+      },
+      "enabled": false,
+      "id": "ollama-local",
       "runtime": {
+        "auth_env": "OLLAMA_API_KEY",
         "base_url": "http://127.0.0.1:11434/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "OLLAMA_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "http://127.0.0.1:11434/v1/models",
-        "auth_env": "OLLAMA_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "ollama-local",
-      "enabled": false
+      "vendor": "local-ollama"
     },
     {
-      "id": "lmstudio-local",
-      "vendor": "local-lmstudio",
       "catalog_provider_id": "local-lmstudio",
+      "credential_scope": "lmstudio-local",
+      "discovery": {
+        "auth_env": "LMSTUDIO_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "http://127.0.0.1:1234/v1/models"
+      },
+      "enabled": false,
+      "id": "lmstudio-local",
       "runtime": {
+        "auth_env": "LMSTUDIO_API_KEY",
         "base_url": "http://127.0.0.1:1234/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "LMSTUDIO_API_KEY"
+        ]
       },
-      "discovery": {
-        "kind": "open_ai_models",
-        "url": "http://127.0.0.1:1234/v1/models",
-        "auth_env": "LMSTUDIO_API_KEY",
-        "min_request_interval_ms": 250
-      },
-      "credential_scope": "lmstudio-local",
-      "enabled": false
+      "vendor": "local-lmstudio"
     },
     {
-      "id": "llamacpp-local",
-      "vendor": "local-llamacpp",
       "catalog_provider_id": "local-llamacpp",
+      "credential_scope": "llamacpp-local",
+      "discovery": {
+        "auth_env": "LLAMACPP_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "http://127.0.0.1:8080/v1/models"
+      },
+      "enabled": false,
+      "id": "llamacpp-local",
       "runtime": {
+        "auth_env": "LLAMACPP_API_KEY",
         "base_url": "http://127.0.0.1:8080/v1",
         "protocols": [
           "open_ai_chat"
-        ],
-        "auth_env": "LLAMACPP_API_KEY"
+        ]
       },
+      "vendor": "local-llamacpp"
+    },
+    {
+      "catalog_provider_id": "bai",
+      "credential_scope": "bai-main",
+      "discovery": {
+        "auth_env": "BAI_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.b.ai/v1/models"
+      },
+      "enabled": false,
+      "id": "bai-main",
+      "runtime": {
+        "auth_env": "BAI_API_KEY",
+        "base_url": "https://api.b.ai/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "bai"
+    },
+    {
+      "catalog_provider_id": "anyapi",
+      "credential_scope": "anyapi-main",
+      "discovery": {
+        "auth_env": "ANYAPI_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.anyapi.ai/v1/models"
+      },
+      "enabled": false,
+      "id": "anyapi-main",
+      "runtime": {
+        "auth_env": "ANYAPI_API_KEY",
+        "base_url": "https://api.anyapi.ai/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "anyapi"
+    },
+    {
+      "catalog_provider_id": "github",
+      "credential_scope": "github-main",
+      "discovery": {
+        "auth_env": "GITHUB_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://models.github.ai/inference/models"
+      },
+      "enabled": false,
+      "id": "github-main",
+      "runtime": {
+        "auth_env": "GITHUB_API_KEY",
+        "base_url": "https://models.github.ai/inference",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "github"
+    },
+    {
+      "catalog_provider_id": "huggingface",
+      "credential_scope": "huggingface-main",
+      "discovery": {
+        "auth_env": "HUGGINGFACE_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://router.huggingface.co/v1/models"
+      },
+      "enabled": false,
+      "id": "huggingface-main",
+      "runtime": {
+        "auth_env": "HUGGINGFACE_API_KEY",
+        "base_url": "https://router.huggingface.co/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "huggingface"
+    },
+    {
+      "catalog_provider_id": "ollama",
+      "credential_scope": "ollama-main",
+      "discovery": {
+        "auth_env": "OLLAMA_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://ollama.com/v1/models"
+      },
+      "enabled": false,
+      "id": "ollama-main",
+      "runtime": {
+        "auth_env": "OLLAMA_API_KEY",
+        "base_url": "https://ollama.com/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "ollama"
+    },
+    {
+      "catalog_provider_id": "kilo",
+      "credential_scope": "kilo-main",
       "discovery": {
         "kind": "open_ai_models",
-        "url": "http://127.0.0.1:8080/v1/models",
-        "auth_env": "LLAMACPP_API_KEY",
-        "min_request_interval_ms": 250
+        "min_request_interval_ms": 250,
+        "url": "https://api.kilo.ai/api/gateway/v1/models"
       },
-      "credential_scope": "llamacpp-local",
-      "enabled": false
+      "enabled": true,
+      "id": "kilo-main",
+      "runtime": {
+        "base_url": "https://api.kilo.ai/api/gateway/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "kilo"
+    },
+    {
+      "catalog_provider_id": "llm7",
+      "credential_scope": "llm7-main",
+      "discovery": {
+        "auth_env": "LLM7_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.llm7.io/v1/models"
+      },
+      "enabled": false,
+      "id": "llm7-main",
+      "runtime": {
+        "auth_env": "LLM7_API_KEY",
+        "base_url": "https://api.llm7.io/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "llm7"
+    },
+    {
+      "catalog_provider_id": "opencode",
+      "credential_scope": "opencode-main",
+      "discovery": {
+        "auth_env": "OPENCODE_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://opencode.ai/zen/v1/models"
+      },
+      "enabled": false,
+      "id": "opencode-main",
+      "runtime": {
+        "auth_env": "OPENCODE_API_KEY",
+        "base_url": "https://opencode.ai/zen/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "opencode"
+    },
+    {
+      "catalog_provider_id": "ovh",
+      "credential_scope": "ovh-main",
+      "discovery": {
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/models"
+      },
+      "enabled": true,
+      "id": "ovh-main",
+      "runtime": {
+        "base_url": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "ovh"
+    },
+    {
+      "catalog_provider_id": "agnes",
+      "credential_scope": "agnes-main",
+      "discovery": {
+        "auth_env": "AGNES_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://apihub.agnes-ai.com/v1/models"
+      },
+      "enabled": false,
+      "id": "agnes-main",
+      "runtime": {
+        "auth_env": "AGNES_API_KEY",
+        "base_url": "https://apihub.agnes-ai.com/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "agnes"
+    },
+    {
+      "catalog_provider_id": "reka",
+      "credential_scope": "reka-main",
+      "discovery": {
+        "auth_env": "REKA_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.reka.ai/v1/models"
+      },
+      "enabled": false,
+      "id": "reka-main",
+      "runtime": {
+        "auth_env": "REKA_API_KEY",
+        "base_url": "https://api.reka.ai/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "reka"
+    },
+    {
+      "catalog_provider_id": "routeway",
+      "credential_scope": "routeway-main",
+      "discovery": {
+        "auth_env": "ROUTEWAY_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.routeway.ai/v1/models"
+      },
+      "enabled": false,
+      "id": "routeway-main",
+      "runtime": {
+        "auth_env": "ROUTEWAY_API_KEY",
+        "base_url": "https://api.routeway.ai/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "routeway"
+    },
+    {
+      "catalog_provider_id": "bazaarlink",
+      "credential_scope": "bazaarlink-main",
+      "discovery": {
+        "auth_env": "BAZAARLINK_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://bazaarlink.ai/api/v1/models"
+      },
+      "enabled": false,
+      "id": "bazaarlink-main",
+      "runtime": {
+        "auth_env": "BAZAARLINK_API_KEY",
+        "base_url": "https://bazaarlink.ai/api/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "bazaarlink"
+    },
+    {
+      "catalog_provider_id": "ainative",
+      "credential_scope": "ainative-main",
+      "discovery": {
+        "auth_env": "AINATIVE_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.ainative.studio/api/v1/models"
+      },
+      "enabled": false,
+      "id": "ainative-main",
+      "runtime": {
+        "auth_env": "AINATIVE_API_KEY",
+        "base_url": "https://api.ainative.studio/api/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "ainative"
+    },
+    {
+      "catalog_provider_id": "aion",
+      "credential_scope": "aion-main",
+      "discovery": {
+        "auth_env": "AION_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.aionlabs.ai/v1/models"
+      },
+      "enabled": false,
+      "id": "aion-main",
+      "runtime": {
+        "auth_env": "AION_API_KEY",
+        "base_url": "https://api.aionlabs.ai/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "aion"
+    },
+    {
+      "catalog_provider_id": "requesty",
+      "credential_scope": "requesty-main",
+      "discovery": {
+        "auth_env": "REQUESTY_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://router.requesty.ai/v1/models"
+      },
+      "enabled": false,
+      "id": "requesty-main",
+      "runtime": {
+        "auth_env": "REQUESTY_API_KEY",
+        "base_url": "https://router.requesty.ai/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "requesty"
+    },
+    {
+      "catalog_provider_id": "navy",
+      "credential_scope": "navy-main",
+      "discovery": {
+        "auth_env": "NAVY_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.navy/v1/models"
+      },
+      "enabled": false,
+      "id": "navy-main",
+      "runtime": {
+        "auth_env": "NAVY_API_KEY",
+        "base_url": "https://api.navy/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "navy"
+    },
+    {
+      "catalog_provider_id": "nara",
+      "credential_scope": "nara-main",
+      "discovery": {
+        "auth_env": "NARA_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://router.bynara.id/v1/models"
+      },
+      "enabled": false,
+      "id": "nara-main",
+      "runtime": {
+        "auth_env": "NARA_API_KEY",
+        "base_url": "https://router.bynara.id/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "nara"
+    },
+    {
+      "catalog_provider_id": "sealion",
+      "credential_scope": "sealion-main",
+      "discovery": {
+        "auth_env": "SEALION_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.sea-lion.ai/v1/models"
+      },
+      "enabled": false,
+      "id": "sealion-main",
+      "runtime": {
+        "auth_env": "SEALION_API_KEY",
+        "base_url": "https://api.sea-lion.ai/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "sealion"
+    },
+    {
+      "catalog_provider_id": "orcarouter",
+      "credential_scope": "orcarouter-main",
+      "discovery": {
+        "auth_env": "ORCAROUTER_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.orcarouter.ai/v1/models"
+      },
+      "enabled": false,
+      "id": "orcarouter-main",
+      "runtime": {
+        "auth_env": "ORCAROUTER_API_KEY",
+        "base_url": "https://api.orcarouter.ai/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "orcarouter"
+    },
+    {
+      "catalog_provider_id": "unorouter",
+      "credential_scope": "unorouter-main",
+      "discovery": {
+        "auth_env": "UNOROUTER_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.unorouter.com/v1/models"
+      },
+      "enabled": false,
+      "id": "unorouter-main",
+      "runtime": {
+        "auth_env": "UNOROUTER_API_KEY",
+        "base_url": "https://api.unorouter.com/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "unorouter"
+    },
+    {
+      "catalog_provider_id": "xkiro",
+      "credential_scope": "xkiro-main",
+      "discovery": {
+        "auth_env": "XKIRO_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.xkiro.com/v1/models"
+      },
+      "enabled": false,
+      "id": "xkiro-main",
+      "runtime": {
+        "auth_env": "XKIRO_API_KEY",
+        "base_url": "https://api.xkiro.com/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "xkiro"
+    },
+    {
+      "catalog_provider_id": "volcengine",
+      "credential_scope": "volcengine-main",
+      "discovery": {
+        "auth_env": "VOLCENGINE_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://ark.cn-beijing.volces.com/api/v3/models"
+      },
+      "enabled": false,
+      "id": "volcengine-main",
+      "runtime": {
+        "auth_env": "VOLCENGINE_API_KEY",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "volcengine"
+    },
+    {
+      "catalog_provider_id": "longcat",
+      "credential_scope": "longcat-main",
+      "discovery": {
+        "auth_env": "LONGCAT_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.longcat.chat/openai/v1/models"
+      },
+      "enabled": false,
+      "id": "longcat-main",
+      "runtime": {
+        "auth_env": "LONGCAT_API_KEY",
+        "base_url": "https://api.longcat.chat/openai/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "longcat"
+    },
+    {
+      "catalog_provider_id": "xfyun",
+      "credential_scope": "xfyun-main",
+      "discovery": {
+        "auth_env": "XFYUN_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://spark-api-open.xf-yun.com/v1/models"
+      },
+      "enabled": false,
+      "id": "xfyun-main",
+      "runtime": {
+        "auth_env": "XFYUN_API_KEY",
+        "base_url": "https://spark-api-open.xf-yun.com/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "xfyun"
+    },
+    {
+      "catalog_provider_id": "modelscope",
+      "credential_scope": "modelscope-main",
+      "discovery": {
+        "auth_env": "MODELSCOPE_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api-inference.modelscope.cn/v1/models"
+      },
+      "enabled": false,
+      "id": "modelscope-main",
+      "runtime": {
+        "auth_env": "MODELSCOPE_API_KEY",
+        "base_url": "https://api-inference.modelscope.cn/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "modelscope"
+    },
+    {
+      "catalog_provider_id": "pollinations",
+      "credential_scope": "pollinations-main",
+      "discovery": {
+        "auth_env": "POLLINATIONS_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://gen.pollinations.ai/v1/models"
+      },
+      "enabled": false,
+      "id": "pollinations-main",
+      "runtime": {
+        "auth_env": "POLLINATIONS_API_KEY",
+        "base_url": "https://gen.pollinations.ai/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "pollinations"
+    },
+    {
+      "catalog_provider_id": "google",
+      "credential_scope": "google-main",
+      "discovery": {
+        "auth_env": "GOOGLE_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://generativelanguage.googleapis.com/v1beta/models"
+      },
+      "enabled": false,
+      "id": "google-main",
+      "runtime": {
+        "auth_env": "GOOGLE_API_KEY",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "google"
+    },
+    {
+      "catalog_provider_id": "sail",
+      "credential_scope": "sail-main",
+      "discovery": {
+        "auth_env": "SAIL_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.sailresearch.com/v1/models"
+      },
+      "enabled": false,
+      "id": "sail-main",
+      "runtime": {
+        "auth_env": "SAIL_API_KEY",
+        "base_url": "https://api.sailresearch.com/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "sail"
+    },
+    {
+      "catalog_provider_id": "cohere",
+      "credential_scope": "cohere-main",
+      "discovery": {
+        "auth_env": "COHERE_API_KEY",
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://api.cohere.ai/compatibility/v1/models"
+      },
+      "enabled": false,
+      "id": "cohere-main",
+      "runtime": {
+        "auth_env": "COHERE_API_KEY",
+        "base_url": "https://api.cohere.ai/compatibility/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "cohere"
+    },
+    {
+      "catalog_provider_id": "aihorde",
+      "credential_scope": "aihorde-main",
+      "discovery": {
+        "kind": "open_ai_models",
+        "min_request_interval_ms": 250,
+        "url": "https://oai.aihorde.net/v1/models"
+      },
+      "enabled": false,
+      "id": "aihorde-main",
+      "runtime": {
+        "base_url": "https://oai.aihorde.net/v1",
+        "protocols": [
+          "open_ai_chat"
+        ]
+      },
+      "vendor": "aihorde"
     }
-  ]
+  ],
+  "schema_version": 1
 }

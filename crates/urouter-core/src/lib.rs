@@ -1973,7 +1973,7 @@ mod tests {
             .decide(
                 &catalog(),
                 &json!({
-                    "model": "local-vllm-qwen38/qwen3.8-27b",
+                    "model": "local-vllm-qwen36/qwen3.6-35b-a3b",
                     "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]
                 }),
             )
@@ -2040,7 +2040,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(decision.tier, "efficient");
-        let capable = ModelId::new("local-vllm-qwen38/qwen3.8-27b").unwrap();
+        let capable = ModelId::new("local-vllm-qwen36/qwen3.6-35b-a3b").unwrap();
         let bound = route.bind_decision(&catalog, decision, &capable).unwrap();
         assert_eq!(bound.tier, "capable");
         assert_eq!(bound.model, capable);
@@ -2099,7 +2099,7 @@ mod tests {
             serde_json::from_str(include_str!("../../../gateway/route.json")).unwrap();
         assert_eq!(
             route.revision(),
-            "sha256:c272ed069b6b4360a9e3cb3d4a1b42799b14a10675a4d11bd4d5d8f021532fe0"
+            "sha256:b4518c2fb41ceba05eac7d23520c74d99aee40f1288a2159dcf42cfaf87ac3ec"
         );
     }
 

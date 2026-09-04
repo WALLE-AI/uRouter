@@ -4,11 +4,13 @@
     {
       "tier": "efficient",
       "model": "local-vllm/qwen3.5-4b",
-      "fallbacks": ["capable"]
+      "fallbacks": [
+        "capable"
+      ]
     },
     {
       "tier": "capable",
-      "model": "local-vllm-qwen38/qwen3.8-27b"
+      "model": "local-vllm-qwen36/qwen3.6-35b-a3b"
     }
   ],
   "default_preference_bias_millis": 0

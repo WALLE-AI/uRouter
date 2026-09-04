@@ -57,7 +57,7 @@ x-urouter-reason: default_efficient
 x-urouter-source: model
 x-urouter-degraded: false
 x-urouter-compatibility-mode: true
-x-urouter-alternatives: local-vllm-qwen38/qwen3.8-27b
+x-urouter-alternatives: local-vllm-qwen36/qwen3.6-35b-a3b
 ```
 
 ### 3. 不发请求也能看路由决策

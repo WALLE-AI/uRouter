@@ -80,6 +80,38 @@ impl ParamPolicy {
     pub fn is_noop(&self) -> bool {
         self == &Self::default()
     }
+
+    /// Layer a model policy over its provider's.
+    ///
+    /// Drops and renames UNION: a provider-wide "this upstream rejects
+    /// logprobs" is not something one of its models can opt out of, so the two
+    /// sets add rather than replace. Scalars take the model's value when it
+    /// states one, because a per-model cap is by definition more specific than
+    /// the provider default it narrows.
+    #[must_use]
+    pub fn merged_over(&self, provider: &Self) -> Self {
+        let mut drop = provider.drop.clone();
+        for key in &self.drop {
+            if !drop.contains(key) {
+                drop.push(key.clone());
+            }
+        }
+        let mut rename = provider.rename.clone();
+        rename.extend(self.rename.clone());
+        Self {
+            drop,
+            rename,
+            json_object_to_schema: self.json_object_to_schema || provider.json_object_to_schema,
+            default_max_tokens: self.default_max_tokens.or(provider.default_max_tokens),
+            // The TIGHTER cap wins: both bounds are real limits, and exceeding
+            // either is a 400.
+            max_tokens_cap: match (self.max_tokens_cap, provider.max_tokens_cap) {
+                (Some(model), Some(provider)) => Some(model.min(provider)),
+                (model, provider) => model.or(provider),
+            },
+            force_single_tool_call: self.force_single_tool_call || provider.force_single_tool_call,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -18,7 +18,7 @@ The route is configured in `gateway/route.json`:
 | Tier | Catalog model | Local endpoint |
 |---|---|---|
 | `efficient` | `local-vllm/qwen3.5-4b` | `127.0.0.1:8087` |
-| `capable` | `local-vllm-qwen38/qwen3.8-27b` | `127.0.0.1:19121/starvlm` |
+| `capable` | `local-vllm-qwen36/qwen3.6-35b-a3b` | `127.0.0.1:19121/starvlm` |
 
 ## Run
 

@@ -6,8 +6,8 @@ use thiserror::Error;
 use urouter_types::{CatalogHash, ModelId, ProviderId, WireApi};
 
 use crate::{
-    auth::AuthSpec, capabilities::Capabilities, compat::Compat, endpoint::EndpointPlan,
-    pricing::ModelCost,
+    auth::AuthSpec, capabilities::Capabilities, compat::Compat, compat::ParamPolicy,
+    endpoint::EndpointPlan, pricing::ModelCost,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +50,22 @@ pub struct ProviderSpec {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Request quirks that apply to every model of this provider.
+    ///
+    /// Quirks are overwhelmingly a PROVIDER property — "Mistral 422s on unknown
+    /// keys", "GitHub Models caps `max_tokens` at 400" — not a per-model one. A
+    /// model may still narrow it further via `Compat::param_policy`; the two are
+    /// merged with the model winning.
+    #[serde(default)]
+    pub param_policy: ParamPolicy,
+    /// Per-provider request timeout. `None` uses the gateway default.
+    ///
+    /// One global timeout cannot serve both a sub-second edge inference API and
+    /// a queue-based volunteer network that legitimately takes minutes: the
+    /// short bound makes the slow provider permanently unusable, and the long
+    /// one makes a dead fast provider hold a lease for minutes.
+    #[serde(default)]
+    pub timeout_millis: Option<u64>,
     pub source: SourceMeta,
 }
 

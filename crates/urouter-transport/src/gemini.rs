@@ -83,9 +83,7 @@ impl ProviderTransport for GeminiTransport {
             .and_then(Value::as_u64)
         {
             let bound = ctx
-                .model
-                .compat
-                .param_policy
+                .param_policy()
                 .max_tokens_cap
                 .map_or(bound, |cap| bound.min(cap));
             generation.insert("maxOutputTokens".to_owned(), json!(bound));

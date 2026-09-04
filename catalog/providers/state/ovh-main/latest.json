@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "instance_id": "ovh-main",
+  "content_hash": "sha256:e72778863525c4561c78b4f5219e50a98be50a67d7d59cf3dea7cbc0aa83df1a",
+  "snapshot": "snapshots/e72778863525c4561c78b4f5219e50a98be50a67d7d59cf3dea7cbc0aa83df1a.json",
+  "last_fetched_at_unix": 1788461718,
+  "models": 25
+}

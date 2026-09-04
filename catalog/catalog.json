@@ -1,394 +1,1264 @@
 {
-  "schema_version": 1,
-  "providers": [
-    {
-      "id": "anthropic",
-      "name": "Anthropic",
-      "base_url": "https://api.anthropic.com/v1",
-      "built_in": true,
-      "auth": { "kind": "api_key_env", "env": "ANTHROPIC_API_KEY", "header": "x-api-key", "prefix": "" },
-      "headers": { "anthropic-version": "2023-06-01" },
-      "source": {
-        "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
-        "checked_at": "2026-08-25",
-        "confidence": "official"
-      }
-    },
-    {
-      "id": "local-fixture",
-      "name": "Local OpenAI-compatible Fixture",
-      "base_url": "http://127.0.0.1:{PORT}/v1",
-      "built_in": false,
-      "auth": { "kind": "none" },
-      "env": { "PORT": "8000" },
-      "source": {
-        "source": "fixture://local-openai-compatible",
-        "checked_at": "2026-08-25",
-        "confidence": "verified"
-      }
-    },
-    {
-      "id": "local-vllm",
-      "name": "Local vLLM on port 8087",
-      "base_url": "http://127.0.0.1:8087/v1",
-      "built_in": false,
-      "auth": { "kind": "none" },
-      "source": {
-        "source": "smoke://127.0.0.1:8087/v1/models",
-        "checked_at": "2026-08-26",
-        "confidence": "verified"
-      }
-    },
-    {
-      "id": "local-vllm-qwen38",
-      "name": "Local Qwen3.8-27B vLLM",
-      "base_url": "http://127.0.0.1:19121/starvlm/v1",
-      "built_in": false,
-      "auth": { "kind": "none" },
-      "source": {
-        "source": "smoke://127.0.0.1:19121/starvlm/v1/models",
-        "checked_at": "2026-08-26",
-        "confidence": "verified"
-      }
-    },
-    {
-      "id": "openai",
-      "name": "OpenAI",
-      "base_url": "https://api.openai.com/v1",
-      "built_in": true,
-      "auth": { "kind": "api_key_env", "env": "OPENAI_API_KEY" },
-      "source": {
-        "source": "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
-        "checked_at": "2026-08-25",
-        "confidence": "official"
-      }
-    },
-    {
-      "id": "siliconflow",
-      "name": "SiliconFlow",
-      "base_url": "https://api.siliconflow.cn/v1",
-      "built_in": false,
-      "auth": { "kind": "api_key_env", "env": "SILICONFLOW_API_KEY" },
-      "source": {
-        "source": "https://docs.siliconflow.cn/docs/userguide/quickstart",
-        "checked_at": "2026-08-29",
-        "confidence": "official"
-      }
-    }
-  ],
   "models": [
     {
-      "id": "anthropic/claude-sonnet-4-6",
-      "upstream_id": "claude-sonnet-4-6",
-      "name": "Claude Sonnet 4.6",
-      "provider": "anthropic",
+      "aliases": [
+        "claude-sonnet-4-6"
+      ],
       "api": "anthropic_messages",
       "base_url": null,
-      "cost": {
-        "base": { "input": "3", "output": "15", "cache_read": "0.3", "cache_write": "3.75" },
-        "tiers": [],
-        "long_cache_write": { "input_multiplier_millis": 2000 }
-      },
       "capabilities": {
         "context_window": 1000000,
+        "input_modalities": [
+          "text",
+          "image"
+        ],
         "max_output_tokens": 64000,
-        "input_modalities": ["text", "image"],
-        "tool_calling": true,
-        "structured_output": true,
-        "reasoning": "token_budget",
         "prompt_cache": {
           "enabled": true,
+          "explicit_control": true,
           "min_cacheable_tokens": 1024,
           "retention": "provider_default",
-          "explicit_control": true,
           "session_affinity_header": null
-        }
+        },
+        "reasoning": "token_budget",
+        "structured_output": true,
+        "tool_calling": true
       },
       "compat": {
         "max_tokens_field": "max_output_tokens",
-        "supports_usage_in_streaming": true,
-        "supports_finish_reason": true,
-        "supports_developer_role": false,
-        "tool_call_format": "anthropic",
         "structured_output_format": "tool_call",
-        "thinking_format": "anthropic_budget"
+        "supports_developer_role": false,
+        "supports_finish_reason": true,
+        "supports_usage_in_streaming": true,
+        "thinking_format": "anthropic_budget",
+        "tool_call_format": "anthropic"
       },
-      "aliases": ["claude-sonnet-4-6"],
+      "cost": {
+        "base": {
+          "cache_read": "0.3",
+          "cache_write": "3.75",
+          "input": "3",
+          "output": "15"
+        },
+        "long_cache_write": {
+          "input_multiplier_millis": 2000
+        },
+        "tiers": []
+      },
+      "id": "anthropic/claude-sonnet-4-6",
       "lifecycle": "active",
+      "name": "Claude Sonnet 4.6",
+      "provider": "anthropic",
       "source": {
-        "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
         "checked_at": "2026-08-25",
-        "confidence": "official"
-      }
+        "confidence": "official",
+        "source": "https://platform.claude.com/docs/en/about-claude/models/overview"
+      },
+      "upstream_id": "claude-sonnet-4-6"
     },
     {
+      "aliases": [
+        "local/efficient"
+      ],
+      "api": "open_ai_chat",
+      "base_url": null,
+      "capabilities": {
+        "context_window": 32768,
+        "input_modalities": [
+          "text"
+        ],
+        "max_output_tokens": 8192,
+        "prompt_cache": {
+          "enabled": false,
+          "explicit_control": false,
+          "min_cacheable_tokens": 0,
+          "retention": "provider_default",
+          "session_affinity_header": null
+        },
+        "reasoning": "unsupported",
+        "structured_output": false,
+        "tool_calling": true
+      },
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "structured_output_format": "none",
+        "supports_developer_role": false,
+        "supports_finish_reason": true,
+        "supports_usage_in_streaming": false,
+        "thinking_format": "none",
+        "tool_call_format": "open_ai"
+      },
+      "cost": {
+        "base": {
+          "cache_read": "0",
+          "cache_write": "0",
+          "input": "0",
+          "output": "0"
+        },
+        "long_cache_write": null,
+        "tiers": []
+      },
       "id": "local-fixture/efficient",
-      "upstream_id": "fixture-efficient",
+      "lifecycle": "active",
       "name": "Local Efficient Fixture",
       "provider": "local-fixture",
-      "api": "open_ai_chat",
-      "base_url": null,
-      "cost": {
-        "base": { "input": "0", "output": "0", "cache_read": "0", "cache_write": "0" },
-        "tiers": [],
-        "long_cache_write": null
-      },
-      "capabilities": {
-        "context_window": 32768,
-        "max_output_tokens": 8192,
-        "input_modalities": ["text"],
-        "tool_calling": true,
-        "structured_output": false,
-        "reasoning": "unsupported",
-        "prompt_cache": {
-          "enabled": false,
-          "min_cacheable_tokens": 0,
-          "retention": "provider_default",
-          "explicit_control": false,
-          "session_affinity_header": null
-        }
-      },
-      "compat": {
-        "max_tokens_field": "max_tokens",
-        "supports_usage_in_streaming": false,
-        "supports_finish_reason": true,
-        "supports_developer_role": false,
-        "tool_call_format": "open_ai",
-        "structured_output_format": "none",
-        "thinking_format": "none"
-      },
-      "aliases": ["local/efficient"],
-      "lifecycle": "active",
       "source": {
-        "source": "fixture://local/efficient",
         "checked_at": "2026-08-25",
-        "confidence": "verified"
-      }
+        "confidence": "verified",
+        "source": "fixture://local/efficient"
+      },
+      "upstream_id": "fixture-efficient"
     },
     {
-      "id": "local-vllm/qwen3.5-4b",
-      "upstream_id": "Qwen3.5-4B",
-      "name": "Qwen3.5 4B (local vLLM)",
-      "provider": "local-vllm",
+      "aliases": [
+        "qwen3.5-4b",
+        "local/qwen3.5-4b"
+      ],
       "api": "open_ai_chat",
       "base_url": null,
-      "cost": {
-        "base": { "input": "0", "output": "0", "cache_read": "0", "cache_write": "0" },
-        "tiers": [],
-        "long_cache_write": null
-      },
       "capabilities": {
         "context_window": 16384,
+        "input_modalities": [
+          "text"
+        ],
         "max_output_tokens": 16384,
-        "input_modalities": ["text"],
-        "tool_calling": false,
-        "structured_output": true,
-        "reasoning": "unsupported",
         "prompt_cache": {
           "enabled": false,
+          "explicit_control": false,
           "min_cacheable_tokens": 0,
           "retention": "provider_default",
-          "explicit_control": false,
           "session_affinity_header": null
-        }
+        },
+        "reasoning": "unsupported",
+        "structured_output": true,
+        "tool_calling": false
       },
       "compat": {
         "max_tokens_field": "max_tokens",
-        "supports_usage_in_streaming": true,
-        "supports_finish_reason": true,
-        "supports_developer_role": false,
-        "tool_call_format": "none",
         "structured_output_format": "json_schema",
-        "thinking_format": { "custom": "plaintext_content" }
+        "supports_developer_role": false,
+        "supports_finish_reason": true,
+        "supports_usage_in_streaming": true,
+        "thinking_format": {
+          "custom": "plaintext_content"
+        },
+        "tool_call_format": "none"
       },
-      "aliases": ["qwen3.5-4b", "local/qwen3.5-4b"],
+      "cost": {
+        "base": {
+          "cache_read": "0",
+          "cache_write": "0",
+          "input": "0",
+          "output": "0"
+        },
+        "long_cache_write": null,
+        "tiers": []
+      },
+      "id": "local-vllm/qwen3.5-4b",
       "lifecycle": "active",
+      "name": "Qwen3.5 4B (local vLLM)",
+      "provider": "local-vllm",
       "source": {
-        "source": "smoke://127.0.0.1:8087/v1/chat/completions",
         "checked_at": "2026-08-26",
-        "confidence": "verified"
-      }
+        "confidence": "verified",
+        "source": "smoke://127.0.0.1:8087/v1/chat/completions"
+      },
+      "upstream_id": "Qwen3.5-4B"
     },
     {
-      "id": "local-vllm-qwen38/qwen3.8-27b",
-      "upstream_id": "Qwen3.8-27B",
-      "name": "Qwen3.8 27B (local vLLM)",
-      "provider": "local-vllm-qwen38",
+      "aliases": [
+        "qwen3.6-35b-a3b",
+        "local/qwen3.6-35b-a3b"
+      ],
       "api": "open_ai_chat",
       "base_url": null,
-      "cost": {
-        "base": { "input": "0", "output": "0", "cache_read": "0", "cache_write": "0" },
-        "tiers": [],
-        "long_cache_write": null
-      },
       "capabilities": {
         "context_window": 262144,
+        "input_modalities": [
+          "text",
+          "image"
+        ],
         "max_output_tokens": 262144,
-        "input_modalities": ["text", "image"],
-        "tool_calling": true,
-        "structured_output": true,
-        "reasoning": "boolean",
         "prompt_cache": {
           "enabled": false,
+          "explicit_control": false,
           "min_cacheable_tokens": 0,
           "retention": "provider_default",
-          "explicit_control": false,
           "session_affinity_header": null
-        }
+        },
+        "reasoning": "boolean",
+        "structured_output": true,
+        "tool_calling": true
       },
       "compat": {
         "max_tokens_field": "max_tokens",
-        "supports_usage_in_streaming": true,
-        "supports_finish_reason": true,
-        "supports_developer_role": false,
-        "tool_call_format": "open_ai",
         "structured_output_format": "json_schema",
-        "thinking_format": { "custom": "qwen3_reasoning_field" }
+        "supports_developer_role": false,
+        "supports_finish_reason": true,
+        "supports_usage_in_streaming": true,
+        "thinking_format": {
+          "custom": "qwen3_reasoning_field"
+        },
+        "tool_call_format": "open_ai"
       },
-      "aliases": ["qwen3.8-27b", "local/qwen3.8-27b"],
+      "cost": {
+        "base": {
+          "cache_read": "0",
+          "cache_write": "0",
+          "input": "0",
+          "output": "0"
+        },
+        "long_cache_write": null,
+        "tiers": []
+      },
+      "id": "local-vllm-qwen36/qwen3.6-35b-a3b",
       "lifecycle": "active",
+      "name": "Qwen3.6 35B-A3B (local vLLM)",
+      "provider": "local-vllm-qwen36",
       "source": {
-        "source": "smoke://127.0.0.1:19121/starvlm/v1/chat/completions",
-        "checked_at": "2026-08-26",
-        "confidence": "verified"
-      }
+        "checked_at": "2026-09-03",
+        "confidence": "verified",
+        "source": "smoke://127.0.0.1:19121/starvlm/v1/chat/completions"
+      },
+      "upstream_id": "Qwen3.6-35B-A3B"
     },
     {
+      "aliases": [
+        "siliconflow/qwen2.5-7b"
+      ],
+      "api": "open_ai_chat",
+      "base_url": null,
+      "capabilities": {
+        "context_window": 32768,
+        "input_modalities": [
+          "text"
+        ],
+        "max_output_tokens": 8192,
+        "prompt_cache": {
+          "enabled": false,
+          "explicit_control": false,
+          "min_cacheable_tokens": 0,
+          "retention": "provider_default",
+          "session_affinity_header": null
+        },
+        "reasoning": "unsupported",
+        "structured_output": false,
+        "tool_calling": false
+      },
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "structured_output_format": "none",
+        "supports_developer_role": false,
+        "supports_finish_reason": true,
+        "supports_usage_in_streaming": false,
+        "thinking_format": "none",
+        "tool_call_format": "none"
+      },
+      "cost": {
+        "base": {
+          "cache_read": "0",
+          "cache_write": "0",
+          "input": "0",
+          "output": "0"
+        },
+        "long_cache_write": null,
+        "tiers": []
+      },
       "id": "siliconflow/qwen2.5-7b-instruct",
-      "upstream_id": "Qwen/Qwen2.5-7B-Instruct",
+      "lifecycle": "active",
       "name": "Qwen 2.5 7B Instruct (SiliconFlow)",
       "provider": "siliconflow",
+      "source": {
+        "checked_at": "2026-08-29",
+        "confidence": "verified",
+        "source": "https://www2.siliconflow.cn/pricing"
+      },
+      "upstream_id": "Qwen/Qwen2.5-7B-Instruct"
+    },
+    {
+      "aliases": [
+        "siliconflow/deepseek-r1"
+      ],
       "api": "open_ai_chat",
       "base_url": null,
-      "cost": {
-        "base": { "input": "0", "output": "0", "cache_read": "0", "cache_write": "0" },
-        "tiers": [],
-        "long_cache_write": null
-      },
       "capabilities": {
         "context_window": 32768,
+        "input_modalities": [
+          "text"
+        ],
         "max_output_tokens": 8192,
-        "input_modalities": ["text"],
-        "tool_calling": false,
-        "structured_output": false,
-        "reasoning": "unsupported",
         "prompt_cache": {
           "enabled": false,
+          "explicit_control": false,
           "min_cacheable_tokens": 0,
           "retention": "provider_default",
-          "explicit_control": false,
           "session_affinity_header": null
-        }
+        },
+        "reasoning": "boolean",
+        "structured_output": false,
+        "tool_calling": true
       },
       "compat": {
         "max_tokens_field": "max_tokens",
-        "supports_usage_in_streaming": false,
-        "supports_finish_reason": true,
-        "supports_developer_role": false,
-        "tool_call_format": "none",
         "structured_output_format": "none",
-        "thinking_format": "none"
+        "supports_developer_role": false,
+        "supports_finish_reason": true,
+        "supports_usage_in_streaming": false,
+        "thinking_format": {
+          "custom": "reasoning_content"
+        },
+        "tool_call_format": "open_ai"
       },
-      "aliases": ["siliconflow/qwen2.5-7b"],
-      "lifecycle": "active",
-      "source": {
-        "source": "https://www2.siliconflow.cn/pricing",
-        "checked_at": "2026-08-29",
-        "confidence": "verified"
-      }
-    },
-    {
+      "cost": {
+        "base": {
+          "cache_read": "0.589875",
+          "cache_write": "0.589875",
+          "input": "0.589875",
+          "output": "2.3595"
+        },
+        "long_cache_write": null,
+        "tiers": []
+      },
       "id": "siliconflow/deepseek-r1-pro",
-      "upstream_id": "Pro/deepseek-ai/DeepSeek-R1",
+      "lifecycle": "active",
       "name": "DeepSeek R1 Pro (SiliconFlow)",
       "provider": "siliconflow",
-      "api": "open_ai_chat",
-      "base_url": null,
-      "cost": {
-        "base": { "input": "0.589875", "output": "2.3595", "cache_read": "0.589875", "cache_write": "0.589875" },
-        "tiers": [],
-        "long_cache_write": null
-      },
-      "capabilities": {
-        "context_window": 32768,
-        "max_output_tokens": 8192,
-        "input_modalities": ["text"],
-        "tool_calling": true,
-        "structured_output": false,
-        "reasoning": "boolean",
-        "prompt_cache": {
-          "enabled": false,
-          "min_cacheable_tokens": 0,
-          "retention": "provider_default",
-          "explicit_control": false,
-          "session_affinity_header": null
-        }
-      },
-      "compat": {
-        "max_tokens_field": "max_tokens",
-        "supports_usage_in_streaming": false,
-        "supports_finish_reason": true,
-        "supports_developer_role": false,
-        "tool_call_format": "open_ai",
-        "structured_output_format": "none",
-        "thinking_format": { "custom": "reasoning_content" }
-      },
-      "aliases": ["siliconflow/deepseek-r1"],
-      "lifecycle": "active",
       "source": {
-        "source": "override://siliconflow/deepseek-r1-pro?cny_per_usd=6.7811",
         "checked_at": "2026-08-29",
-        "confidence": "override"
-      }
+        "confidence": "override",
+        "source": "override://siliconflow/deepseek-r1-pro?cny_per_usd=6.7811"
+      },
+      "upstream_id": "Pro/deepseek-ai/DeepSeek-R1"
     },
     {
-      "id": "openai/gpt-5.6-terra",
-      "upstream_id": "gpt-5.6-terra",
-      "name": "GPT-5.6 Terra",
-      "provider": "openai",
+      "aliases": [
+        "gpt-5.6-terra"
+      ],
       "api": "open_ai_responses",
       "base_url": null,
+      "capabilities": {
+        "context_window": 1050000,
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "max_output_tokens": 128000,
+        "prompt_cache": {
+          "enabled": true,
+          "explicit_control": false,
+          "min_cacheable_tokens": 1024,
+          "retention": "provider_default",
+          "session_affinity_header": null
+        },
+        "reasoning": {
+          "levels": [
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        "structured_output": true,
+        "tool_calling": true
+      },
+      "compat": {
+        "max_tokens_field": "max_output_tokens",
+        "structured_output_format": "json_schema",
+        "supports_developer_role": true,
+        "supports_finish_reason": true,
+        "supports_usage_in_streaming": true,
+        "thinking_format": "open_ai_effort",
+        "tool_call_format": "open_ai"
+      },
       "cost": {
-        "base": { "input": "2", "output": "12", "cache_read": "0.2", "cache_write": "2.5" },
+        "base": {
+          "cache_read": "0.2",
+          "cache_write": "2.5",
+          "input": "2",
+          "output": "12"
+        },
+        "long_cache_write": null,
         "tiers": [
           {
             "input_tokens_above": 272000,
-            "rates": { "input": "4", "output": "18", "cache_read": "0.4", "cache_write": "5" }
+            "rates": {
+              "cache_read": "0.4",
+              "cache_write": "5",
+              "input": "4",
+              "output": "18"
+            }
           }
-        ],
-        "long_cache_write": null
+        ]
       },
+      "id": "openai/gpt-5.6-terra",
+      "lifecycle": "active",
+      "name": "GPT-5.6 Terra",
+      "provider": "openai",
+      "source": {
+        "checked_at": "2026-08-25",
+        "confidence": "official",
+        "source": "https://developers.openai.com/api/docs/models/gpt-5.6-terra"
+      },
+      "upstream_id": "gpt-5.6-terra"
+    },
+    {
+      "aliases": [],
+      "api": "open_ai_chat",
+      "base_url": null,
       "capabilities": {
-        "context_window": 1050000,
-        "max_output_tokens": 128000,
-        "input_modalities": ["text", "image"],
-        "tool_calling": true,
-        "structured_output": true,
-        "reasoning": { "levels": ["none", "low", "medium", "high", "xhigh", "max"] },
+        "context_window": 65536,
+        "input_modalities": [
+          "text"
+        ],
+        "max_output_tokens": 65536,
         "prompt_cache": {
-          "enabled": true,
-          "min_cacheable_tokens": 1024,
-          "retention": "provider_default",
+          "enabled": false,
           "explicit_control": false,
+          "min_cacheable_tokens": 0,
+          "retention": "provider_default",
           "session_affinity_header": null
-        }
+        },
+        "reasoning": "unsupported",
+        "structured_output": false,
+        "tool_calling": false
       },
       "compat": {
-        "max_tokens_field": "max_output_tokens",
-        "supports_usage_in_streaming": true,
+        "max_tokens_field": "max_tokens",
+        "structured_output_format": "none",
+        "supports_developer_role": false,
         "supports_finish_reason": true,
-        "supports_developer_role": true,
-        "tool_call_format": "open_ai",
-        "structured_output_format": "json_schema",
-        "thinking_format": "open_ai_effort"
+        "supports_usage_in_streaming": false,
+        "thinking_format": "none",
+        "tool_call_format": "open_ai"
       },
-      "aliases": ["gpt-5.6-terra"],
+      "cost": {
+        "base": {
+          "cache_read": "0",
+          "cache_write": "0",
+          "input": "0.11",
+          "output": "0.11"
+        },
+        "long_cache_write": null,
+        "tiers": []
+      },
+      "id": "ovh/mistral-7b-instruct-v0.3",
       "lifecycle": "active",
+      "name": "Mistral 7B Instruct v0.3 (OVHcloud)",
+      "provider": "ovh",
       "source": {
-        "source": "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
+        "checked_at": "2026-09-03",
+        "confidence": "verified",
+        "source": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/models (context_length, max_completion_tokens and pricing read live; anonymous inference confirmed)"
+      },
+      "upstream_id": "Mistral-7B-Instruct-v0.3"
+    },
+    {
+      "aliases": [],
+      "api": "open_ai_chat",
+      "base_url": null,
+      "capabilities": {
+        "context_window": 4096,
+        "input_modalities": [
+          "text"
+        ],
+        "max_output_tokens": 512,
+        "prompt_cache": {
+          "enabled": false,
+          "explicit_control": false,
+          "min_cacheable_tokens": 0,
+          "retention": "provider_default",
+          "session_affinity_header": null
+        },
+        "reasoning": "unsupported",
+        "structured_output": false,
+        "tool_calling": false
+      },
+      "compat": {
+        "max_tokens_field": "max_tokens",
+        "structured_output_format": "none",
+        "supports_developer_role": false,
+        "supports_finish_reason": true,
+        "supports_usage_in_streaming": false,
+        "thinking_format": "none",
+        "tool_call_format": "open_ai"
+      },
+      "cost": {
+        "base": {
+          "cache_read": "0",
+          "cache_write": "0",
+          "input": "0",
+          "output": "0"
+        },
+        "long_cache_write": null,
+        "tiers": []
+      },
+      "id": "aihorde/angelic-eclipse-12b",
+      "lifecycle": "active",
+      "name": "Angelic Eclipse 12B (AI Horde)",
+      "provider": "aihorde",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "https://oai.aihorde.net/v1/models (anonymous inference confirmed; the endpoint reports NO context length, so 4096/512 are conservative floors chosen to under-route rather than the model's true window)"
+      },
+      "upstream_id": "koboldcpp/Angelic_Eclipse-12B"
+    }
+  ],
+  "providers": [
+    {
+      "auth": {
+        "env": "AGNES_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://apihub.agnes-ai.com/v1",
+      "built_in": false,
+      "id": "agnes",
+      "name": "Agnes AI",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      },
+      "timeout_millis": 60000
+    },
+    {
+      "auth": {
+        "env": "AIHORDE_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://oai.aihorde.net/v1",
+      "built_in": false,
+      "id": "aihorde",
+      "name": "AI Horde (community compute)",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "verified",
+        "source": "https://oai.aihorde.net/v1/models"
+      }
+    },
+    {
+      "auth": {
+        "env": "AINATIVE_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.ainative.studio/api/v1",
+      "built_in": false,
+      "id": "ainative",
+      "name": "AINative Studio",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "AION_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.aionlabs.ai/v1",
+      "built_in": false,
+      "id": "aion",
+      "name": "Aion Labs",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "ANTHROPIC_API_KEY",
+        "header": "x-api-key",
+        "kind": "api_key_env",
+        "prefix": ""
+      },
+      "base_url": "https://api.anthropic.com/v1",
+      "built_in": true,
+      "headers": {
+        "anthropic-version": "2023-06-01"
+      },
+      "id": "anthropic",
+      "name": "Anthropic",
+      "source": {
         "checked_at": "2026-08-25",
-        "confidence": "official"
+        "confidence": "official",
+        "source": "https://platform.claude.com/docs/en/about-claude/models/overview"
+      }
+    },
+    {
+      "auth": {
+        "env": "ANYAPI_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.anyapi.ai/v1",
+      "built_in": false,
+      "id": "anyapi",
+      "name": "AnyAPI",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "BAI_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.b.ai/v1",
+      "built_in": false,
+      "id": "bai",
+      "name": "B.AI",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "BAZAARLINK_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://bazaarlink.ai/api/v1",
+      "built_in": false,
+      "id": "bazaarlink",
+      "name": "BazaarLink",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "CEREBRAS_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.cerebras.ai/v1",
+      "built_in": false,
+      "id": "cerebras",
+      "name": "Cerebras",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "COHERE_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.cohere.ai/compatibility/v1",
+      "built_in": false,
+      "id": "cohere",
+      "name": "Cohere",
+      "param_policy": {
+        "drop": [
+          "top_k",
+          "min_p",
+          "repetition_penalty",
+          "logit_bias",
+          "logprobs",
+          "top_logprobs",
+          "reasoning_effort"
+        ]
+      },
+      "source": {
+        "checked_at": "2026-09-04",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (DedicatedProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "GITHUB_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://models.github.ai/inference",
+      "built_in": false,
+      "id": "github",
+      "name": "GitHub Models",
+      "param_policy": {
+        "drop": [
+          "top_k",
+          "min_p",
+          "repetition_penalty"
+        ]
+      },
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "GOOGLE_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "built_in": false,
+      "id": "google",
+      "name": "Google AI Studio",
+      "param_policy": {
+        "drop": [
+          "min_p",
+          "repetition_penalty",
+          "logit_bias",
+          "logprobs",
+          "top_logprobs"
+        ]
+      },
+      "source": {
+        "checked_at": "2026-09-04",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (DedicatedProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "GROQ_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.groq.com/openai/v1",
+      "built_in": false,
+      "id": "groq",
+      "name": "Groq",
+      "param_policy": {
+        "drop": [
+          "logprobs",
+          "top_logprobs",
+          "logit_bias"
+        ]
+      },
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "HUGGINGFACE_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://router.huggingface.co/v1",
+      "built_in": false,
+      "id": "huggingface",
+      "name": "HuggingFace Router",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "allow_remote": true,
+        "kind": "none"
+      },
+      "base_url": "https://api.kilo.ai/api/gateway/v1",
+      "built_in": false,
+      "id": "kilo",
+      "name": "Kilo Gateway",
+      "param_policy": {
+        "drop": [
+          "response_format"
+        ]
+      },
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "LLM7_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.llm7.io/v1",
+      "built_in": false,
+      "id": "llm7",
+      "name": "LLM7",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "kind": "none"
+      },
+      "base_url": "http://127.0.0.1:{PORT}/v1",
+      "built_in": false,
+      "env": {
+        "PORT": "8000"
+      },
+      "id": "local-fixture",
+      "name": "Local OpenAI-compatible Fixture",
+      "source": {
+        "checked_at": "2026-08-25",
+        "confidence": "verified",
+        "source": "fixture://local-openai-compatible"
+      }
+    },
+    {
+      "auth": {
+        "kind": "none"
+      },
+      "base_url": "http://127.0.0.1:8087/v1",
+      "built_in": false,
+      "id": "local-vllm",
+      "name": "Local vLLM on port 8087",
+      "source": {
+        "checked_at": "2026-08-26",
+        "confidence": "verified",
+        "source": "smoke://127.0.0.1:8087/v1/models"
+      }
+    },
+    {
+      "auth": {
+        "kind": "none"
+      },
+      "base_url": "http://127.0.0.1:19121/starvlm/v1",
+      "built_in": false,
+      "id": "local-vllm-qwen36",
+      "name": "Local Qwen3.6-35B-A3B vLLM",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "verified",
+        "source": "smoke://127.0.0.1:19121/starvlm/v1/models"
+      }
+    },
+    {
+      "auth": {
+        "env": "LONGCAT_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.longcat.chat/openai/v1",
+      "built_in": false,
+      "id": "longcat",
+      "name": "LongCat",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "MISTRAL_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.mistral.ai/v1",
+      "built_in": false,
+      "id": "mistral",
+      "name": "Mistral",
+      "param_policy": {
+        "drop": [
+          "top_k",
+          "min_p",
+          "repetition_penalty",
+          "logit_bias",
+          "logprobs",
+          "top_logprobs",
+          "reasoning_effort"
+        ],
+        "rename": {
+          "seed": "random_seed"
+        }
+      },
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "MODELSCOPE_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api-inference.modelscope.cn/v1",
+      "built_in": false,
+      "id": "modelscope",
+      "name": "ModelScope",
+      "source": {
+        "checked_at": "2026-09-04",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      },
+      "timeout_millis": 90000
+    },
+    {
+      "auth": {
+        "env": "NARA_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://router.bynara.id/v1",
+      "built_in": false,
+      "id": "nara",
+      "name": "NaraRouter",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "NAVY_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.navy/v1",
+      "built_in": false,
+      "headers": {
+        "User-Agent": "FreeLLMAPI/1.0"
+      },
+      "id": "navy",
+      "name": "NavyAI",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "NVIDIA_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "built_in": false,
+      "id": "nvidia",
+      "name": "NVIDIA NIM",
+      "param_policy": {
+        "force_single_tool_call": true
+      },
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      },
+      "timeout_millis": 180000
+    },
+    {
+      "auth": {
+        "env": "OLLAMA_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://ollama.com/v1",
+      "built_in": false,
+      "id": "ollama",
+      "name": "Ollama Cloud",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      },
+      "timeout_millis": 120000
+    },
+    {
+      "auth": {
+        "env": "OPENAI_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.openai.com/v1",
+      "built_in": true,
+      "id": "openai",
+      "name": "OpenAI",
+      "source": {
+        "checked_at": "2026-08-25",
+        "confidence": "official",
+        "source": "https://developers.openai.com/api/docs/models/gpt-5.6-terra"
+      }
+    },
+    {
+      "auth": {
+        "env": "OPENCODE_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://opencode.ai/zen/v1",
+      "built_in": false,
+      "id": "opencode",
+      "name": "OpenCode Zen",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "OPENROUTER_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://openrouter.ai/api/v1",
+      "built_in": false,
+      "headers": {
+        "HTTP-Referer": "http://localhost:3001",
+        "X-Title": "FreeLLMAPI"
+      },
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "ORCAROUTER_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.orcarouter.ai/v1",
+      "built_in": false,
+      "id": "orcarouter",
+      "name": "OrcaRouter",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "allow_remote": true,
+        "kind": "none"
+      },
+      "base_url": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+      "built_in": false,
+      "id": "ovh",
+      "name": "OVHcloud AI Endpoints",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "verified",
+        "source": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/models"
+      }
+    },
+    {
+      "auth": {
+        "env": "POLLINATIONS_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://gen.pollinations.ai/v1",
+      "built_in": false,
+      "id": "pollinations",
+      "name": "Pollinations",
+      "source": {
+        "checked_at": "2026-09-04",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "QIANFAN_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://qianfan.baidubce.com/v2",
+      "built_in": false,
+      "id": "qianfan",
+      "name": "Baidu Qianfan",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "REKA_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.reka.ai/v1",
+      "built_in": false,
+      "id": "reka",
+      "name": "Reka",
+      "param_policy": {
+        "json_object_to_schema": true
+      },
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "REQUESTY_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://router.requesty.ai/v1",
+      "built_in": false,
+      "id": "requesty",
+      "name": "Requesty",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "ROUTEWAY_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.routeway.ai/v1",
+      "built_in": false,
+      "headers": {
+        "User-Agent": "Mozilla/5.0 FreeLLMAPI/1.0"
+      },
+      "id": "routeway",
+      "name": "Routeway",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "SAIL_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.sailresearch.com/v1",
+      "built_in": false,
+      "id": "sail",
+      "name": "Sail Research",
+      "param_policy": {
+        "drop": [
+          "top_k",
+          "min_p",
+          "seed",
+          "presence_penalty",
+          "frequency_penalty",
+          "repetition_penalty",
+          "logit_bias",
+          "logprobs",
+          "top_logprobs"
+        ],
+        "json_object_to_schema": true
+      },
+      "source": {
+        "checked_at": "2026-09-04",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (DedicatedProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "SEALION_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.sea-lion.ai/v1",
+      "built_in": false,
+      "id": "sealion",
+      "name": "SEA-LION",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "SILICONFLOW_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.siliconflow.cn/v1",
+      "built_in": false,
+      "id": "siliconflow",
+      "name": "SiliconFlow",
+      "source": {
+        "checked_at": "2026-08-29",
+        "confidence": "official",
+        "source": "https://docs.siliconflow.cn/docs/userguide/quickstart"
+      }
+    },
+    {
+      "auth": {
+        "env": "UNOROUTER_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.unorouter.com/v1",
+      "built_in": false,
+      "id": "unorouter",
+      "name": "UnoRouter",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "VOLCENGINE_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "built_in": false,
+      "id": "volcengine",
+      "name": "Volcengine Ark",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "XFYUN_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://spark-api-open.xf-yun.com/v1",
+      "built_in": false,
+      "id": "xfyun",
+      "name": "iFlytek Spark",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "XKIRO_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://api.xkiro.com/v1",
+      "built_in": false,
+      "id": "xkiro",
+      "name": "xKiro",
+      "source": {
+        "checked_at": "2026-09-03",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
+      }
+    },
+    {
+      "auth": {
+        "env": "ZHIPU_API_KEY",
+        "kind": "api_key_env"
+      },
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "built_in": false,
+      "id": "zhipu",
+      "name": "Zhipu AI",
+      "source": {
+        "checked_at": "2026-09-04",
+        "confidence": "community",
+        "source": "opensource/freellmapi/server/src/providers/index.ts (OpenAICompatProvider adapter)"
       }
     }
-  ]
+  ],
+  "schema_version": 1
 }

@@ -72,6 +72,15 @@ pub struct TransportContext<'a> {
 }
 
 impl TransportContext<'_> {
+    /// The request quirks in force: the provider's, narrowed by the model's.
+    #[must_use]
+    pub fn param_policy(&self) -> urouter_ai::ParamPolicy {
+        self.model
+            .compat
+            .param_policy
+            .merged_over(&self.provider.param_policy)
+    }
+
     /// Join the transport's path onto the base, tolerating a trailing slash on
     /// either side.
     #[must_use]

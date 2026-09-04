@@ -27,8 +27,13 @@ fn capability_consumer_filters_without_global_intersection() {
         ..CapabilityRequirement::default()
     };
     let result = eligible_models(&catalog, &requirement);
+    // Assert the partition, not a hardcoded total: admission must account for
+    // every model exactly once, and that stays true as the catalog grows.
+    assert_eq!(
+        result.eligible.len() + result.excluded.len(),
+        catalog.models().count()
+    );
     assert_eq!(result.eligible.len(), 3);
-    assert_eq!(result.excluded.len(), 4);
     assert!(
         result
             .excluded
@@ -114,9 +119,9 @@ fn endpoint_plan_resolves_verified_local_vllm() {
 }
 
 #[test]
-fn endpoint_plan_resolves_verified_qwen38_vllm() {
+fn endpoint_plan_resolves_verified_local_vllm_instance() {
     let catalog = catalog();
-    let id = ModelId::new("local-vllm-qwen38/qwen3.8-27b").unwrap();
+    let id = ModelId::new("local-vllm-qwen36/qwen3.6-35b-a3b").unwrap();
     let model = catalog.model(&id).unwrap();
     let provider = catalog.provider(&model.provider).unwrap();
     let endpoint = EndpointPlan::for_model(provider, model).unwrap();
@@ -135,9 +140,11 @@ fn endpoint_plan_resolves_siliconflow() {
 
 #[test]
 fn projection_is_stable_and_policy_free() {
-    let projections = model_projections(&catalog());
-    assert_eq!(projections.len(), 7);
-    assert_eq!(projections[0].id.as_str(), "anthropic/claude-sonnet-4-6");
+    let catalog = catalog();
+    let projections = model_projections(&catalog);
+    assert_eq!(projections.len(), catalog.models().count());
+    // The real invariant is the stable ordering, not the count.
+    assert_eq!(projections[0].id.as_str(), "aihorde/angelic-eclipse-12b");
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,17 +188,17 @@ fn catalog_hash_is_reproducible_across_input_order() {
 #[test]
 fn resolves_alias_with_provenance_and_variant_key() {
     let catalog = catalog();
-    let alias = ModelId::new("qwen3.8-27b").unwrap();
+    let alias = ModelId::new("qwen3.6-35b-a3b").unwrap();
     let resolution = catalog.resolve_model(&alias).unwrap();
     assert_eq!(
         resolution.canonical_id.as_str(),
-        "local-vllm-qwen38/qwen3.8-27b"
+        "local-vllm-qwen36/qwen3.6-35b-a3b"
     );
     assert_eq!(resolution.matched_alias, Some(&alias));
 
-    let provider = ProviderId::new("local-vllm-qwen38").unwrap();
+    let provider = ProviderId::new("local-vllm-qwen36").unwrap();
     let variant = catalog
-        .model_variant(&provider, "Qwen3.8-27B", &WireApi::OpenAiChat)
+        .model_variant(&provider, "Qwen3.6-35B-A3B", &WireApi::OpenAiChat)
         .unwrap();
     assert_eq!(variant.id, *resolution.canonical_id);
 }
@@ -203,10 +210,10 @@ fn duplicate_provider_upstream_api_variant_is_rejected() {
     let mut duplicate = document
         .models
         .iter()
-        .find(|model| model.id.as_str() == "local-vllm-qwen38/qwen3.8-27b")
+        .find(|model| model.id.as_str() == "local-vllm-qwen36/qwen3.6-35b-a3b")
         .unwrap()
         .clone();
-    duplicate.id = ModelId::new("local-vllm-qwen38/qwen3.8-27b-copy").unwrap();
+    duplicate.id = ModelId::new("local-vllm-qwen36/qwen3.6-35b-a3b-copy").unwrap();
     duplicate.aliases.clear();
     document.models.push(duplicate);
     let report = CatalogSnapshot::from_document(document).unwrap_err();

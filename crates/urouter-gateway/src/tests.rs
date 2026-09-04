@@ -2114,7 +2114,7 @@ fn value_stats_separate_downgrade_and_cache_savings() {
                 model["cost"]["base"] =
                     json!({"input": "2", "output": "4", "cache_read": "0.2", "cache_write": "2.5"});
             }
-            Some("local-vllm-qwen38/qwen3.8-27b") => {
+            Some("local-vllm-qwen36/qwen3.6-35b-a3b") => {
                 model["cost"]["base"] = json!({"input": "10", "output": "20", "cache_read": "1", "cache_write": "12.5"});
             }
             _ => {}
@@ -2146,7 +2146,7 @@ fn value_stats_separate_downgrade_and_cache_savings() {
         strength: 0.8,
     }];
     let capable = catalog
-        .model(&ModelId::new("local-vllm-qwen38/qwen3.8-27b").unwrap())
+        .model(&ModelId::new("local-vllm-qwen36/qwen3.6-35b-a3b").unwrap())
         .unwrap();
 
     let stats = calculate_value_stats(&[record], &catalog, Some(capable));
@@ -4192,7 +4192,7 @@ async fn falls_back_to_capable_after_efficient_is_exhausted() {
         "capable",
         vec![deployment(
             "capable-only",
-            "local-vllm-qwen38/qwen3.8-27b",
+            "local-vllm-qwen36/qwen3.6-35b-a3b",
             format!("http://{address}/capable"),
             0,
         )],
@@ -4304,7 +4304,7 @@ async fn timeout_uses_its_typed_fallback_chain() {
     )];
     route.tiers[1].deployments = vec![deployment(
         "generic",
-        "local-vllm-qwen38/qwen3.8-27b",
+        "local-vllm-qwen36/qwen3.6-35b-a3b",
         format!("http://{generic_address}"),
         0,
     )];
@@ -4313,7 +4313,7 @@ async fn timeout_uses_its_typed_fallback_chain() {
     timeout_tier.fallbacks.clear();
     timeout_tier.deployments = vec![deployment(
         "timeout-backup",
-        "local-vllm-qwen38/qwen3.8-27b",
+        "local-vllm-qwen36/qwen3.6-35b-a3b",
         format!("http://{timeout_address}"),
         0,
     )];

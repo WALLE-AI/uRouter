@@ -983,6 +983,8 @@ struct TierSuccess {
 
 struct PreparedDeployment {
     model: ModelSpec,
+    /// This provider's own request timeout, when it declares one.
+    timeout: Duration,
     url: String,
     headers: BTreeMap<String, String>,
     request: Value,
@@ -5753,9 +5755,10 @@ async fn execute_tier(
         let url = prepared.url;
         let headers = prepared.headers;
         let upstream_request = prepared.request;
+        let timeout = prepared.timeout;
         last_model.clone_from(&model);
 
-        match send_deployment_request(state, &url, &headers, &upstream_request).await {
+        match send_deployment_request(state, &url, &headers, &upstream_request, timeout).await {
             Ok((response, latency_ms)) => {
                 let attempt =
                     observe_attempt(state, &deployment.id, Ok(()), latency_ms, attempts.len());
@@ -5976,8 +5979,12 @@ async fn prepare_deployment_request(
             quota_reset_millis: None,
         })
     })?;
+    let timeout = provider
+        .timeout_millis
+        .map_or(state.request_timeout, Duration::from_millis);
     Ok(PreparedDeployment {
         model,
+        timeout,
         url,
         headers,
         request,
@@ -6317,13 +6324,10 @@ async fn send_deployment_request(
     url: &str,
     headers: &BTreeMap<String, String>,
     request: &Value,
+    timeout: Duration,
 ) -> Result<(reqwest::Response, u128), AttemptFailure> {
     let started = Instant::now();
-    let mut builder = state
-        .client
-        .post(url)
-        .timeout(state.request_timeout)
-        .json(request);
+    let mut builder = state.client.post(url).timeout(timeout).json(request);
     for (name, value) in headers {
         builder = builder.header(name, value);
     }
