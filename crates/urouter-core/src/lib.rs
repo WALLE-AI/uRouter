@@ -1,3 +1,5 @@
+pub mod trajectory;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -175,12 +177,55 @@ pub struct IntelligenceConfig {
 pub struct SignalSourceConfig {
     #[serde(default)]
     pub mode: SignalMode,
+    /// Trajectory extraction tuning. Ignored by the intent source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trajectory: Option<TrajectoryTuning>,
+}
+
+/// Operator-tunable bounds for trajectory extraction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrajectoryTuning {
+    #[serde(default = "default_recent_window")]
+    pub recent_window: u8,
+    #[serde(default = "default_stall_min_tool_results")]
+    pub stall_min_tool_results: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compaction_markers: Vec<String>,
+}
+
+fn default_recent_window() -> u8 {
+    trajectory::DEFAULT_RECENT_WINDOW
+}
+
+fn default_stall_min_tool_results() -> u32 {
+    trajectory::DEFAULT_STALL_MIN_TOOL_RESULTS
+}
+
+impl Default for TrajectoryTuning {
+    fn default() -> Self {
+        Self {
+            recent_window: default_recent_window(),
+            stall_min_tool_results: default_stall_min_tool_results(),
+            compaction_markers: Vec::new(),
+        }
+    }
+}
+
+impl From<&TrajectoryTuning> for trajectory::TrajectoryConfig {
+    fn from(value: &TrajectoryTuning) -> Self {
+        Self {
+            recent_window: value.recent_window,
+            stall_min_tool_results: value.stall_min_tool_results,
+            compaction_markers: value.compaction_markers.clone(),
+        }
+    }
 }
 
 impl SignalSourceConfig {
     #[must_use]
     pub fn is_off(&self) -> bool {
-        self.mode == SignalMode::Off
+        self.mode == SignalMode::Off && self.trajectory.is_none()
     }
 }
 
@@ -491,9 +536,26 @@ pub struct RouteDecision {
 pub struct IntelligenceTrace {
     pub trajectory_mode: SignalMode,
     pub intent_mode: SignalMode,
+    /// Tool-result payloads seen. Zero means no trajectory to read, which is
+    /// different from a trajectory that is going well.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub tool_result_count: u32,
     /// Signal kind to origin. Ordered so the trace is byte-stable across runs.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub signal_sources: BTreeMap<String, SignalOrigin>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// One inferred signal ready to be merged into the request contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrajectorySignalStrength {
+    pub kind: &'static str,
+    pub strength_millis: u16,
+    pub origin: SignalOrigin,
 }
 
 /// Where one signal value came from.
@@ -520,6 +582,7 @@ impl IntelligenceTrace {
         Self {
             trajectory_mode: config.trajectory.mode,
             intent_mode: config.intent.mode,
+            tool_result_count: 0,
             signal_sources: BTreeMap::new(),
         }
     }
@@ -529,6 +592,56 @@ impl IntelligenceTrace {
     #[must_use]
     pub fn is_inactive(&self) -> bool {
         !self.trajectory_mode.produces() && !self.intent_mode.produces()
+    }
+}
+
+/// Runs the trajectory extractor and folds its output into the contract.
+///
+/// A kind the caller declared is left alone and recorded as `Declared`. The
+/// caller knows things the gateway cannot infer — that a failing probe was
+/// expected, say — and silently overwriting them would both remove that
+/// expressiveness and make a bad route impossible to attribute: "the gateway
+/// inferred this wrongly" and "the client declared this wrongly" are different
+/// bugs with different owners.
+///
+/// In `Shadow` the signals are recorded but not merged, so the decision is
+/// byte-identical to `Off` while the dataset needed to justify `On` accumulates.
+fn apply_trajectory(
+    source: &SignalSourceConfig,
+    request: &Value,
+    contract: &mut RequestContract,
+    trace: &mut IntelligenceTrace,
+) {
+    if !source.mode.produces() {
+        return;
+    }
+    let tuning = source.trajectory.clone().unwrap_or_default();
+    let signals = trajectory::extract_trajectory(request, &(&tuning).into());
+    if signals.is_empty() {
+        return;
+    }
+    trace.tool_result_count = signals.tool_result_count;
+    for inferred in signals.signal_strengths() {
+        let declared = contract
+            .signals
+            .iter()
+            .any(|signal| signal.kind.as_deref() == Some(inferred.kind));
+        if declared {
+            trace
+                .signal_sources
+                .insert(inferred.kind.to_owned(), SignalOrigin::Declared);
+            continue;
+        }
+        trace
+            .signal_sources
+            .insert(inferred.kind.to_owned(), inferred.origin);
+        if source.mode.decides() {
+            contract.signals.push(SignalContract {
+                turn: None,
+                kind: Some(inferred.kind.to_owned()),
+                strength: Some(serde_json::Number::from(inferred.strength_millis)),
+            });
+        }
     }
 }
 
@@ -830,9 +943,17 @@ impl RouteConfig {
             .get("model")
             .and_then(Value::as_str)
             .ok_or(RouteError::InvalidRequestModel)?;
-        let contract = parse_contract(request)?;
+        let mut contract = parse_contract(request)?;
         let compatibility_mode = contract.compatibility_mode();
-        let intelligence = IntelligenceTrace::for_config(self.intelligence.as_ref());
+        let mut intelligence = IntelligenceTrace::for_config(self.intelligence.as_ref());
+        if let Some(config) = self.intelligence.as_ref() {
+            apply_trajectory(
+                &config.trajectory,
+                request,
+                &mut contract,
+                &mut intelligence,
+            );
+        }
         let (semantic, requirement) = semantic_requirement(request, self.semantic_rules.as_ref())?;
         if requested_model != self.id {
             let requested =
@@ -2374,8 +2495,14 @@ mod tests {
             let mut route = route();
             route.intelligence = Some(IntelligenceConfig {
                 schema_version: INTELLIGENCE_SCHEMA_VERSION,
-                trajectory: SignalSourceConfig { mode },
-                intent: SignalSourceConfig { mode },
+                trajectory: SignalSourceConfig {
+                    mode,
+                    ..SignalSourceConfig::default()
+                },
+                intent: SignalSourceConfig {
+                    mode,
+                    ..SignalSourceConfig::default()
+                },
             });
             let decision = route.decide(&catalog(), &request).unwrap();
             assert_eq!(decision.tier, baseline.tier, "mode {mode:?} changed the tier");
@@ -2384,10 +2511,108 @@ mod tests {
             assert_eq!(decision.intelligence.intent_mode, mode);
             assert!(
                 decision.intelligence.signal_sources.is_empty(),
-                "no producer is wired up yet"
+                "a request without tool activity has no trajectory to report"
             );
             assert_eq!(decision.intelligence.is_inactive(), mode == SignalMode::Off);
         }
+    }
+
+    fn agent_request(tool: &str, result: &str) -> Value {
+        json!({
+            "model": "urouter/auto",
+            "messages": [
+                {"role": "user", "content": "keep going"},
+                {"role": "assistant", "content": "",
+                 "tool_calls": [{"id": "c1", "type": "function",
+                                 "function": {"name": tool, "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": result}
+            ]
+        })
+    }
+
+    fn with_trajectory(mode: SignalMode) -> RouteConfig {
+        let mut route = route();
+        route.intelligence = Some(IntelligenceConfig {
+            schema_version: INTELLIGENCE_SCHEMA_VERSION,
+            trajectory: SignalSourceConfig {
+                mode,
+                ..SignalSourceConfig::default()
+            },
+            intent: SignalSourceConfig::default(),
+        });
+        route
+    }
+
+    /// Shadow must record the trajectory and change nothing else.
+    ///
+    /// This is what lets the extractor ship before there is enough model depth
+    /// to prove it helps: the dataset accumulates while the decision stays
+    /// byte-identical to the one the same request gets today.
+    #[test]
+    fn shadow_records_the_trajectory_without_changing_the_decision() {
+        let request = agent_request("Bash", "AssertionError: boom");
+        let baseline = route().decide(&catalog(), &request).unwrap();
+
+        let decision = with_trajectory(SignalMode::Shadow)
+            .decide(&catalog(), &request)
+            .unwrap();
+        assert_eq!(decision.tier, baseline.tier);
+        assert_eq!(decision.reason, baseline.reason);
+        assert_eq!(decision.cascade_trace, baseline.cascade_trace);
+        // Recorded, but not merged into the contract the cascade reads.
+        assert_eq!(decision.intelligence.tool_result_count, 1);
+        assert_eq!(
+            decision.intelligence.signal_sources.get("severity"),
+            Some(&SignalOrigin::Inferred)
+        );
+        assert!(decision.signals.is_empty());
+
+        // The same trajectory with the source on must escalate.
+        let decision = with_trajectory(SignalMode::On)
+            .decide(&catalog(), &request)
+            .unwrap();
+        assert_eq!(decision.tier, "capable");
+        assert_eq!(decision.reason, "quality_guard");
+    }
+
+    /// A caller's own declaration wins over the gateway's inference, and the
+    /// trace says which was used.
+    ///
+    /// Attribution is the point: "the gateway inferred this wrongly" and "the
+    /// client declared this wrongly" are different bugs with different owners,
+    /// and a silent overwrite makes them indistinguishable.
+    #[test]
+    fn a_declared_signal_is_kept_and_marked_as_declared() {
+        let mut request = agent_request("Bash", "AssertionError: boom");
+        request["urouter"] = json!({
+            "signals": [{"kind": "severity", "strength": 0.0}]
+        });
+        let decision = with_trajectory(SignalMode::On)
+            .decide(&catalog(), &request)
+            .unwrap();
+        assert_eq!(
+            decision.intelligence.signal_sources.get("severity"),
+            Some(&SignalOrigin::Declared)
+        );
+        // The caller said this failure was expected, so no escalation happened
+        // even though the extractor would have found a hard error.
+        assert_eq!(decision.tier, "efficient");
+        assert_eq!(decision.signals.len(), 1);
+    }
+
+    /// A productive run must not be escalated by its own productivity.
+    #[test]
+    fn an_inferred_productive_trajectory_prefers_the_cheaper_tier() {
+        let request = agent_request("Write", "ok");
+        let decision = with_trajectory(SignalMode::On)
+            .decide(&catalog(), &request)
+            .unwrap();
+        assert_eq!(
+            decision.intelligence.signal_sources.get("production_intensity"),
+            Some(&SignalOrigin::Inferred)
+        );
+        assert_eq!(decision.tier, "efficient");
+        assert_eq!(decision.reason, "cost_preference");
     }
 
     /// An empty quota limit list must not appear in the serialization at all.

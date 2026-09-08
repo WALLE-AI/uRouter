@@ -246,18 +246,34 @@ fn dry_run_reports_intelligence_sources_that_are_enabled_but_inert() {
     });
     assert_eq!(status_for(&all_off).0, DryRunStatus::Pass);
 
+    // Trajectory has a producer, so enabling it is reported as active.
     let mut shadow = route();
     shadow.intelligence = Some(IntelligenceConfig {
         schema_version: INTELLIGENCE_SCHEMA_VERSION,
         trajectory: SignalSourceConfig {
             mode: SignalMode::Shadow,
+            ..SignalSourceConfig::default()
         },
         intent: SignalSourceConfig::default(),
     });
     let (status, message, valid) = status_for(&shadow);
-    assert_eq!(status, DryRunStatus::Warning);
+    assert_eq!(status, DryRunStatus::Pass);
     assert!(message.contains("trajectory=shadow"), "{message}");
-    assert!(!message.contains("intent"), "{message}");
+    assert!(valid);
+
+    // Intent has none yet, so enabling it must warn rather than read as working.
+    let mut intent = route();
+    intent.intelligence = Some(IntelligenceConfig {
+        schema_version: INTELLIGENCE_SCHEMA_VERSION,
+        trajectory: SignalSourceConfig::default(),
+        intent: SignalSourceConfig {
+            mode: SignalMode::On,
+            ..SignalSourceConfig::default()
+        },
+    });
+    let (status, message, valid) = status_for(&intent);
+    assert_eq!(status, DryRunStatus::Warning);
+    assert!(message.contains("intent=on"), "{message}");
     // A warning must not fail the run: the config is legal, just not yet useful.
     assert!(valid);
 }

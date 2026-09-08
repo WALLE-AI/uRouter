@@ -580,17 +580,29 @@ fn intelligence_signal_sources_check(route: &RouteConfig) -> DryRunCheck {
             "no intelligence signal sources are configured".to_owned(),
         );
     };
-    let sources = [
-        ("trajectory", config.trajectory.mode),
-        ("intent", config.intent.mode),
-    ];
-    // Producers land in a later change; until then every non-off mode is inert.
-    let inert: Vec<String> = sources
+    // The intent classifier has no producer yet, so enabling it is inert.
+    let armed: Vec<String> = [("trajectory", config.trajectory.mode)]
         .iter()
         .filter(|(_, mode)| mode.produces())
         .map(|(name, mode)| format!("{name}={}", mode.as_str()))
         .collect();
-    if inert.is_empty() {
+    let inert: Vec<String> = [("intent", config.intent.mode)]
+        .iter()
+        .filter(|(_, mode)| mode.produces())
+        .map(|(name, mode)| format!("{name}={}", mode.as_str()))
+        .collect();
+    if !inert.is_empty() {
+        return check(
+            19,
+            DRY_RUN_CHECK_IDS[18],
+            DryRunStatus::Warning,
+            format!(
+                "{} enabled but has no producer yet and contributes nothing",
+                inert.join(", ")
+            ),
+        );
+    }
+    if armed.is_empty() {
         return check(
             19,
             DRY_RUN_CHECK_IDS[18],
@@ -601,11 +613,8 @@ fn intelligence_signal_sources_check(route: &RouteConfig) -> DryRunCheck {
     check(
         19,
         DRY_RUN_CHECK_IDS[18],
-        DryRunStatus::Warning,
-        format!(
-            "{} enabled but no producer is wired up yet; these sources contribute nothing",
-            inert.join(", ")
-        ),
+        DryRunStatus::Pass,
+        format!("{} active", armed.join(", ")),
     )
 }
 
